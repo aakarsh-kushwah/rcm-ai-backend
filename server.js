@@ -1,88 +1,93 @@
-// ज़रूरी पैकेजेज़ इम्पोर्ट करें
 require('dotenv').config();
 const express = require('express');
-const { Pool } = require('pg'); // ✅ बदला हुआ: pg लाइब्रेरी का Pool इस्तेमाल करें
 const cors = require('cors');
+const helmet = require('helmet'); // Security hardening
+const rateLimit = require('express-rate-limit'); // DDoS/Brute force protection
+const morgan = require('morgan'); // Logging (great for production diagnostics)
 
-// ऐप और पोर्ट सेटअप
+// --- Route Imports ---
+const authRoutes = require('./routes/authRoutes');
+const subscriberRoutes = require('./routes/subscriberRoutes');
+const chatRoutes = require('./routes/chatRoutes');
+const userRoutes = require('./routes/userRoutes');
+const videoRoutes = require('./routes/videoRoutes'); 
+const adminRoutes = require('./routes/adminRoutes'); 
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// मिडिलवेयर
-app.use(cors());
-app.use(express.json());
+// --- Global Security & Middleware ---
 
-// ✅ बदला हुआ: PostgreSQL का कनेक्शन पूल
-// यह Render के DATABASE_URL से सीधे कनेक्ट हो जाएगा
-const dbPool = new Pool({
-    connectionString: process.env.DATABASE_URL, // Render यह URL अपने आप दे देता है
-    ssl: {
-        rejectUnauthorized: false // Render के SSL कनेक्शन के लिए ज़रूरी
-    }
-});
+// 1. Helmet: Secure Express apps by setting various HTTP headers
+app.use(helmet());
 
-// टेस्ट रूट: यह चेक करने के लिए कि सर्वर चल रहा है
-app.get('/', (req, res) => {
-    res.send('RCM AI Backend is running!');
-});
-
-// API रूट: नया सब्सक्राइबर जोड़ने के लिए
-app.post('/api/subscribe', async (req, res) => {
-    const { name, phone } = req.body;
-
-    if (!name || !phone) {
-        return res.status(400).json({ success: false, message: 'Name and phone number are required.' });
-    }
-
-    try {
-        // ✅ बदला हुआ: SQL क्वेरी में प्लेसहोल्डर (?) की जगह ($1, $2) का इस्तेमाल करें
-        const sql = 'INSERT INTO subscribers (name, phone_number) VALUES ($1, $2)';
+// 2. CORS Configuration: RESTRICTED Access Control
+const allowedOrigins = [
+    'http://localhost:3000', // Admin UI dev environment (Example)
+    'http://localhost:3002', // ✅ FIX: User UI dev environment (from your error log)
+    'https://your-production-frontend.com', // Replace with your actual production domain
+    'https://your-admin-frontend.com' // Replace with your Admin UI production domain
+];
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps, Postman, or curl)
+        if (!origin) return callback(null, true); 
         
-        // डेटाबेस में डेटा डालें
-        await dbPool.query(sql, [name, phone]);
-        
-        console.log(`Data saved: ${name}, ${phone}`);
-        res.status(201).json({ success: true, message: 'Successfully subscribed!' });
+        // Check if the origin is in the allowed list
+        if (allowedOrigins.indexOf(origin) === -1) {
+            const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+            return callback(new Error(msg), false);
+        }
+        return callback(null, true);
+    },
+    credentials: true, // Allow cookies and authentication headers
+}));
 
-    } catch (error) {
-        console.error('Database error:', error);
-        res.status(500).json({ success: false, message: 'Failed to subscribe. Please try again later.' });
-    }
+// 3. Rate Limiting: Limit repeated requests to prevent DoS attacks
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again after 15 minutes'
+});
+app.use(apiLimiter);
+
+// 4. Logging: HTTP request logger (Use 'dev' for development/verbose logging)
+app.use(morgan('dev')); 
+
+// 5. Body Parsers: Increase limit for file/video uploads
+app.use(express.json({ limit: '50mb' })); 
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+
+// --- Root Test Route ---
+app.get('/', (req, res) => res.send('RCM AI Production-Ready Backend is running!'));
+
+// --- Route Mounting ---
+app.use('/api/auth', authRoutes);
+app.use('/api', subscriberRoutes); 
+app.use('/api/chat', chatRoutes); 
+app.use('/api/users', userRoutes);
+app.use('/api/videos', videoRoutes); // Video routes handle their own auth
+app.use('/api/admin', adminRoutes); // Admin Routes Mounted
+
+// --- Global Error Handlers ---
+
+// 404 Handler (Catch all unhandled routes)
+app.use((req, res, next) => {
+    res.status(404).json({ message: `Route Not Found: ${req.originalUrl}` });
 });
 
-// सर्वर को शुरू करें
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    // सर्वर स्टार्ट होने पर डेटाबेस टेबल बनाने का प्रयास करें
-    createTableIfNotExists();
+// Centralized Error Handling Middleware (Handles errors thrown by controllers/middleware)
+app.use((err, req, res, next) => {
+    // Default status is 500
+    const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+    res.status(statusCode);
+    res.json({
+        message: err.message,
+        // Only provide stack trace in development mode
+        stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+    });
 });
 
-// यह फंक्शन चेक करेगा कि टेबल मौजूद है या नहीं, नहीं तो बना देगा
-async function createTableIfNotExists() {
-    try {
-        // ✅ बदला हुआ: SQL सिंटैक्स को PostgreSQL के हिसाब से बदला गया
-        // INT AUTO_INCREMENT की जगह SERIAL PRIMARY KEY का इस्तेमाल होता है
-        const createTableSql = `
-            CREATE TABLE IF NOT EXISTS subscribers (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                phone_number VARCHAR(20) NOT NULL,
-                subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-        `;
-        await dbPool.query(createTableSql);
-        console.log('Table "subscribers" is ready.');
-    } catch (error) {
-        console.error('Could not create table:', error);
-    }
-}
 
-app.get('/api/subscribers', async (req, res) => {
-    try {
-        const result = await dbPool.query('SELECT id, name, phone_number, subscribed_at FROM subscribers ORDER BY id DESC');
-        res.json({ success: true, data: result.rows });
-    } catch (error) {
-        console.error('Database error:', error);
-        res.status(500).json({ success: false, message: 'Failed to fetch data.' });
-    }
-});
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));

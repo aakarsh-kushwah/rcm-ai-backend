@@ -10,11 +10,22 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@prisma/client": "^6.17.1",
+    "axios": "^1.12.2",
+    "bcrypt": "^6.0.0",
+    "cloudinary": "^2.7.0",
     "cors": "^2.8.5",
+    "datauri": "^4.1.0",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "groq-sdk": "^0.33.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
     "mysql2": "^3.15.2",
-    "pg": "^8.16.3",
+    "prisma": "^6.17.1",
     "react-router-dom": "^7.9.4"
   }
 }
