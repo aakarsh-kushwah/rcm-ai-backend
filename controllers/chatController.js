@@ -1,44 +1,92 @@
+const { getAIChatResponse } = require('../services/aiService'); 
 const { PrismaClient } = require('@prisma/client');
-const { getAIChatResponse } = require('../services/aiService');
 const prisma = new PrismaClient();
 
+// CRITICAL FIX: Ensure System Prompt has mandatory content
+const SYSTEM_PROMPT = "You are the RCM AI assistant. Provide concise and accurate answers related to RCM products, business, and leader information. Maintain a helpful and professional tone.";
+
 const handleChat = async (req, res) => {
-    const { message } = req.body;
-    const userId = req.user.id;
+    // Logic for user chat submission (POST /api/chat)
+    const { message } = req.body; 
+    const userId = req.user ? req.user.id : null; 
 
     if (!message) {
-        return res.status(400).json({ success: false, message: 'Message is required.' });
+        return res.status(400).json({ success: false, message: "Message content cannot be empty." });
     }
+
     try {
-        await prisma.chatMessage.create({
-            data: { userId, sender: 'USER', message },
-        });
-        const botResponse = await getAIChatResponse(message);
-        await prisma.chatMessage.create({
-            data: { userId, sender: 'BOT', message: botResponse },
-        });
-        res.json({ success: true, reply: botResponse });
+        // 1. Construct the message array
+        const groqMessages = [
+            { role: "system", content: SYSTEM_PROMPT },
+            // Placeholder for chat history would go here
+            { role: "user", content: message }
+        ];
+
+        // 2. Get response from AI Service
+        const reply = await getAIChatResponse(groqMessages);
+
+        // 3. Save chat history
+        if (userId) {
+            await prisma.chatMessage.createMany({
+                data: [
+                    { userId: userId, sender: 'USER', message: message },
+                    { userId: userId, sender: 'BOT', message: reply },
+                ]
+            });
+        }
+        
+        // 4. Send successful response
+        res.status(200).json({ success: true, reply: reply });
+
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to get chat response.' });
+        console.error("Chat Error:", error);
+        const statusCode = error.status || 500; 
+        res.status(statusCode).json({ success: false, message: error.message || "An unexpected error occurred during AI processing." });
     }
 };
 
+/**
+ * Admin function to retrieve all chat messages segmented by user.
+ * This function resolves the "TypeError: argument handler must be a function" issue.
+ */
 const getAllChats = async (req, res) => {
+    // This route is protected by `protect` and `isAdmin`
     try {
-        const messages = await prisma.chatMessage.findMany({
-            orderBy: { createdAt: 'asc' },
-            include: { user: { select: { email: true } } },
+        const allMessages = await prisma.chatMessage.findMany({
+            orderBy: { createdAt: 'desc' },
+            select: {
+                sender: true,
+                message: true,
+                createdAt: true,
+                user: {
+                    select: {
+                        email: true // Use email to group chats on the frontend
+                    }
+                }
+            }
         });
-        const chatsBySession = messages.reduce((acc, msg) => {
-            const sessionId = msg.user.email;
-            if (!acc[sessionId]) acc[sessionId] = [];
-            acc[sessionId].push(msg);
+
+        // Group messages by user email for frontend display
+        const chatsByUser = allMessages.reduce((acc, msg) => {
+            const email = msg.user.email;
+            if (!acc[email]) {
+                acc[email] = [];
+            }
+            acc[email].push({
+                sender: msg.sender,
+                message: msg.message,
+                createdAt: msg.createdAt
+            });
             return acc;
         }, {});
-        res.json({ success: true, data: chatsBySession });
+
+        res.status(200).json({ success: true, data: chatsByUser });
+
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to fetch chats.' });
+        console.error("Admin Chat Fetch Error:", error);
+        res.status(500).json({ success: false, message: "Failed to retrieve chat history." });
     }
 };
 
-module.exports = { handleChat, getAllChats };
+
+module.exports = { handleChat, getAllChats }; // Ensure both functions are exported
