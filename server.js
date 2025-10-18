@@ -23,19 +23,20 @@ app.use(helmet());
 
 // 2. CORS Configuration: Allows local host and Vercel production domains
 const allowedOrigins = [
-    'http://localhost:3000', // Admin/User local dev
-    'http://localhost:3002', // Admin/User local dev (if using different ports)
+    'http://localhost:3000', 
+    'http://localhost:3002', 
+    'https://rcmai.in', // ✅ CRITICAL FIX: Added the live custom domain
     // Add your live Vercel domains here for production access
     'https://your-vercel-frontend.vercel.app', 
     'https://your-admin-frontend.vercel.app',
 ];
 app.use(cors({
     origin: (origin, callback) => {
-        // Allow requests with no origin (like mobile apps, curl, or same-origin requests)
-        if (!origin || allowedOrigins.includes(origin)) {
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) {
             return callback(null, true);
         }
-        // Check for dynamic Render/Vercel URLs (optional, but robust)
+        // Check for dynamic Render/Vercel URLs (for review branches, etc.)
         if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
             return callback(null, true);
         }
@@ -47,7 +48,7 @@ app.use(cors({
 // 3. Rate Limiting: Limit repeated requests
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 1000, // Increased limit for better deployment stability
+    max: 1000, 
     message: 'Too many requests from this IP, please try again after 15 minutes'
 });
 app.use(apiLimiter);
@@ -55,7 +56,7 @@ app.use(apiLimiter);
 // 4. Logging: HTTP request logger
 app.use(morgan('combined')); 
 
-// 5. Body Parsers: Increased limit for file uploads (even if we removed Cloudinary, keeping it high is safe)
+// 5. Body Parsers: Increased limit for safety
 app.use(express.json({ limit: '50mb' })); 
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
