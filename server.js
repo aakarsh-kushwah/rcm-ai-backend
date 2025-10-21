@@ -28,8 +28,8 @@ const allowedOrigins = [
     'https://rcmai.in', 
     'https://www.rcmai.in', // ✅ CRITICAL FIX: Added the live custom domain
     // Add your live Vercel domains here for production access
-    'https://your-vercel-frontend.vercel.app', 
-    'https://your-admin-frontend.vercel.app',
+    'https://rcmai.in',
+    'https://www.rcmai.in',
 ];
 app.use(cors({
     origin: (origin, callback) => {
