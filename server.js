@@ -27,9 +27,7 @@ const allowedOrigins = [
     'http://localhost:3002', 
     'https://rcmai.in', 
     'https://www.rcmai.in', // ✅ CRITICAL FIX: Added the live custom domain
-    // Add your live Vercel domains here for production access
-    'https://rcmai.in',
-    'https://www.rcmai.in',
+   
 ];
 app.use(cors({
     origin: (origin, callback) => {
