@@ -18,7 +18,6 @@ const handleChat = async (req, res) => {
         // 1. Construct the message array
         const groqMessages = [
             { role: "system", content: SYSTEM_PROMPT },
-            // Placeholder for chat history would go here
             { role: "user", content: message }
         ];
 
@@ -47,10 +46,9 @@ const handleChat = async (req, res) => {
 
 /**
  * Admin function to retrieve all chat messages segmented by user.
- * This function resolves the "TypeError: argument handler must be a function" issue.
+ * This function is mapped to GET /api/chat/admin/chats.
  */
 const getAllChats = async (req, res) => {
-    // This route is protected by `protect` and `isAdmin`
     try {
         const allMessages = await prisma.chatMessage.findMany({
             orderBy: { createdAt: 'desc' },
@@ -89,4 +87,4 @@ const getAllChats = async (req, res) => {
 };
 
 
-module.exports = { handleChat, getAllChats };// Ensure both functions are exported
+module.exports = { handleChat, getAllChats };
