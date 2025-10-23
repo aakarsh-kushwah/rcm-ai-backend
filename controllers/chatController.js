@@ -89,4 +89,4 @@ const getAllChats = async (req, res) => {
 };
 
 
-module.exports = { handleChat, getAllChats }; // Ensure both functions are exported
+module.exports = { handleChat, getAllChats };// Ensure both functions are exported
