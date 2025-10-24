@@ -1,5 +1,3 @@
-// This is your Prisma schema file. It defines your database models and their relations.
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,72 +8,78 @@ datasource db {
 }
 
 // =======================================================
-// User and Chat Models
+// User & Authentication Model (CRITICAL)
 // =======================================================
 
-// Model for user authentication (Login/Register)
 model User {
-  id        Int       @id @default(autoincrement())
-  fullName  String    @map("full_name")
-  // FIX: rcmId aur phone ko optional banaya (Admin Signup ke liye)
-  rcmId     String?   @unique @map("rcm_id") 
-  email     String    @unique
-  phone     String?   
-  password  String
-  role      Role      @default(USER)
-  createdAt DateTime  @default(now())
-  messages  ChatMessage[]
+  id               Int       @id @default(autoincrement())
+  fullName         String    @map("full_name")
+  rcmId            String?   @unique @map("rcm_id")
+  email            String    @unique
+  phone            String?
+  password         String
+  role             Role      @default(USER)
+  createdAt        DateTime  @default(now())
+  
+  // Payment & Subscription Fields
+  autoPayStatus    Boolean   @default(false) // Auto-Pay subscription status
+  nextBillingDate  DateTime? // Next payment date for analytics
+  razorpayCustomerId String? @map("razorpay_customer_id") // Required for Razorpay API calls
+
+  // Relations
+  messages         ChatMessage[]
 }
 
-// Model for storing chat history
+// =======================================================
+// Chat & Subscriber Models
+// =======================================================
+
 model ChatMessage {
-  id        Int       @id @default(autoincrement())
-  sender    String    // Will be "USER" or "BOT"
-  message   String    @db.Text // Use TEXT for potentially long messages
-  createdAt DateTime  @default(now())
+  id               Int       @id @default(autoincrement())
+  sender           String    
+  message          String    @db.Text
+  createdAt        DateTime  @default(now())
   
-  // Relation: Each message belongs to a user
-  user      User      @relation(fields: [userId], references: [id])
-  userId    Int
+  user             User      @relation(fields: [userId], references: [id])
+  userId           Int
 
   @@map("chat_messages")
 }
 
-// Model for the original subscriber form (Landing Page)
 model Subscriber {
-  id            Int      @id @default(autoincrement())
-  name          String
-  phone_number  String
-  subscribed_at DateTime @default(now())
+  id               Int       @id @default(autoincrement())
+  name             String
+  phone_number     String
+  subscribed_at    DateTime  @default(now())
   
   @@map("subscribers")
 }
 
 // =======================================================
-// Video Models (With Performance Fix)
+// Video Models (YouTube Links)
 // =======================================================
 
 model LeaderVideo {
-  id          Int      @id @default(autoincrement())
-  title       String
-  description String   @db.Text
-  videoUrl    String   @map("video_url")
-  publicId    String   @map("public_id") // For deleting from Cloudinary
-  createdAt   DateTime @default(now())
+  id               Int       @id @default(autoincrement())
+  title            String
+  description      String?   @db.Text
+  videoUrl         String    @map("video_url")
+  publicId         String?   @map("public_id") // Stores YouTube ID
+  createdAt        DateTime  @default(now())
   
-  // FIX: Database performance ke liye title par index joda gaya hai
+  // FIX: Index for fast search performance
   @@index([title]) 
 }
 
 model ProductVideo {
-  id          Int      @id @default(autoincrement())
-  title       String
-  description String   @db.Text
-  videoUrl    String   @map("video_url")
-  publicId    String   @map("public_id")
-  createdAt   DateTime @default(now())
+  id               Int       @id @default(autoincrement())
+  title            String
+  description      String?   @db.Text
+  videoUrl         String    @map("video_url")
+  publicId         String?   @map("public_id") // Stores YouTube ID
+  createdAt        DateTime  @default(now())
 
-  // FIX: Database performance ke liye title par index joda gaya hai
+  // FIX: Index for fast search performance
   @@index([title])
 }
 

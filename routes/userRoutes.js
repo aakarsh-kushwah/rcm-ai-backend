@@ -1,9 +1,13 @@
 const express = require('express');
-const { getAllUsers } = require('../controllers/userController');
-const { protect, isAdmin } = require('../middleware/authMiddleware');
 const router = express.Router();
+// Assuming you import protect and isAdmin middleware
+const { protect, isAdmin } = require('../middleware/authMiddleware'); 
+const { deleteUser, updateUserData } = require('../controllers/userController'); // Import new functions
 
-// सिर्फ एडमिन ही सभी यूज़र्स को देख सकता है
-router.get('/', protect, isAdmin, getAllUsers);
+// Route for deleting a user (Requires Admin role)
+router.delete('/:userId', protect, isAdmin, deleteUser); // ✅ NEW DELETE ROUTE
+
+// Route for updating user data (Requires Admin role)
+router.put('/:userId', protect, isAdmin, updateUserData); // ✅ NEW UPDATE ROUTE
 
 module.exports = router;
