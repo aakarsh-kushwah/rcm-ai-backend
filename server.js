@@ -27,7 +27,7 @@ const allowedOrigins = [
     'http://localhost:3002', 
     'https://rcmai.in', 
     'https://www.rcmai.in', // ✅ CRITICAL FIX: Added the live custom domain
-   
+    'https://rcm-ai-admin-ui.vercel.app/'
 ];
 app.use(cors({
     origin: (origin, callback) => {
