@@ -23,10 +23,11 @@ app.use(helmet());
 
 // 2. CORS Configuration: Allows local host and Vercel production domains
 const allowedOrigins = [
-    'http://localhost:3000', 
+'http://localhost:3000', 
     'http://localhost:3002', 
     'https://rcmai.in', 
     'https://www.rcmai.in', // ✅ CRITICAL FIX: Added the live custom domain
+    
 ];
 app.use(cors({
     origin: (origin, callback) => {
