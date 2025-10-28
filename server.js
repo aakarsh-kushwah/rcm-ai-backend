@@ -25,6 +25,7 @@ const allowedOrigins = [
     'http://localhost:3002', 
     'https://rcmai.in', 
     'https://www.rcmai.in', 
+    'https://rcm-ai.vercel.app',
 ];
 
 app.use(cors({
