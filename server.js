@@ -1,9 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet'); // Security hardening
-const rateLimit = require('express-rate-limit'); // DDoS/Brute force protection
-const morgan = require('morgan'); // Logging
+const helmet = require('helmet'); 
+const rateLimit = require('express-rate-limit'); 
+const morgan = require('morgan'); 
 
 // --- Route Imports ---
 const authRoutes = require('./routes/authRoutes');
@@ -16,19 +16,17 @@ const adminRoutes = require('./routes/adminRoutes');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// --- Global Security & Middleware ---
+// ----------------------------------------------------
+// ✅ CRITICAL FIX: CORS Must be the first middleware to handle preflight (OPTIONS) requests
+// ----------------------------------------------------
 
-// 1. Helmet: Secure Express apps by setting various HTTP headers
-app.use(helmet());
-
-// 2. CORS Configuration: Allows local host and Vercel production domains
 const allowedOrigins = [
-'http://localhost:3000', 
+    'http://localhost:3000', 
     'http://localhost:3002', 
     'https://rcmai.in', 
-    'https://www.rcmai.in', // ✅ CRITICAL FIX: Added the live custom domain
-    
+    'https://www.rcmai.in', 
 ];
+
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin) return callback(null, true);
@@ -44,7 +42,12 @@ app.use(cors({
     credentials: true,
 }));
 
-// 3. Rate Limiting: Limit repeated requests
+// --- Global Security & Middleware (After CORS) ---
+
+// 1. Helmet: Secure Express apps by setting various HTTP headers
+app.use(helmet());
+
+// 2. Rate Limiting: Limit repeated requests
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 1000, 
@@ -52,10 +55,10 @@ const apiLimiter = rateLimit({
 });
 app.use(apiLimiter);
 
-// 4. Logging: HTTP request logger
+// 3. Logging: HTTP request logger
 app.use(morgan('combined')); 
 
-// 5. Body Parsers: Increased limit for safety
+// 4. Body Parsers: Increased limit for safety
 app.use(express.json({ limit: '50mb' })); 
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
