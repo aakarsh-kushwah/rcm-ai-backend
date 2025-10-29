@@ -7,85 +7,60 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// =======================================================
-// User & Authentication Model (CRITICAL)
-// =======================================================
-
 model User {
-  id               Int       @id @default(autoincrement())
-  fullName         String    @map("full_name")
-  rcmId            String?   @unique @map("rcm_id")
-  email            String    @unique
-  phone            String?
-  password         String
-  role             Role      @default(USER)
-  createdAt        DateTime  @default(now())
-  
-  // Payment & Subscription Fields
-  autoPayStatus    Boolean   @default(false) // Auto-Pay subscription status
-  nextBillingDate  DateTime? // Next payment date for analytics
-  razorpayCustomerId String? @map("razorpay_customer_id") // Required for Razorpay API calls
-
-  // Relations
-  messages         ChatMessage[]
+  id        Int           @id @default(autoincrement())
+  fullName  String        @map("full_name")
+  rcmId     String?       @unique @map("rcm_id")
+  email     String        @unique
+  phone     String?
+  autoPayStatus Boolean @default(false)
+  password  String
+  role      Role          @default(USER)
+  createdAt DateTime      @default(now())
+  messages  ChatMessage[]
 }
 
-// =======================================================
-// Chat & Subscriber Models
-// =======================================================
-
 model ChatMessage {
-  id               Int       @id @default(autoincrement())
-  sender           String    
-  message          String    @db.Text
-  createdAt        DateTime  @default(now())
-  
-  user             User      @relation(fields: [userId], references: [id])
-  userId           Int
+  id        Int      @id @default(autoincrement())
+  sender    String
+  message   String
+  createdAt DateTime @default(now())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
 
   @@map("chat_messages")
 }
 
 model Subscriber {
-  id               Int       @id @default(autoincrement())
-  name             String
-  phone_number     String
-  subscribed_at    DateTime  @default(now())
-  
+  id            Int      @id @default(autoincrement())
+  name          String
+  phone_number  String
+  subscribed_at DateTime @default(now())
+
   @@map("subscribers")
 }
 
-// =======================================================
-// Video Models (YouTube Links)
-// =======================================================
-
 model LeaderVideo {
-  id               Int       @id @default(autoincrement())
-  title            String
-  description      String?   @db.Text
-  videoUrl         String    @map("video_url")
-  publicId         String?   @map("public_id") // Stores YouTube ID
-  createdAt        DateTime  @default(now())
-  
-  // FIX: Index for fast search performance
-  @@index([title]) 
-}
+  id          Int      @id @default(autoincrement())
+  title       String
+  description String
+  videoUrl    String   @map("video_url")
+  publicId    String   @map("public_id")
+  createdAt   DateTime @default(now())
 
-model ProductVideo {
-  id               Int       @id @default(autoincrement())
-  title            String
-  description      String?   @db.Text
-  videoUrl         String    @map("video_url")
-  publicId         String?   @map("public_id") // Stores YouTube ID
-  createdAt        DateTime  @default(now())
-
-  // FIX: Index for fast search performance
   @@index([title])
 }
 
-// =======================================================
-// Enum
-// =======================================================
+model ProductVideo {
+  id          Int      @id @default(autoincrement())
+  title       String
+  description String
+  videoUrl    String   @map("video_url")
+  publicId    String   @map("public_id")
+  createdAt   DateTime @default(now())
+
+  @@index([title])
+}
 
 enum Role {
   USER
