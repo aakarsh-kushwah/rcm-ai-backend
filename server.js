@@ -23,9 +23,11 @@ app.set('trust proxy', 1);
 // ✅ CORS Setup for Render + Vercel
 // ----------------------------------------------------
 const allowedOrigins = [
+  'https://rcm-ai-admin-ui.vercel.app',
+ 
   'https://rcmai.in',
   'https://www.rcmai.in',
-  'http://localhost:3000', // local dev
+  'http://localhost:3000', // for local testing
 ];
 
 app.use(
