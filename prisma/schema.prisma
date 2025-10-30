@@ -1,58 +1,36 @@
-// =======================================================
-// Prisma Schema for RCM-AI Backend
-// =======================================================
-
-// ======================
-// Prisma Client Generator
-// ======================
 generator client {
   provider = "prisma-client-js"
 }
 
-// ======================
-// Database Connection
-// ======================
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-// =======================================================
-// User & Authentication Model
-// =======================================================
 model User {
-  id        Int      @id @default(autoincrement())
-  fullName  String   @map("full_name")
-  rcmId     String?  @unique @map("rcm_id")
-  email     String   @unique
-  phone     String?
-  password  String
-  role      Role     @default(USER)
-  createdAt DateTime @default(now())
-
-  // Payment & Subscription Fields
-  autoPayStatus      Boolean   @default(false) // Auto-pay subscription status
-  nextBillingDate    DateTime? // Next payment date for analytics
-  razorpayCustomerId String?   @map("razorpay_customer_id") // For Razorpay API integration
-
-  // Relations
-  messages ChatMessage[]
+  id                 Int           @id @default(autoincrement())
+  fullName           String        @map("full_name")
+  rcmId              String?       @unique @map("rcm_id")
+  email              String        @unique
+  phone              String?
+  password           String
+  role               Role          @default(USER)
+  createdAt          DateTime      @default(now())
+  autoPayStatus      Boolean       @default(false)
+  nextBillingDate    DateTime?
+  razorpayCustomerId String?       @map("razorpay_customer_id")
+  messages           ChatMessage[]
 
   @@map("users")
 }
 
-// =======================================================
-// Chat & Subscriber Models
-// =======================================================
 model ChatMessage {
   id        Int      @id @default(autoincrement())
   sender    String
-  message   String   @db.Text
+  message   String
   createdAt DateTime @default(now())
-
-  // Relations
-  user   User @relation(fields: [userId], references: [id])
-  userId Int
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
 
   @@map("chat_messages")
 }
@@ -66,15 +44,12 @@ model Subscriber {
   @@map("subscribers")
 }
 
-// =======================================================
-// Video Models (YouTube Links)
-// =======================================================
 model LeaderVideo {
   id          Int      @id @default(autoincrement())
   title       String
-  description String?  @db.Text
+  description String?
   videoUrl    String   @map("video_url")
-  publicId    String?  @map("public_id") // Stores YouTube video ID
+  publicId    String?  @map("public_id")
   createdAt   DateTime @default(now())
 
   @@index([title])
@@ -84,18 +59,15 @@ model LeaderVideo {
 model ProductVideo {
   id          Int      @id @default(autoincrement())
   title       String
-  description String?  @db.Text
+  description String?
   videoUrl    String   @map("video_url")
-  publicId    String?  @map("public_id") // Stores YouTube video ID
+  publicId    String?  @map("public_id")
   createdAt   DateTime @default(now())
 
   @@index([title])
   @@map("product_videos")
 }
 
-// =======================================================
-// Enum Definitions
-// =======================================================
 enum Role {
   USER
   ADMIN
