@@ -1,95 +1,115 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet'); 
-const rateLimit = require('express-rate-limit'); 
-const morgan = require('morgan'); 
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const morgan = require('morgan');
 
 // --- Route Imports ---
 const authRoutes = require('./routes/authRoutes');
 const subscriberRoutes = require('./routes/subscriberRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const userRoutes = require('./routes/userRoutes');
-const videoRoutes = require('./routes/videoRoutes'); 
-const adminRoutes = require('./routes/adminRoutes'); 
+const videoRoutes = require('./routes/videoRoutes');
+const adminRoutes = require('./routes/adminRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ----------------------------------------------------
-// ✅ CRITICAL FIX: CORS Must be the first middleware to handle preflight (OPTIONS) requests
+// ✅ FIXED: Robust and Flexible CORS for Render + Vercel
 // ----------------------------------------------------
-
-const allowedOrigins = [ 
-    'https://rcmai.in', 
-    'https://www.rcmai.in', 
-    'https://rcm-ai-admin-ui.vercel.app/'
-    
+const allowedOrigins = [
+  'https://rcmai.in',
+  'https://www.rcmai.in',
+  
+  'http://localhost:3000', // for local testing
 ];
 
-app.use(cors({
+app.use(
+  cors({
     origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.includes(origin)) {
-            return callback(null, true);
-        }
-        // Check for dynamic Render/Vercel URLs (for review branches, etc.)
-        if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
-            return callback(null, true);
-        }
-        callback(new Error('Not allowed by CORS'), false);
+      // Allow requests without origin (like Postman or curl)
+      if (!origin) return callback(null, true);
+
+      // Allow known domains
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      // ✅ Allow dynamic deploy preview URLs from Render or Vercel
+      if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
+        return callback(null, true);
+      }
+
+      console.warn('❌ Blocked by CORS:', origin);
+      return callback(new Error('Not allowed by CORS'), false);
     },
     credentials: true,
-}));
+  })
+);
 
-// --- Global Security & Middleware (After CORS) ---
+// ----------------------------------------------------
+// 🛡️ Security & Utility Middlewares
+// ----------------------------------------------------
 
-// 1. Helmet: Secure Express apps by setting various HTTP headers
+// Helmet - Security headers
 app.use(helmet());
 
-// 2. Rate Limiting: Limit repeated requests
+// Rate Limiting - Prevent brute force / abuse
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 1000, 
-    message: 'Too many requests from this IP, please try again after 15 minutes'
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000,
+  message: 'Too many requests from this IP, please try again after 15 minutes',
 });
 app.use(apiLimiter);
 
-// 3. Logging: HTTP request logger
-app.use(morgan('combined')); 
+// Morgan - Request logging
+app.use(morgan('combined'));
 
-// 4. Body Parsers: Increased limit for safety
-app.use(express.json({ limit: '50mb' })); 
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// JSON Body Parsing
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// ----------------------------------------------------
+// 🌐 Root Endpoint
+// ----------------------------------------------------
+app.get('/', (req, res) => {
+  res.send('✅ RCM AI Production-Ready Backend is running successfully!');
+});
 
-// --- Root Test Route ---
-app.get('/', (req, res) => res.send('RCM AI Production-Ready Backend is running!'));
-
-// --- Route Mounting ---
+// ----------------------------------------------------
+// 🚀 Route Mounting
+// ----------------------------------------------------
 app.use('/api/auth', authRoutes);
-app.use('/api', subscriberRoutes); 
-app.use('/api/chat', chatRoutes); 
+app.use('/api', subscriberRoutes);
+app.use('/api/chat', chatRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/videos', videoRoutes);
-app.use('/api/admin', adminRoutes); // Admin Routes Mounted
+app.use('/api/admin', adminRoutes);
 
-// --- Global Error Handlers ---
-
-// 404 Handler (Catch all unhandled routes)
+// ----------------------------------------------------
+// ❌ 404 Not Found
+// ----------------------------------------------------
 app.use((req, res, next) => {
-    res.status(404).json({ message: `Route Not Found: ${req.originalUrl}` });
+  res.status(404).json({ message: `Route Not Found: ${req.originalUrl}` });
 });
 
-// Centralized Error Handling Middleware
+// ----------------------------------------------------
+// ⚠️ Central Error Handler
+// ----------------------------------------------------
 app.use((err, req, res, next) => {
-    const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
-    res.status(statusCode);
-    res.json({
-        message: err.message,
-        stack: process.env.NODE_ENV === 'production' ? null : err.stack,
-    });
+  console.error('🔥 Global Error Handler:', err.message);
+  const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  res.status(statusCode).json({
+    message: err.message,
+    stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+  });
 });
 
-
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+// ----------------------------------------------------
+// 🚀 Start Server
+// ----------------------------------------------------
+app.listen(PORT, () =>
+  console.log(`✅ Server is running on port ${PORT}`)
+);
