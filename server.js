@@ -16,32 +16,24 @@ const adminRoutes = require('./routes/adminRoutes');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ✅ Fix “trust proxy” issue for Render
+app.set('trust proxy', 1);
+
 // ----------------------------------------------------
-// ✅ FIXED: Robust and Flexible CORS for Render + Vercel
+// ✅ CORS Setup for Render + Vercel
 // ----------------------------------------------------
 const allowedOrigins = [
   'https://rcmai.in',
   'https://www.rcmai.in',
-  
-  'http://localhost:3000', // for local testing
+  'http://localhost:3000', // local dev
 ];
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests without origin (like Postman or curl)
       if (!origin) return callback(null, true);
-
-      // Allow known domains
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      // ✅ Allow dynamic deploy preview URLs from Render or Vercel
-      if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
-        return callback(null, true);
-      }
-
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) return callback(null, true);
       console.warn('❌ Blocked by CORS:', origin);
       return callback(new Error('Not allowed by CORS'), false);
     },
@@ -52,22 +44,15 @@ app.use(
 // ----------------------------------------------------
 // 🛡️ Security & Utility Middlewares
 // ----------------------------------------------------
-
-// Helmet - Security headers
 app.use(helmet());
-
-// Rate Limiting - Prevent brute force / abuse
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000,
-  message: 'Too many requests from this IP, please try again after 15 minutes',
-});
-app.use(apiLimiter);
-
-// Morgan - Request logging
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 1000,
+    message: 'Too many requests from this IP, please try again after 15 minutes',
+  })
+);
 app.use(morgan('combined'));
-
-// JSON Body Parsing
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -75,7 +60,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // 🌐 Root Endpoint
 // ----------------------------------------------------
 app.get('/', (req, res) => {
-  res.send('✅ RCM AI Production-Ready Backend is running successfully!');
+  res.send('✅ RCM AI Production Backend is running successfully!');
 });
 
 // ----------------------------------------------------
@@ -89,14 +74,14 @@ app.use('/api/videos', videoRoutes);
 app.use('/api/admin', adminRoutes);
 
 // ----------------------------------------------------
-// ❌ 404 Not Found
+// ❌ 404 Handler
 // ----------------------------------------------------
 app.use((req, res, next) => {
   res.status(404).json({ message: `Route Not Found: ${req.originalUrl}` });
 });
 
 // ----------------------------------------------------
-// ⚠️ Central Error Handler
+// ⚠️ Global Error Handler
 // ----------------------------------------------------
 app.use((err, req, res, next) => {
   console.error('🔥 Global Error Handler:', err.message);
@@ -110,6 +95,4 @@ app.use((err, req, res, next) => {
 // ----------------------------------------------------
 // 🚀 Start Server
 // ----------------------------------------------------
-app.listen(PORT, () =>
-  console.log(`✅ Server is running on port ${PORT}`)
-);
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
