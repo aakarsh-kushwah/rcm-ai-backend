@@ -1,41 +1,50 @@
 // backend/controllers/adminController.js
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const db = require('../models/user.model');
+const User = db.user; // Assuming your Sequelize user model is named 'user'
 
-const userSelectFields = {
-    id: true, fullName: true, rcmId: true, email: true, phone: true, role: true, createdAt: true,
-};
+// Define which fields we want to include in the response
+const userSelectFields = ['id', 'fullName', 'rcmId', 'email', 'phone', 'role', 'createdAt'];
 
-// 1. Fetches only users with role 'USER' (for User Management table)
+// =======================================================
+// 1️⃣ Fetch only regular users (role = 'USER')
+// =======================================================
 const getRegularUsers = async (req, res) => {
-    try {
-        const users = await prisma.user.findMany({
-            where: { role: 'USER' },
-            select: userSelectFields,
-            orderBy: { createdAt: 'desc' },
-        });
+  try {
+    const users = await User.findAll({
+      where: { role: 'USER' },
+      attributes: userSelectFields,
+      order: [['createdAt', 'DESC']],
+    });
 
-        res.json({ success: true, data: users });
-    } catch (error) {
-        console.error("Error fetching regular users:", error);
-        res.status(500).json({ success: false, message: 'Internal server error.' });
-    }
+    res.status(200).json({ success: true, data: users });
+  } catch (error) {
+    console.error('❌ Error fetching regular users:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
 };
 
-// 2. Fetches only users with role 'ADMIN' (for Admin Management table)
+// =======================================================
+// 2️⃣ Fetch only admins (role = 'ADMIN')
+// =======================================================
 const getAllAdmins = async (req, res) => {
-    try {
-        const admins = await prisma.user.findMany({
-            where: { role: 'ADMIN' },
-            select: userSelectFields,
-            orderBy: { createdAt: 'desc' },
-        });
+  try {
+    const admins = await User.findAll({
+      where: { role: 'ADMIN' },
+      attributes: userSelectFields,
+      order: [['createdAt', 'DESC']],
+    });
 
-        res.json({ success: true, data: admins });
-    } catch (error) {
-        console.error("Error fetching admins:", error);
-        res.status(500).json({ success: false, message: 'Internal server error.' });
-    }
+    res.status(200).json({ success: true, data: admins });
+  } catch (error) {
+    console.error('❌ Error fetching admins:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
 };
 
-module.exports = { getRegularUsers, getAllAdmins };
+// =======================================================
+// 3️⃣ Exports
+// =======================================================
+module.exports = {
+  getRegularUsers,
+  getAllAdmins,
+};
