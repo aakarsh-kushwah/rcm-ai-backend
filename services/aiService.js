@@ -4,7 +4,7 @@ const Groq = require("groq-sdk");
 let groqClient = null;
 
 try {
-    const apiKey = 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;
+    const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
         console.warn(

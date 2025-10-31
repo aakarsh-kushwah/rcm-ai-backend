@@ -1,5 +1,4 @@
 require('dotenv').config();
-app.set('trust proxy', 1);
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -14,10 +13,10 @@ const userRoutes = require('./routes/userRoutes');
 const videoRoutes = require('./routes/videoRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 
-const app = express();
+const app = express(); // ✅ Declare first
 const PORT = process.env.PORT || 3001;
 
-// ✅ Fix “trust proxy” issue for Render
+// ✅ Fix “trust proxy” issue for Render (must be AFTER app is created)
 app.set('trust proxy', 1);
 
 // ----------------------------------------------------
@@ -29,7 +28,7 @@ const allowedOrigins = [
   'https://rcmai.in',
   'https://www.rcmai.in',
   'http://localhost:3000',
-  'http://localhost:3001', // ✅ add this for local backend/frontend testing
+  'http://localhost:3001', // local dev
 ];
 
 app.use(
@@ -37,7 +36,8 @@ app.use(
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
-      if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) return callback(null, true);
+      if (origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app'))
+        return callback(null, true);
       console.warn('❌ Blocked by CORS:', origin);
       return callback(new Error('Not allowed by CORS'), false);
     },
@@ -53,7 +53,8 @@ app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 1000,
-    message: 'Too many requests from this IP, please try again after 15 minutes',
+    message:
+      'Too many requests from this IP, please try again after 15 minutes',
   })
 );
 app.use(morgan('combined'));
