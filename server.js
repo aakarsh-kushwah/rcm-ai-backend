@@ -1,4 +1,5 @@
 require('dotenv').config();
+app.set('trust proxy', 1);
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -24,10 +25,11 @@ app.set('trust proxy', 1);
 // ----------------------------------------------------
 const allowedOrigins = [
   'https://rcm-ai-admin-ui.vercel.app',
- 
+  'https://rcm-ai-frontend.vercel.app',
   'https://rcmai.in',
   'https://www.rcmai.in',
-  'http://localhost:3000', // for local testing
+  'http://localhost:3000',
+  'http://localhost:3001', // ✅ add this for local backend/frontend testing
 ];
 
 app.use(
