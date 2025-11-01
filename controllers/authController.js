@@ -15,19 +15,32 @@ const register = async (req, res) => {
   const { fullName, rcmId, email, phone, password, role } = req.body;
 
   if (!fullName || !email || !password) {
-    return res.status(400).json({ message: 'Full name, email, and password are required.' });
+    return res.status(400).json({
+      message: 'Full name, email, and password are required.',
+    });
   }
 
   try {
     const User = getUserModel();
-    const existingUser = await User.findOne({ where: { email } });
 
+    // ✅ Check if email already exists
+    const existingUser = await User.findOne({ where: { email } });
     if (existingUser) {
       return res.status(400).json({ message: 'Email already registered.' });
     }
 
+    // ✅ Check if RCM ID already exists (only if provided)
+    if (rcmId) {
+      const existingRcm = await User.findOne({ where: { rcmId } });
+      if (existingRcm) {
+        return res.status(400).json({ message: 'RCM ID already registered.' });
+      }
+    }
+
+    // ✅ Hash the password
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // ✅ Create new user
     const newUser = await User.create({
       fullName,
       rcmId: rcmId || null,
@@ -38,17 +51,18 @@ const register = async (req, res) => {
       status: 'pending',
     });
 
-    // ✅ Create JWT token right after registration
+    // ✅ Create JWT token
     const token = jwt.sign(
       { id: newUser.id, role: newUser.role || 'USER' },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
 
+    // ✅ Send response with token and user info
     res.status(201).json({
       message: 'User created successfully.',
       userId: newUser.id,
-      token, // ✅ Include token so frontend can store it
+      token,
       user: {
         id: newUser.id,
         fullName: newUser.fullName,
@@ -60,9 +74,13 @@ const register = async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating user:', error);
-    res.status(500).json({ message: 'Error creating user.', error: error.message });
+    res.status(500).json({
+      message: 'Error creating user.',
+      error: error.message,
+    });
   }
 };
+
 
 
 // ----------------------------------------------------
