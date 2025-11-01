@@ -1,14 +1,22 @@
 // backend/controllers/adminController.js
-const User = require('../models/user.model'); // ✅ Directly import model
+const dbModule = require('../config/db');
 
-// Define which fields we want to include in the response
+// Safe way to get User model after db initialization
+let User;
+(async () => {
+  await dbModule.initialize(); // Ensure DB connection and model sync
+  User = dbModule.db.User;
+  console.log('✅ User model loaded successfully in adminController');
+})();
+
 const userSelectFields = ['id', 'fullName', 'rcmId', 'email', 'phone', 'role', 'createdAt'];
 
 // =======================================================
-// 1️⃣ Fetch only regular users (role = 'USER')
+// 1️⃣ Fetch only regular users
 // =======================================================
 const getRegularUsers = async (req, res) => {
   try {
+    if (!User) throw new Error('User model not initialized yet.');
     const users = await User.findAll({
       where: { role: 'USER' },
       attributes: userSelectFields,
@@ -23,10 +31,11 @@ const getRegularUsers = async (req, res) => {
 };
 
 // =======================================================
-// 2️⃣ Fetch only admins (role = 'ADMIN')
+// 2️⃣ Fetch only admins
 // =======================================================
 const getAllAdmins = async (req, res) => {
   try {
+    if (!User) throw new Error('User model not initialized yet.');
     const admins = await User.findAll({
       where: { role: 'ADMIN' },
       attributes: userSelectFields,
@@ -40,9 +49,6 @@ const getAllAdmins = async (req, res) => {
   }
 };
 
-// =======================================================
-// 3️⃣ Exports
-// =======================================================
 module.exports = {
   getRegularUsers,
   getAllAdmins,
