@@ -38,15 +38,32 @@ const register = async (req, res) => {
       status: 'pending',
     });
 
+    // ✅ Create JWT token right after registration
+    const token = jwt.sign(
+      { id: newUser.id, role: newUser.role || 'USER' },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
     res.status(201).json({
       message: 'User created successfully.',
       userId: newUser.id,
+      token, // ✅ Include token so frontend can store it
+      user: {
+        id: newUser.id,
+        fullName: newUser.fullName,
+        email: newUser.email,
+        rcmId: newUser.rcmId,
+        role: newUser.role,
+        status: newUser.status,
+      },
     });
   } catch (error) {
     console.error('Error creating user:', error);
     res.status(500).json({ message: 'Error creating user.', error: error.message });
   }
 };
+
 
 // ----------------------------------------------------
 // 🔐 LOGIN - User or Admin
