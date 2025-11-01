@@ -9,6 +9,7 @@ const { db, initialize } = require('./config/db');
 // Routes
 const authRoutes = require('./routes/authRoutes');
 const subscriberRoutes = require('./routes/subscriberRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const userRoutes = require('./routes/userRoutes');
 const videoRoutes = require('./routes/videoRoutes');
@@ -55,6 +56,7 @@ app.get('/', (req, res) => {
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api', subscriberRoutes);
+app.use('/api/payments', paymentRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/videos', videoRoutes);
