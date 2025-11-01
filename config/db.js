@@ -38,7 +38,7 @@ async function initialize() {
     db.sequelize = sequelize;
 
     // Sync all models
-    await sequelize.sync({ force: false, alter: true });
+    await sequelize.sync({ alter: false });
     console.log('✅ All models were synchronized successfully.');
   } catch (error) {
     console.error('❌ Unable to initialize the database:', error);
