@@ -1,13 +1,12 @@
 const express = require('express');
 const { addSubscriber, getAllSubscribers } = require('../controllers/subscriberController');
-const { protect, isAdmin } = require('../middleware/authMiddleware');
+const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware'); // ✅ 'protect' को 'isAuthenticated' से बदला गया
 const router = express.Router();
 
 // Public route
 router.post('/subscribe', addSubscriber);
 
-
-
-router.get('/subscribers', protect, isAdmin, getAllSubscribers);
+// Protected Admin route
+router.get('/subscribers', isAuthenticated, isAdmin, getAllSubscribers);
 
 module.exports = router;

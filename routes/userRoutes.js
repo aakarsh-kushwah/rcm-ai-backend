@@ -1,13 +1,17 @@
+// routes/userRoutes.js
+
 const express = require('express');
 const router = express.Router();
-// Assuming you import protect and isAdmin middleware
-const { protect, isAdmin } = require('../middleware/authMiddleware'); 
-const { deleteUser, updateUserData } = require('../controllers/userController'); // Import new functions
+// ✅ सिर्फ userController से इम्पोर्ट करें
+const { getMyProfile } = require('../controllers/userController'); 
+const { isAuthenticated } = require('../middleware/authMiddleware');
 
-// Route for deleting a user (Requires Admin role)
-router.delete('/:userId', protect, isAdmin, deleteUser); // ✅ NEW DELETE ROUTE
+// ----------------------------------------------------------------
+// 🛑 एरर फिक्स: यहाँ से 'deleteUser' और 'updateUserData' हटा दिया गया है
+// ----------------------------------------------------------------
 
-// Route for updating user data (Requires Admin role)
-router.put('/:userId', protect, isAdmin, updateUserData); // ✅ NEW UPDATE ROUTE
+// ✅ यह रूट सिर्फ़ लॉग-इन यूज़र को उसका *अपना* प्रोफ़ाइल दिखाता है
+// GET /api/users/me
+router.get('/me', isAuthenticated, getMyProfile);
 
 module.exports = router;

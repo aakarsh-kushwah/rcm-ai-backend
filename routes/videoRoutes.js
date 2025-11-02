@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
 
-// Middleware assumed to be available: protect (for authentication), isAdmin (for authorization)
-const { protect, isAdmin } = require('../middleware/authMiddleware'); 
+// Middleware (यह 'isAuthenticated' और 'isAdmin' को इम्पोर्ट करता है)
+// हम 'isAuthenticated' का इस्तेमाल करते हैं, जो डेटाबेस को हिट नहीं करता है
+const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware'); 
 
-// Import handlers from videoController.js
+// कंट्रोलर से सभी फ़ंक्शंस को इम्पोर्ट करें
 const { 
     saveVideoMetadata, 
     getLeaderVideos, 
@@ -15,22 +16,42 @@ const {
     deleteProductVideo
 } = require('../controllers/videoController'); 
 
+// ============================================================
+// 🔹 1. Public Routes (जो यूज़र लॉग इन हैं)
+// ============================================================
 
-router.post('/save-link', protect, isAdmin, saveVideoMetadata); 
+// GET /api/videos/leaders (यूज़र के लिए - पेजिनेशन के साथ)
+router.get('/leaders', isAuthenticated, getLeaderVideos); 
+
+// GET /api/videos/products (यूज़र के लिए - पेजिनेशन के साथ)
+router.get('/products', isAuthenticated, getProductVideos);
 
 
-router.get('/leaders', protect, getLeaderVideos); 
-// Path: PUT /api/videos/leaders/:id (Admin only)
-router.put('/leaders/:id', protect, isAdmin, updateLeaderVideo);
-// Path: DELETE /api/videos/leaders/:id (Admin only)
-router.delete('/leaders/:id', protect, isAdmin, deleteLeaderVideo);
+// ============================================================
+// 🔹 2. Admin Routes (सिर्फ़ एडमिन के लिए)
+// ============================================================
 
-// Product Video CRUD
-// Path: GET /api/videos/products
-router.get('/products', protect, getProductVideos);
-// Path: PUT /api/videos/products/:id (Admin only)
-router.put('/products/:id', protect, isAdmin, updateProductVideo);
-// Path: DELETE /api/videos/products/:id (Admin only)
-router.delete('/products/:id', protect, isAdmin, deleteProductVideo);
+// हम 'isAuthenticated' और 'isAdmin' दोनों का इस्तेमाल करते हैं
+router.use(isAuthenticated, isAdmin);
+
+// POST /api/videos/save-link (एक नया वीडियो सेव करें)
+router.post('/save-link', saveVideoMetadata); 
+
+// --- लीडर वीडियो के लिए एडमिन रूट्स ---
+
+// PUT /api/videos/leaders/:id (लीडर वीडियो अपडेट करें)
+router.put('/leaders/:id', updateLeaderVideo);
+
+// DELETE /api/videos/leaders/:id (लीडर वीडियो डिलीट करें)
+router.delete('/leaders/:id', deleteLeaderVideo);
+
+// --- प्रोडक्ट वीडियो के लिए एडमिन रूट्स ---
+
+// PUT /api/videos/products/:id (प्रोडक्ट वीडियो अपडेट करें)
+router.put('/products/:id', updateProductVideo);
+
+// DELETE /api/videos/products/:id (प्रोडक्ट वीडियो डिलीट करें)
+router.delete('/products/:id', deleteProductVideo);
 
 module.exports = router;
+

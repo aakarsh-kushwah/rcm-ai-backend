@@ -1,4 +1,3 @@
-// backend/controllers/subscriberController.js
 const { db } = require('../config/db'); // Import db with Sequelize instance
 
 // ✅ Add Subscriber
@@ -58,4 +57,5 @@ const getAllSubscribers = async (req, res) => {
   }
 };
 
+// ✅ यह 'module.exports' आपके 'undefined' एरर को ठीक करता है
 module.exports = { addSubscriber, getAllSubscribers };
