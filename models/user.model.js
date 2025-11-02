@@ -17,13 +17,13 @@ module.exports = (sequelize) => {
       rcmId: {
         type: DataTypes.STRING(200),
         allowNull: true,
-        unique: true,
+        unique: false, // ✅ BOHAT ZARURI: इसे 'true' से 'false' में बदल दिया गया है
         field: 'rcm_id',
       },
       email: {
         type: DataTypes.STRING(200),
         allowNull: false,
-        unique: true,
+        unique: false, // ✅ BOHAT ZARURI: इसे 'true' से 'false' में बदल दिया गया है
       },
       phone: {
         type: DataTypes.STRING(20),
