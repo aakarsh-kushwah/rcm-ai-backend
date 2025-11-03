@@ -58,11 +58,13 @@ const getAllChats = async (req, res) => {
       include: [
         {
           model: db.User,
-          attributes: ["email"],
+          as: 'User', // must match the association alias in db.js
+          attributes: ['email'],
         },
       ],
-      order: [["createdAt", "DESC"]],
+      order: [['createdAt', 'DESC']],
     });
+
 
     // Group messages by user email
     const chatsByUser = {};
