@@ -168,37 +168,39 @@ ${calculations.join('\n')}
 // 🔹 Admin: Get All Chats Grouped by User
 // ============================================================
 const getAllChats = async (req, res) => {
-    // ... (आपका getAllChats कोड... कोई बदलाव नहीं)
-    try {
-// ... (बाकी का कोड जैसा था वैसा ही है) ...
-        const allMessages = await db.ChatMessage.findAll({
-            include: [{ model: db.User, attributes: ["email"] }],
-            order: [["createdAt", "DESC"]],
-        });
-// ... (बाकी का कोड जैसा था वैसा ही है) ...
-        const chatsByUser = {};
-        allMessages.forEach((msg) => {
-            const email = msg.User ? msg.User.email : "Unknown User";
-// ... (बाकी का कोड जैसा था वैसा ही है) ...
-            if (!chatsByUser[email]) chatsByUser[email] = [];
-            chatsByUser[email].push({
-                sender: msg.sender,
-// ... (बाकी का कोड जैसा था वैसा ही है) ...
-                message: msg.message,
-                createdAt: msg.createdAt,
-            });
-        });
-// ... (बाकी का कोड जैसा था वैसा ही है) ...
-        res.status(200).json({ success: true, data: chatsByUser });
-    } catch (error) {
-        console.error("❌ Admin Chat Fetch Error:", error);
-// ... (बाकी का कोड जैसा था वैसा ही है) ...
-        res.status(500).json({
-            success: false,
-            message: "Failed to retrieve chat history.",
-            error: error.message,
-        });
-    }
+  try {
+    // Fetch chat messages with associated user email
+    const allMessages = await db.ChatMessage.findAll({
+      include: [
+        {
+          model: db.User,
+          attributes: ["email"],
+        },
+      ],
+      order: [["createdAt", "DESC"]],
+    });
+
+    // Group messages by user email
+    const chatsByUser = {};
+    allMessages.forEach((msg) => {
+      const email = msg.User ? msg.User.email : "Unknown User";
+      if (!chatsByUser[email]) chatsByUser[email] = [];
+      chatsByUser[email].push({
+        sender: msg.sender,
+        message: msg.message,
+        createdAt: msg.createdAt,
+      });
+    });
+
+    res.status(200).json({ success: true, data: chatsByUser });
+  } catch (error) {
+    console.error("❌ Admin Chat Fetch Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve chat history.",
+      error: error.message,
+    });
+  }
 };
 
 module.exports = { handleChat, getAllChats, handleCalculate };
