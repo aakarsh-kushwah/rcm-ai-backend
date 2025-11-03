@@ -23,13 +23,11 @@ router.get('/products', isAuthenticated, getProductVideos);
 // ============================================================
 // 2. Admin Routes (एडमिन के लिए)
 // ============================================================
-router.use(isAuthenticated, isAdmin);
+router.use(isAuthenticated, isAdmin); // Iske neeche sab routes admin-only hain
 
 // ✅ Naya Route: Multiple URLs ko scrape aur import karein
 // POST /api/videos/batch-scrape-import
 router.post('/batch-scrape-import', batchScrapeImport); 
-
-// --- (पुराने '/save-link' और '/batch-import' को हटा दिया गया है) ---
 
 // --- Leader Video Admin ---
 router.put('/leaders/:id', updateLeaderVideo);

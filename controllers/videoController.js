@@ -22,11 +22,11 @@ const getCleanVideoId = (url) => {
   
   // पुरानी regex (रेगेक्स) fallback
   const match = url.match(/(?:v=|\/)([^"&?\/\s]{11})/);
-  return match ? match[1] : url; // fallback
+  return match ? match[1] : null; // null रिटर्न करें अगर ID न मिले
 };
 
 // ============================================================
-// 🔹 1. ✅ Naya: URL Scraper (100% Free)
+// 🔹 1. Naya: URL Scraper (100% Free)
 // यह टाइटल और विवरण को सीधे YouTube पेज से लाता है
 // ============================================================
 const fetchUrlDetails = async (videoUrl) => {
@@ -44,7 +44,7 @@ const fetchUrlDetails = async (videoUrl) => {
     const title = response.data.title;
     // oEmbed विवरण नहीं देता, इसलिए हम उसे खाली छोड़ देंगे (या टाइटल का इस्तेमाल करेंगे)
     const description = response.data.author_name || ''; 
-    const thumbnailUrl = response.data.thumbnail_url || '';
+    const thumbnailUrl = response.data.thumbnail_url || `https://i.ytimg.com/vi/${publicId}/mqdefault.jpg`;
 
     return {
       title,
@@ -61,7 +61,7 @@ const fetchUrlDetails = async (videoUrl) => {
 
 
 // ============================================================
-// 🔹 2. ✅ Naya: Batch Scrape & Import (Multiple URLs)
+// 🔹 2. Naya: Batch Scrape & Import (Multiple URLs)
 // ============================================================
 const batchScrapeImport = async (req, res) => {
     const { urls, videoType } = req.body;
@@ -70,9 +70,12 @@ const batchScrapeImport = async (req, res) => {
     }
 
     const Model = videoType === 'leaders' ? db.LeaderVideo : db.ProductVideo;
+    if (!Model) {
+        return res.status(500).json({ success: false, message: 'Database model not ready.' });
+    }
 
     try {
-        // 1. ✅ Scalable: सभी URLs को एक साथ (parallel) स्क्रैप करें
+        // 1. Scalable: सभी URLs को एक साथ (parallel) स्क्रैप करें
         const scrapePromises = urls.map(url => fetchUrlDetails(url));
         const results = await Promise.allSettled(scrapePromises);
 
@@ -82,10 +85,10 @@ const batchScrapeImport = async (req, res) => {
             .map(res => res.value);
 
         if (successfulScrapes.length === 0) {
-             return res.status(400).json({ success: false, message: 'Failed to fetch details for all provided URLs.' });
+             return res.status(400).json({ success: false, message: 'Failed to fetch details for all provided URLs. Are they valid YouTube links?' });
         }
 
-        // 3. ✅ Safe: डुप्लीकेट चेक करें
+        // 3. Safe: डुप्लीकेट चेक करें
         const existingPublicIds = (await Model.findAll({
             attributes: ['publicId'],
             where: {
@@ -99,12 +102,12 @@ const batchScrapeImport = async (req, res) => {
         if (newVideosToSave.length === 0) {
             return res.status(200).json({ 
                 success: true, 
-                message: `All ${successfulScrapes.length} videos are already in your database.`,
+                message: `All ${successfulScrapes.length} valid videos are already in your database.`,
                 importedCount: 0 
             });
         }
 
-        // 5. ✅ Zero Load: एक ही कमांड में सभी नए वीडियो सेव करें
+        // 5. Zero Load: एक ही कमांड में सभी नए वीडियो सेव करें
         await Model.bulkCreate(newVideosToSave);
 
         res.status(201).json({
@@ -127,7 +130,11 @@ const batchScrapeImport = async (req, res) => {
 // 🔹 3. Get Videos (Production Ready - Pagination)
 // ============================================================
 const getVideos = async (Model, req, res) => {
+  if (!Model) {
+    return res.status(500).json({ success: false, message: 'Database model not ready.' });
+  }
   try {
+    // Page 1, Limit 20 (default)
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const offset = (page - 1) * limit;
@@ -162,6 +169,9 @@ const getVideos = async (Model, req, res) => {
 const updateVideo = async (Model, req, res) => {
   const { id } = req.params;
   const { title, description } = req.body;
+  if (!Model) {
+    return res.status(500).json({ success: false, message: 'Database model not ready.' });
+  }
 
   if (!title) {
     return res.status(400).json({ success: false, message: 'Title is required.' });
@@ -195,6 +205,10 @@ const updateVideo = async (Model, req, res) => {
 // ============================================================
 const deleteVideo = async (Model, req, res) => {
   const { id } = req.params;
+  if (!Model) {
+    return res.status(500).json({ success: false, message: 'Database model not ready.' });
+  }
+
   try {
     const deleted = await Model.destroy({ where: { id: parseInt(id) } });
     if (!deleted) {
@@ -213,7 +227,6 @@ const deleteVideo = async (Model, req, res) => {
 // ============================================================
 // 🔹 6. Exports
 // ============================================================
-// (saveVideoMetadata को हटा दिया गया है)
 exports.batchScrapeImport = batchScrapeImport; // ✅ Naya export
 
 // Leader Videos
