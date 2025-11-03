@@ -1,6 +1,8 @@
+// backend/services/aiService.js
+
 const Groq = require("groq-sdk");
 
-// ✅ Safe initialization
+// ✅ सुरक्षित initialization
 let groqClient = null;
 
 try {
@@ -18,48 +20,71 @@ try {
     console.error("❌ Failed to initialize Groq client:", err.message);
 }
 
-// ✅ Model selection (use stable and supported one)
-const MODEL = "llama-3.3-70b-versatile";
+// --- ✅ प्रोडक्शन रेडी: मॉडल लिस्ट ---
+// हम Llama 3 (बेस्ट) को ट्राई करेंगे, और अगर वह फेल होता है तो Mixtral (सेकंड बेस्ट) पर जाएँगे
+const MODELS = [
+    "llama3-70b-8192",      // 1. प्राइमरी (सबसे पावरफुल)
+    "mixtral-8x7b-32768"   // 2. फॉलबैक (दूसरा सबसे अच्छा)
+];
 
 /**
- * Safely handles AI chat response.
+ * Safely handles AI chat response with failover.
  * @param {Array<Object>} messages - Chat messages array.
  * @returns {Promise<string>} - AI-generated message or fallback.
  */
 async function getAIChatResponse(messages) {
-    try {
-        // 1️⃣ Basic validation
-        if (
-            !messages ||
-            !Array.isArray(messages) ||
-            messages.length === 0 ||
-            !messages.some((m) => m.role === "user")
-        ) {
-            return "⚠️ Invalid input: No user message provided.";
-        }
-
-        // 2️⃣ Ensure Groq client is ready
-        if (!groqClient) {
-            console.error("🚫 Groq client not initialized (missing API key).");
-            return "⚠️ AI service unavailable. Please contact the administrator.";
-        }
-
-        // 3️⃣ Call Groq API
-        const chatCompletion = await groqClient.chat.completions.create({
-            model: MODEL,
-            messages,
-            temperature: 0.5,
+    // 1️⃣ Groq client है या नहीं, यह चेक करें
+    if (!groqClient) {
+        console.error("🚫 Groq client not initialized (missing API key).");
+        return JSON.stringify({
+            type: "text",
+            content: "⚠️ AI service is unavailable. Please contact the administrator."
         });
-
-        // 4️⃣ Extract response
-        return (
-            chatCompletion?.choices?.[0]?.message?.content ||
-            "🤖 Sorry, I couldn't generate a response."
-        );
-    } catch (error) {
-        console.error("❌ Groq AI Service Error:", error.message);
-        return "⚠️ An internal error occurred while processing your request.";
     }
+
+    // 2️⃣ बेसिक वैलिडेशन
+    if (
+        !messages ||
+        !Array.isArray(messages) ||
+        messages.length === 0 ||
+        !messages.some((m) => m.role === "user")
+    ) {
+        return JSON.stringify({
+            type: "text",
+            content: "⚠️ Invalid input: No user message provided."
+        });
+    }
+
+    // 3️⃣ ✅ "Heavy Traffic" के लिए मल्टिपल मॉडल को ट्राई करें
+    for (const model of MODELS) {
+        try {
+            const chatCompletion = await groqClient.chat.completions.create({
+                model: model,
+                messages,
+                temperature: 0.5,
+            });
+            
+            const content = chatCompletion?.choices?.[0]?.message?.content;
+            
+            if (content) {
+                // 4️⃣ सफल जवाब
+                return content; // (यह JSON स्ट्रिंग या टेक्स्ट हो सकता है)
+            }
+            // अगर content खाली है, तो अगले मॉडल को ट्राई करें
+
+        } catch (error) {
+            // अगर यह मॉडल फेल होता है, तो अगले को ट्राई करें
+            console.warn(`❌ Groq model "${model}" failed:`, error.message);
+            // (अगले लूप में अगला मॉडल ट्राई होगा)
+        }
+    }
+
+    // 5️⃣ अगर सारे मॉडल फेल हो जाएँ
+    console.error("❌ All Groq models failed to respond.");
+    return JSON.stringify({
+        type: "text",
+        content: "⚠️ AI service is temporarily overloaded. Please try again in a moment."
+    });
 }
 
 module.exports = { getAIChatResponse };
