@@ -1,6 +1,7 @@
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { db } = require('../config/db');
+const { Op } = require('sequelize'); // ✅ Login में 'OR' के लिए ज़रूरी
 
 // Helper to safely access model after DB init
 function getUserModel() {
@@ -51,7 +52,7 @@ const register = async (req, res) => {
       status: 'pending',
     });
 
-    // ✅ Create JWT token
+    // ✅ Create JWT token (Smart Token)
     const token = jwt.sign(
       { id: newUser.id, role: newUser.role || 'USER' },
       process.env.JWT_SECRET,
@@ -99,21 +100,31 @@ const login = async (req, res) => {
     const User = getUserModel();
     let user;
 
+    // ✅ Login ID या RCM ID, दोनों से लॉगिन
     if (loginId.includes('@')) {
       user = await User.findOne({ where: { email: loginId } });
     } else {
-      user = await User.findOne({ where: { rcmId: loginId } });
+      user = await User.findOne({ 
+        where: { 
+          [Op.or]: [
+            { rcmId: loginId },
+            { email: loginId } // RCM ID की तरह दिखने वाले ईमेल के लिए फॉलबैक
+          ]
+        } 
+      });
     }
 
     if (!user) {
       return res.status(401).json({ message: 'Invalid login ID or password.' });
     }
 
+    // ✅ पासवर्ड चेक करें
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: 'Invalid login ID or password.' });
     }
 
+    // ✅ "Smart" Token बनाएँ (Heavy Traffic के लिए)
     const token = jwt.sign(
       { id: user.id, role: user.role || 'USER' },
       process.env.JWT_SECRET,
@@ -121,6 +132,7 @@ const login = async (req, res) => {
     );
 
     res.json({
+      success: true, // ✅ 'success' फ़्लैग जोड़ा गया
       token,
       user: {
         id: user.id,
@@ -133,7 +145,7 @@ const login = async (req, res) => {
     });
   } catch (error) {
     console.error('Login failed:', error);
-    res.status(500).json({ message: 'Login failed.', error: error.message });
+    res.status(500).json({ success: false, message: 'Login failed.', error: error.message });
   }
 };
 
@@ -178,3 +190,4 @@ const adminSignup = async (req, res) => {
 };
 
 module.exports = { register, login, adminSignup };
+

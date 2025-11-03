@@ -19,7 +19,7 @@ try {
 }
 
 // ✅ Model selection (use stable and supported one)
-const MODEL = "openai/gpt-oss-120b";
+const MODEL = "llama-3.3-70b-versatile";
 
 /**
  * Safely handles AI chat response.
