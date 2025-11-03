@@ -1,158 +1,227 @@
 // backend/controllers/videoController.js
 const { db } = require('../config/db'); 
+const { Op } = require('sequelize');
+const axios = require('axios'); // ✅ HTML लाने के लिए
+const cheerio = require('cheerio'); // ✅ HTML पढ़ने के लिए
 
 // ============================================================
-// 🔹 Helper: Extract YouTube Video ID (11 characters)
+// 🔹 Helper: Extract YouTube Video ID
 // ============================================================
 const getCleanVideoId = (url) => {
-  const youtubeMatch = url.match(
-    /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/
-  );
-  if (youtubeMatch && youtubeMatch[1]) {
-    return youtubeMatch[1];
-  }
-  return url; // fallback if not standard YouTube URL
-};
-
-// ============================================================
-// 🔹 1. Save Video Metadata (POST /api/videos/save-link)
-// ============================================================
-const saveVideoMetadata = async (req, res) => {
-  const { title, description, videoUrl, videoType } = req.body;
-
-  const publicId = getCleanVideoId(videoUrl);
-  const Model = videoType === 'leaders' ? db.LeaderVideo : db.ProductVideo;
-
-  if (!title || !videoUrl || publicId.length !== 11) {
-    return res.status(400).json({
-      success: false,
-      message:
-        'Invalid or missing Title or YouTube URL. Ensure the URL is correct.',
-    });
-  }
-
   try {
-    const video = await Model.create({
-      title,
-      description: description || '',
-      videoUrl,
-      publicId,
-    });
-
-    res.status(201).json({
-      success: true,
-      message: 'Video link saved successfully!',
-      data: video,
-    });
+    const videoUrl = new URL(url);
+    if (videoUrl.hostname === 'youtu.be') {
+      return videoUrl.pathname.slice(1); // 'youtu.be/' के बाद
+    }
+    if (videoUrl.hostname.includes('youtube.com') && videoUrl.pathname === '/watch') {
+      return videoUrl.searchParams.get('v'); // 'v=' के बाद
+    }
   } catch (error) {
-    console.error('❌ VIDEO METADATA SAVE FAILED:', error);
-    res.status(500).json({
-      success: false,
-      message: 'An internal server error occurred during metadata save.',
-    });
+    // अगर URL गलत है
   }
+  
+  // पुरानी regex (रेगेक्स) fallback
+  const match = url.match(/(?:v=|\/)([^"&?\/\s]{11})/);
+  return match ? match[1] : url; // fallback
 };
 
 // ============================================================
-// 🔹 2. Get Videos (GET /api/videos)
+// 🔹 1. ✅ Naya: URL Scraper (100% Free)
+// यह टाइटल और विवरण को सीधे YouTube पेज से लाता है
+// ============================================================
+const fetchUrlDetails = async (videoUrl) => {
+  try {
+    const publicId = getCleanVideoId(videoUrl);
+    if (!publicId || publicId.length !== 11) {
+      throw new Error('Invalid YouTube URL');
+    }
+    
+    // (YouTube oEmbed API का इस्तेमाल करें - यह फ्री है और API Key नहीं माँगता)
+    const oEmbedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${publicId}&format=json`;
+    
+    const response = await axios.get(oEmbedUrl);
+    
+    const title = response.data.title;
+    // oEmbed विवरण नहीं देता, इसलिए हम उसे खाली छोड़ देंगे (या टाइटल का इस्तेमाल करेंगे)
+    const description = response.data.author_name || ''; 
+    const thumbnailUrl = response.data.thumbnail_url || '';
+
+    return {
+      title,
+      description,
+      publicId,
+      videoUrl: `https://www.youtube.com/watch?v=${publicId}`,
+      thumbnailUrl,
+    };
+  } catch (error) {
+    console.warn(`⚠️ Failed to scrape URL: ${videoUrl}. Error: ${error.message}`);
+    return null; // जो URL फेल हो, उसे छोड़ दें
+  }
+};
+
+
+// ============================================================
+// 🔹 2. ✅ Naya: Batch Scrape & Import (Multiple URLs)
+// ============================================================
+const batchScrapeImport = async (req, res) => {
+    const { urls, videoType } = req.body;
+    if (!Array.isArray(urls) || urls.length === 0) {
+        return res.status(400).json({ success: false, message: 'No URLs provided.' });
+    }
+
+    const Model = videoType === 'leaders' ? db.LeaderVideo : db.ProductVideo;
+
+    try {
+        // 1. ✅ Scalable: सभी URLs को एक साथ (parallel) स्क्रैप करें
+        const scrapePromises = urls.map(url => fetchUrlDetails(url));
+        const results = await Promise.allSettled(scrapePromises);
+
+        // 2. जो स्क्रैप सफल हुए, उन्हें फ़िल्टर करें
+        const successfulScrapes = results
+            .filter(res => res.status === 'fulfilled' && res.value)
+            .map(res => res.value);
+
+        if (successfulScrapes.length === 0) {
+             return res.status(400).json({ success: false, message: 'Failed to fetch details for all provided URLs.' });
+        }
+
+        // 3. ✅ Safe: डुप्लीकेट चेक करें
+        const existingPublicIds = (await Model.findAll({
+            attributes: ['publicId'],
+            where: {
+                publicId: { [Op.in]: successfulScrapes.map(v => v.publicId) }
+            }
+        })).map(v => v.publicId);
+
+        // 4. सिर्फ़ नए वीडियो को फ़िल्टर करें
+        const newVideosToSave = successfulScrapes.filter(video => !existingPublicIds.includes(video.publicId));
+
+        if (newVideosToSave.length === 0) {
+            return res.status(200).json({ 
+                success: true, 
+                message: `All ${successfulScrapes.length} videos are already in your database.`,
+                importedCount: 0 
+            });
+        }
+
+        // 5. ✅ Zero Load: एक ही कमांड में सभी नए वीडियो सेव करें
+        await Model.bulkCreate(newVideosToSave);
+
+        res.status(201).json({
+            success: true,
+            message: `Import complete! Added ${newVideosToSave.length} new videos. (Skipped ${existingPublicIds.length} duplicates / ${results.length - successfulScrapes.length} failures).`,
+            importedCount: newVideosToSave.length
+        });
+
+    } catch (error) {
+        console.error('❌ BATCH SCRAPE FAILED:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message || 'An internal server error occurred during batch import.',
+        });
+    }
+};
+
+
+// ============================================================
+// 🔹 3. Get Videos (Production Ready - Pagination)
 // ============================================================
 const getVideos = async (Model, req, res) => {
-  const { search } = req.query;
   try {
-    const videos = await Model.findAll({
-      where: search
-        ? { title: { [db.Sequelize.Op.like]: `%${search}%` } }
-        : undefined,
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    const { count, rows } = await Model.findAndCountAll({
       order: [['createdAt', 'DESC']],
+      limit: limit,
+      offset: offset,
     });
 
-    res.status(200).json({ success: true, data: videos });
+    res.status(200).json({
+      success: true,
+      data: rows,
+      pagination: {
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+        currentPage: page,
+      },
+    });
   } catch (error) {
     console.error(`❌ Fetch Videos Failed (${Model.name}):`, error);
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch videos due to a server error.',
+      message: 'Failed to fetch videos.',
     });
   }
 };
 
 // ============================================================
-// 🔹 3. Update Video (PUT /api/videos/:id)
+// 🔹 4. Update Video
 // ============================================================
 const updateVideo = async (Model, req, res) => {
   const { id } = req.params;
   const { title, description } = req.body;
 
   if (!title) {
-    return res
-      .status(400)
-      .json({ success: false, message: 'Title is required for update.' });
+    return res.status(400).json({ success: false, message: 'Title is required.' });
   }
 
   try {
-    const [updatedCount, updatedRows] = await Model.update(
+    const [updatedCount] = await Model.update(
       { title, description },
-      { where: { id: parseInt(id) }, returning: true }
+      { where: { id: parseInt(id) } }
     );
 
     if (updatedCount === 0) {
-      return res
-        .status(404)
-        .json({ success: false, message: `Video with ID ${id} not found.` });
+      return res.status(404).json({ success: false, message: `Video ID ${id} not found.` });
     }
 
     res.status(200).json({
       success: true,
       message: 'Video updated successfully!',
-      data: updatedRows[0],
     });
   } catch (error) {
     console.error(`❌ Update Failed (${Model.name} ID: ${id}):`, error);
     res.status(500).json({
       success: false,
-      message: 'Failed to update video due to a server error.',
+      message: 'Failed to update video.',
     });
   }
 };
 
 // ============================================================
-// 🔹 4. Delete Video (DELETE /api/videos/:id)
+// 🔹 5. Delete Video
 // ============================================================
 const deleteVideo = async (Model, req, res) => {
   const { id } = req.params;
-
   try {
     const deleted = await Model.destroy({ where: { id: parseInt(id) } });
-
     if (!deleted) {
-      return res
-        .status(404)
-        .json({ success: false, message: 'Video not found or already deleted.' });
+      return res.status(404).json({ success: false, message: 'Video not found.' });
     }
-
-    res.status(200).json({ success: true, message: 'Video deleted successfully.' });
+    res.status(200).json({ success: true, message: 'Video deleted.' });
   } catch (error) {
     console.error(`❌ Delete Failed (${Model.name} ID: ${id}):`, error);
     res.status(500).json({
       success: false,
-      message: 'Failed to delete video due to a server error.',
+      message: 'Failed to delete video.',
     });
   }
 };
 
 // ============================================================
-// 🔹 5. Exports (Controller Mappings)
+// 🔹 6. Exports
 // ============================================================
+// (saveVideoMetadata को हटा दिया गया है)
+exports.batchScrapeImport = batchScrapeImport; // ✅ Naya export
 
-// ✅ Save new YouTube video metadata
-exports.saveVideoMetadata = saveVideoMetadata;
-
-// ✅ Leader Videos
+// Leader Videos
 exports.getLeaderVideos = (req, res) => getVideos(db.LeaderVideo, req, res);
 exports.updateLeaderVideo = (req, res) => updateVideo(db.LeaderVideo, req, res);
 exports.deleteLeaderVideo = (req, res) => deleteVideo(db.LeaderVideo, req, res);
 
-// ✅ Product Videos
+// Product Videos
 exports.getProductVideos = (req, res) => getVideos(db.ProductVideo, req, res);
 exports.updateProductVideo = (req, res) => updateVideo(db.ProductVideo, req, res);
 exports.deleteProductVideo = (req, res) => deleteVideo(db.ProductVideo, req, res);
