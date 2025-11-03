@@ -1,49 +1,66 @@
 // backend/controllers/videoController.js
 const { db } = require('../config/db'); 
 const { Op } = require('sequelize');
-const axios = require('axios'); // ✅ HTML लाने के लिए
-const cheerio = require('cheerio'); // ✅ HTML पढ़ने के लिए
+const axios = require('axios'); // HTML लाने के लिए
+const cheerio = require('cheerio'); // HTML पढ़ने के लिए
 
 // ============================================================
-// 🔹 Helper: Extract YouTube Video ID
+// 🔹 Helper 1: Extract YouTube Video ID (Updated)
 // ============================================================
 const getCleanVideoId = (url) => {
   try {
     const videoUrl = new URL(url);
+    let publicId = '';
+
     if (videoUrl.hostname === 'youtu.be') {
-      return videoUrl.pathname.slice(1); // 'youtu.be/' के बाद
+      publicId = videoUrl.pathname.slice(1);
+    } else if (videoUrl.hostname.includes('youtube.com')) {
+      if (videoUrl.pathname === '/watch') {
+        publicId = videoUrl.searchParams.get('v');
+      } else if (videoUrl.pathname.startsWith('/live/')) {
+        publicId = videoUrl.pathname.split('/live/')[1];
+      } else if (videoUrl.pathname.startsWith('/shorts/')) {
+        publicId = videoUrl.pathname.split('/shorts/')[1];
+      }
     }
-    if (videoUrl.hostname.includes('youtube.com') && videoUrl.pathname === '/watch') {
-      return videoUrl.searchParams.get('v'); // 'v=' के बाद
+    if (publicId) {
+      return publicId.split('?')[0].split('&')[0];
     }
   } catch (error) {
-    // अगर URL गलत है
+    // Fallback
   }
-  
-  // पुरानी regex (रेगेक्स) fallback
-  const match = url.match(/(?:v=|\/)([^"&?\/\s]{11})/);
-  return match ? match[1] : null; // null रिटर्न करें अगर ID न मिले
+  const match = url.match(/(?:v=|youtu\.be\/|\/live\/|\/shorts\/)([^"&?\/\s]{11})/);
+  return match ? match[1] : null;
 };
 
 // ============================================================
-// 🔹 1. Naya: URL Scraper (100% Free)
-// यह टाइटल और विवरण को सीधे YouTube पेज से लाता है
+// 🔹 Helper 2: ✅ Naya - Emoji Remover
+// यह टाइटल और विवरण से Emojis (जैसे '🔥') को हटाता है
+// ============================================================
+const removeEmojis = (str) => {
+  if (!str) return '';
+  // यह regex (रेगेक्स) ज़्यादातर Emojis को पकड़ लेता है
+  return str.replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '').trim();
+};
+
+
+// ============================================================
+// 🔹 3. URL Scraper (100% Free) - (Updated)
 // ============================================================
 const fetchUrlDetails = async (videoUrl) => {
   try {
     const publicId = getCleanVideoId(videoUrl);
     if (!publicId || publicId.length !== 11) {
-      throw new Error('Invalid YouTube URL');
+      throw new Error(`Invalid YouTube ID extracted: ${publicId}`);
     }
     
-    // (YouTube oEmbed API का इस्तेमाल करें - यह फ्री है और API Key नहीं माँगता)
     const oEmbedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${publicId}&format=json`;
     
     const response = await axios.get(oEmbedUrl);
     
-    const title = response.data.title;
-    // oEmbed विवरण नहीं देता, इसलिए हम उसे खाली छोड़ देंगे (या टाइटल का इस्तेमाल करेंगे)
-    const description = response.data.author_name || ''; 
+    // ✅ FIX: यहाँ Emojis को हटाया गया
+    const title = removeEmojis(response.data.title);
+    const description = removeEmojis(response.data.author_name) || ''; 
     const thumbnailUrl = response.data.thumbnail_url || `https://i.ytimg.com/vi/${publicId}/mqdefault.jpg`;
 
     return {
@@ -55,13 +72,13 @@ const fetchUrlDetails = async (videoUrl) => {
     };
   } catch (error) {
     console.warn(`⚠️ Failed to scrape URL: ${videoUrl}. Error: ${error.message}`);
-    return null; // जो URL फेल हो, उसे छोड़ दें
+    return null; 
   }
 };
 
 
 // ============================================================
-// 🔹 2. Naya: Batch Scrape & Import (Multiple URLs)
+// 🔹 4. Batch Scrape & Import (Multiple URLs)
 // ============================================================
 const batchScrapeImport = async (req, res) => {
     const { urls, videoType } = req.body;
@@ -127,14 +144,13 @@ const batchScrapeImport = async (req, res) => {
 
 
 // ============================================================
-// 🔹 3. Get Videos (Production Ready - Pagination)
+// 🔹 5. Get Videos (Production Ready - Pagination)
 // ============================================================
 const getVideos = async (Model, req, res) => {
   if (!Model) {
     return res.status(500).json({ success: false, message: 'Database model not ready.' });
   }
   try {
-    // Page 1, Limit 20 (default)
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const offset = (page - 1) * limit;
@@ -164,7 +180,7 @@ const getVideos = async (Model, req, res) => {
 };
 
 // ============================================================
-// 🔹 4. Update Video
+// 🔹 6. Update Video
 // ============================================================
 const updateVideo = async (Model, req, res) => {
   const { id } = req.params;
@@ -173,13 +189,17 @@ const updateVideo = async (Model, req, res) => {
     return res.status(500).json({ success: false, message: 'Database model not ready.' });
   }
 
-  if (!title) {
+  // ✅ FIX: अपडेट करते समय भी Emojis हटाएँ
+  const cleanedTitle = removeEmojis(title);
+  const cleanedDescription = removeEmojis(description);
+
+  if (!cleanedTitle) {
     return res.status(400).json({ success: false, message: 'Title is required.' });
   }
 
   try {
     const [updatedCount] = await Model.update(
-      { title, description },
+      { title: cleanedTitle, description: cleanedDescription },
       { where: { id: parseInt(id) } }
     );
 
@@ -201,7 +221,7 @@ const updateVideo = async (Model, req, res) => {
 };
 
 // ============================================================
-// 🔹 5. Delete Video
+// 🔹 7. Delete Video
 // ============================================================
 const deleteVideo = async (Model, req, res) => {
   const { id } = req.params;
@@ -225,9 +245,9 @@ const deleteVideo = async (Model, req, res) => {
 };
 
 // ============================================================
-// 🔹 6. Exports
+// 🔹 8. Exports
 // ============================================================
-exports.batchScrapeImport = batchScrapeImport; // ✅ Naya export
+exports.batchScrapeImport = batchScrapeImport; 
 
 // Leader Videos
 exports.getLeaderVideos = (req, res) => getVideos(db.LeaderVideo, req, res);
