@@ -30,16 +30,13 @@ const MODELS = [
 /**
  * Safely handles AI chat response with failover.
  * @param {Array<Object>} messages - Chat messages array.
- * @returns {Promise<string>} - AI-generated message or fallback.
+ * @returns {Promise<string>} - AI-generated message (text or JSON string) or an error message.
  */
 async function getAIChatResponse(messages) {
     // 1️⃣ Groq client है या नहीं, यह चेक करें
     if (!groqClient) {
         console.error("🚫 Groq client not initialized (missing API key).");
-        return JSON.stringify({
-            type: "text",
-            content: "⚠️ AI service is unavailable. Please contact the administrator."
-        });
+        return "⚠️ AI service is unavailable. Please contact the administrator.";
     }
 
     // 2️⃣ बेसिक वैलिडेशन
@@ -49,10 +46,7 @@ async function getAIChatResponse(messages) {
         messages.length === 0 ||
         !messages.some((m) => m.role === "user")
     ) {
-        return JSON.stringify({
-            type: "text",
-            content: "⚠️ Invalid input: No user message provided."
-        });
+        return "⚠️ Invalid input: No user message provided.";
     }
 
     // 3️⃣ ✅ "Heavy Traffic" के लिए मल्टिपल मॉडल को ट्राई करें
@@ -68,9 +62,11 @@ async function getAIChatResponse(messages) {
             
             if (content) {
                 // 4️⃣ सफल जवाब
-                return content; // (यह JSON स्ट्रिंग या टेक्स्ट हो सकता है)
+                // (यह एक टेक्स्ट स्ट्रिंग या JSON स्ट्रिंग हो सकती है, जिसे chatController हैंडल करेगा)
+                return content; 
             }
             // अगर content खाली है, तो अगले मॉडल को ट्राई करें
+            console.warn(`⚠️ Groq model "${model}" returned empty content.`);
 
         } catch (error) {
             // अगर यह मॉडल फेल होता है, तो अगले को ट्राई करें
@@ -81,10 +77,7 @@ async function getAIChatResponse(messages) {
 
     // 5️⃣ अगर सारे मॉडल फेल हो जाएँ
     console.error("❌ All Groq models failed to respond.");
-    return JSON.stringify({
-        type: "text",
-        content: "⚠️ AI service is temporarily overloaded. Please try again in a moment."
-    });
+    return "⚠️ AI service is temporarily overloaded. Please try again in a moment.";
 }
 
 module.exports = { getAIChatResponse };
