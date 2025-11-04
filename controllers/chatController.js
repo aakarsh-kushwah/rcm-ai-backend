@@ -5,76 +5,127 @@ const { db } = require('../config/db');
 const { MASTER_PROMPT } = require('../utils/prompts'); 
 
 // ============================================================
-// 🔹 1. Handle User Chat (AI) - (Updated)
+// 🔹 1. Helper Function: Emojis को हटाने के लिए
+// (यह 'Incorrect string value' वाले एरर को रोकता है)
+// ============================================================
+const removeEmojis = (str) => {
+  if (!str) return '';
+  // यह regex (रेगेक्स) ज़्यादातर Emojis और खास सिंबल को पकड़ लेता है
+  return str.replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '').trim();
+};
+
+
+// ============================================================
+// 🔹 2. Handle User Chat (AI) - (Updated)
 // ============================================================
 const handleChat = async (req, res) => {
     // ❌ 'mode' ko hata diya gaya hai
     const { message } = req.body; 
     const userId = req.user ? req.user.id : null;
+    let replyFromAI; // AI का जवाब
+    let replyObject; // AI का JSON ऑब्जेक्ट
 
     if (!message) {
-        return res
-            .status(400)
-            .json({ success: false, message: "Message content cannot be empty." });
+        return res.status(400).json({ success: false, message: "Message content cannot be empty." });
     }
 
     try {
-        // 1️⃣ Hamesha "Master Prompt" ka istemal karein
-        const systemPrompt = MASTER_PROMPT;
-
+        // 1️⃣ AI का जवाब लाएँ
+        const systemPrompt = MASTER_PROMPT; // ⬅️✅ हमेशा "Master Prompt" का इस्तेमाल करें
+        let chatHistory = [];
+        
+        // पिछला इतिहास (Previous History) लाएँ
+        if (userId) {
+             const history = await db.ChatMessage.findAll({
+                where: { userId },
+                order: [['createdAt', 'DESC']],
+                limit: 6 
+             });
+             history.reverse();
+             
+             for (const msg of history) {
+                if (msg.sender === 'USER') {
+                    chatHistory.push({ role: 'user', content: msg.message });
+                } else {
+                    try {
+                         const botReply = JSON.parse(msg.message);
+                         if (botReply.type === 'text') {
+                             chatHistory.push({ role: 'assistant', content: botReply.content });
+                         }
+                    } catch (e) { 
+                        chatHistory.push({ role: 'assistant', content: msg.message });
+                    }
+                }
+             }
+        }
+        
         const groqMessages = [
-            { role: "system", content: systemPrompt }, 
+            { role: "system", content: systemPrompt }, // ✅ 'systemPrompt' अब 'MASTER_PROMPT' है
+            ...chatHistory,
             { role: "user", content: message },
         ];
-
-        // 2️⃣ Get response from AI service
-        const replyFromAI = await getAIChatResponse(groqMessages);
-
-        let reply;
         
-        // 3️⃣ AI ka jawab JSON hai ya Text, yeh check karein
+        replyFromAI = await getAIChatResponse(groqMessages); // यह हमेशा स्ट्रिंग देगा
+        
+        // 2️⃣ जवाब को Parse (पार्स) करें
         try {
-            // (Jaise {"type": "calculator", ...})
-            reply = JSON.parse(replyFromAI);
+            replyObject = JSON.parse(replyFromAI); // (e.g., {"type": "calculator"})
         } catch (e) {
-            // (Yeh ek aam text message hai)
-            reply = { type: "text", content: replyFromAI };
+            replyObject = { type: "text", content: replyFromAI }; // (e.g., "Hello")
         }
 
-        // 4️⃣ Save chat history
+        // 3️⃣ डेटाबेस में सेव करें (Emojis हटाकर)
         if (userId) {
+            const dbSafeUserMessage = removeEmojis(message);
+            
+            let dbSafeBotMessage;
+            if (replyObject.type === 'text') {
+                 dbSafeBotMessage = JSON.stringify({
+                    type: 'text',
+                    content: removeEmojis(replyObject.content) // ✅ Emojis को यहाँ साफ़ करें
+                 });
+            } else {
+                 dbSafeBotMessage = JSON.stringify(replyObject); // Calculator/Video
+            }
+            
             await db.ChatMessage.bulkCreate([
-                { userId, sender: "USER", message },
-                // Hum AI ke raw (asli) jawab ko save karte hain (JSON ya text)
-                { userId, sender: "BOT", message: JSON.stringify(reply) }, 
+                { userId, sender: "USER", message: dbSafeUserMessage },
+                { userId, sender: "BOT", message: dbSafeBotMessage }, 
             ]);
         }
 
-        // 5️⃣ Send reply
-        res.status(200).json({ success: true, reply });
+        // 4️⃣ यूज़र को जवाब भेजें (Emojis के साथ)
+        res.status(200).json({ success: true, reply: replyObject });
+
     } catch (error) {
-        console.error("❌ Chat Error:", error);
+        console.error("❌ Chat Controller Error:", error);
+        
+        const errorMessage = { 
+            type: 'text', 
+            content: error.message || "An unexpected error occurred." 
+        };
+        
         res.status(500).json({
             success: false,
-            message: error.message || "An unexpected error occurred during AI processing.",
+            reply: errorMessage // यूज़र को एरर दिखाएँ
         });
     }
 };
 
 // ============================================================
-// 🔹 2. Commission Calculator (Ismein koi badlaav nahin)
+// 🔹 3. Commission Calculator (Ismein koi badlaav nahin)
 // ============================================================
 const commissionSlabs = [
-    { bv: 350000, percent: 0.22 },   // 22%
-    { bv: 260000, percent: 0.195 },  // 19.5%
-    { bv: 170000, percent: 0.17 },   // 17%
-    { bv: 115000, percent: 0.145 },  // 14.5%
-    { bv: 70000,  percent: 0.12 },   // 12%
-    { bv: 40000,  percent: 0.095 },  // 9.5%
-    { bv: 20000,  percent: 0.07 },   // 7%
-    { bv: 10000,  percent: 0.045 },  // 4.5%
-    { bv: 5000,   percent: 0.02 },   // 2%
-    { bv: 0,      percent: 0.00 }    // 0%
+    { bv: 350000, percent: 0.22 },
+    { bv: 260000, percent: 0.195 },
+    { bv: 170000, percent: 0.17 },
+    { bv: 115000, percent: 0.145 },
+    { bv: 70000,  percent: 0.12 },
+    { bv: 40000,  percent: 0.095 },
+    { bv: 20000,  percent: 0.07 },
+    { bv: 10000,  percent: 0.045 },
+    { bv: 5000,   percent: 0.02 },
+    { bv: 0,      percent: 0.00 }
 ];
 
 const getPercentage = (bv) => {
@@ -123,13 +174,13 @@ const handleCalculate = (req, res) => {
         const resultString = `
 Here is your Performance Bonus calculation:
 ---
-**Your Total BV:** ${totalBV.toLocaleString('en-IN')}
-**Your Slab:** ${userPercent * 100}%
+Your Total BV: ${totalBV.toLocaleString('en-IN')}
+Your Slab: ${userPercent * 100}%
 ---
 ${calculations.join('\n')}
 ---
-**Total Estimated Commission:** ₹${totalCommission.toFixed(2)}
-*(Note: This is an estimate based on Performance Bonus slabs only.)*
+Total Estimated Commission: Rs ${totalCommission.toFixed(2)}
+(Note: This is an estimate based on Performance Bonus slabs only.)
         `;
 
         const reply = { type: 'text', content: resultString };
@@ -155,7 +206,7 @@ ${calculations.join('\n')}
 };
 
 // ============================================================
-// 🔹 3. Admin: Get All Chats (Ismein koi badlaav nahin)
+// 🔹 4. Admin: Get All Chats (Updated)
 // ============================================================
 const getAllChats = async (req, res) => {
     try {
@@ -176,13 +227,14 @@ const getAllChats = async (req, res) => {
             
             let messageContent = msg.message;
             try {
-                // Yeh '{"type":"text","content":"..."}' jaise JSON ko saaf text mein badlega
                 const parsed = JSON.parse(msg.message);
                 if (parsed && parsed.content) {
                     messageContent = parsed.content.substring(0, 100) + (parsed.content.length > 100 ? '...' : '');
+                } else if (parsed && parsed.type) {
+                    messageContent = `[${parsed.type} card]`; // (e.g., [calculator card])
                 }
             } catch (e) {
-                // yeh pehle se hi saaf text hai (jaise purane user messages)
+                // yeh pehle se hi saaf text hai
             }
             
             chatsByUser[email].push({
