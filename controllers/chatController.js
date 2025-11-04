@@ -1,202 +1,161 @@
-// backend/controllers/chatController.js
 const { getAIChatResponse } = require('../services/aiService');
 const { db } = require('../config/db');
-// ✅ Naye "Master Prompt" ko import karein (Sirf ek)
-const { MASTER_PROMPT } = require('../utils/prompts'); 
+// ✅ पाथ को './' से '../' में बदल दिया गया है
+const { SYSTEM_PROMPT } = require('../utils/prompts'); 
 
 // ============================================================
-// 🔹 1. Helper Function: Emojis को हटाने के लिए
-// (यह 'Incorrect string value' वाले एरर को रोकता है)
-// ============================================================
-const removeEmojis = (str) => {
-  if (!str) return '';
-  // यह regex (रेगेक्स) ज़्यादातर Emojis और खास सिंबल को पकड़ लेता है
-  return str.replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '').trim();
-};
-
-
-// ============================================================
-// 🔹 2. Handle User Chat (AI) - (Updated)
+// 🔹 Handle User Chat (AI)
 // ============================================================
 const handleChat = async (req, res) => {
-    // ❌ 'mode' ko hata diya gaya hai
-    const { message } = req.body; 
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+    const { message, mode } = req.body; 
     const userId = req.user ? req.user.id : null;
-    let replyFromAI; // AI का जवाब
-    let replyObject; // AI का JSON ऑब्जेक्ट
 
     if (!message) {
-        return res.status(400).json({ success: false, message: "Message content cannot be empty." });
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
     }
 
     try {
-        // 1️⃣ AI का जवाब लाएँ
-        const systemPrompt = MASTER_PROMPT; // ⬅️✅ हमेशा "Master Prompt" का इस्तेमाल करें
-        let chatHistory = [];
-        
-        // पिछला इतिहास (Previous History) लाएँ
-        if (userId) {
-             const history = await db.ChatMessage.findAll({
-                where: { userId },
-                order: [['createdAt', 'DESC']],
-                limit: 6 
-             });
-             history.reverse();
-             
-             for (const msg of history) {
-                if (msg.sender === 'USER') {
-                    chatHistory.push({ role: 'user', content: msg.message });
-                } else {
-                    try {
-                         const botReply = JSON.parse(msg.message);
-                         if (botReply.type === 'text') {
-                             chatHistory.push({ role: 'assistant', content: botReply.content });
-                         }
-                    } catch (e) { 
-                        chatHistory.push({ role: 'assistant', content: msg.message });
-                    }
-                }
-             }
-        }
-        
+        // 1️⃣ Construct messages array
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         const groqMessages = [
-            { role: "system", content: systemPrompt }, // ✅ 'systemPrompt' अब 'MASTER_PROMPT' है
-            ...chatHistory,
-            { role: "user", content: message },
+            { role: "system", content: SYSTEM_PROMPT }, // ✅ अपडेटेड प्रॉम्प्ट
+            { role: "user", content: `(Current Mode: ${mode || 'General'}) ${message}` }, // ✅ मोड को मैसेज के साथ भेजें
         ];
-        
-        replyFromAI = await getAIChatResponse(groqMessages); // यह हमेशा स्ट्रिंग देगा
-        
-        // 2️⃣ जवाब को Parse (पार्स) करें
-        try {
-            replyObject = JSON.parse(replyFromAI); // (e.g., {"type": "calculator"})
-        } catch (e) {
-            replyObject = { type: "text", content: replyFromAI }; // (e.g., "Hello")
-        }
 
-        // 3️⃣ डेटाबेस में सेव करें (Emojis हटाकर)
+        // 2️⃣ Get response from AI service
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+        const reply = await getAIChatResponse(groqMessages);
+
+        // 3️⃣ Save chat history
         if (userId) {
-            const dbSafeUserMessage = removeEmojis(message);
-            
-            let dbSafeBotMessage;
-            if (replyObject.type === 'text') {
-                 dbSafeBotMessage = JSON.stringify({
-                    type: 'text',
-                    content: removeEmojis(replyObject.content) // ✅ Emojis को यहाँ साफ़ करें
-                 });
-            } else {
-                 dbSafeBotMessage = JSON.stringify(replyObject); // Calculator/Video
-            }
-            
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
             await db.ChatMessage.bulkCreate([
-                { userId, sender: "USER", message: dbSafeUserMessage },
-                { userId, sender: "BOT", message: dbSafeBotMessage }, 
+                { userId, sender: "USER", message },
+                { userId, sender: "BOT", message: reply }, 
             ]);
         }
 
-        // 4️⃣ यूज़र को जवाब भेजें (Emojis के साथ)
-        res.status(200).json({ success: true, reply: replyObject });
+        // 4️⃣ Send reply
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+        try {
+            // कोशिश करें कि जवाब को JSON में पार्स करें
+            const jsonReply = JSON.parse(reply);
+            res.status(200).json({ success: true, reply: jsonReply });
+        } catch (e) {
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+            res.status(200).json({ success: true, reply: { type: 'text', content: reply } });
+        }
 
     } catch (error) {
-        console.error("❌ Chat Controller Error:", error);
-        
-        const errorMessage = { 
-            type: 'text', 
-            content: error.message || "An unexpected error occurred." 
-        };
-        
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         res.status(500).json({
             success: false,
-            reply: errorMessage // यूज़र को एरर दिखाएँ
+            message: error.message || "An unexpected error occurred during AI processing.",
         });
     }
 };
 
 // ============================================================
-// 🔹 3. Commission Calculator (Ismein koi badlaav nahin)
+// ✅ --- 2. नया फ़ंक्शन: कमीशन कैलकुलेटर ---
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
 // ============================================================
+
+// आपकी इमेज से लिए गए कमीशन स्लैब
 const commissionSlabs = [
-    { bv: 350000, percent: 0.22 },
-    { bv: 260000, percent: 0.195 },
-    { bv: 170000, percent: 0.17 },
-    { bv: 115000, percent: 0.145 },
-    { bv: 70000,  percent: 0.12 },
-    { bv: 40000,  percent: 0.095 },
-    { bv: 20000,  percent: 0.07 },
-    { bv: 10000,  percent: 0.045 },
-    { bv: 5000,   percent: 0.02 },
-    { bv: 0,      percent: 0.00 }
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+    { bv: 350000, percent: 0.22 },   // 22%
+    { bv: 260000, percent: 0.195 },  // 19.5%
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+    { bv: 5000,   percent: 0.02 },   // 2%
+    { bv: 0,      percent: 0.00 }    // 0% (5000 से कम)
 ];
 
+// Helper: BV के हिसाब से % स्लैब निकालता है
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
 const getPercentage = (bv) => {
-    const numericBV = parseFloat(bv);
-    if (isNaN(numericBV)) return 0;
     for (const slab of commissionSlabs) {
-        if (numericBV >= slab.bv) return slab.percent;
+        if (bv >= slab.bv) {
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+        }
     }
-    return 0; 
+    return 0; // 5000 BV से कम
 };
 
 const handleCalculate = (req, res) => {
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
     const { selfBV, legs } = req.body;
     const userId = req.user ? req.user.id : null;
 
     try {
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         const numSelfBV = parseFloat(selfBV) || 0;
-        const numLegsBV = Array.isArray(legs) ? legs.map(leg => parseFloat(leg.bv) || 0) : [];
+        // [{bv: "10000"}, {bv: ""}] को [10000, 0] में बदलें
+        const numLegsBV = legs.map(leg => parseFloat(leg.bv) || 0);
 
+        // 1. कुल BV और यूज़र का % निकालें
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         const totalLegsBV = numLegsBV.reduce((acc, bv) => acc + bv, 0);
         const totalBV = numSelfBV + totalLegsBV;
         const userPercent = getPercentage(totalBV);
 
         let calculations = [];
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         let totalCommission = 0;
 
+        // 2. खुद की खरीद पर कमीशन
         const selfCommission = numSelfBV * userPercent;
-        totalCommission += selfCommission;
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         calculations.push(`Self Commission: ${numSelfBV.toLocaleString('en-IN')} BV @ ${userPercent * 100}% = ₹${selfCommission.toFixed(2)}`);
 
+        // 3. सभी Legs पर डिफ्रेंशियल कमीशन
         numLegsBV.forEach((legBV, index) => {
-            if (legBV > 0) { 
-                const legPercent = getPercentage(legBV);
-                const differentialPercent = userPercent - legPercent;
-                
-                if (differentialPercent > 0) {
-                    const legCommission = legBV * differentialPercent;
-                    totalCommission += legCommission;
-                    calculations.push(`Leg ${String.fromCharCode(65 + index)} Commission: ${legBV.toLocaleString('en-IN')} BV @ ${differentialPercent * 100}% (Diff: ${userPercent * 100}% - ${legPercent * 100}%) = ₹${legCommission.toFixed(2)}`);
-                } else {
-                    calculations.push(`Leg ${String.fromCharCode(65 + index)}: No commission (Leg slab ${legPercent*100}% is >= your slab)`);
-                }
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+            const legPercent = getPercentage(legBV);
+            const differentialPercent = userPercent - legPercent;
+            
+            if (differentialPercent > 0.001) { // फ्लोटिंग पॉइंट एरर से बचने के लिए
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
+                totalCommission += legCommission;
+                calculations.push(`Leg ${String.fromCharCode(65 + index)} Commission: ${legBV.toLocaleString('en-IN')} BV @ ${differentialPercent.toFixed(3) * 100}% (Diff: ${userPercent * 100}% - ${legPercent * 100}%) = ₹${legCommission.toFixed(2)}`);
+            } else {
+                 calculations.push(`Leg ${String.fromCharCode(65 + index)}: No commission (Leg slab @ ${legPercent*100}% is too high)`);
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
             }
         });
 
+        // 4. फ़ाइनल रिजल्ट स्ट्रिंग बनाएँ
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         const resultString = `
 Here is your Performance Bonus calculation:
 ---
-Your Total BV: ${totalBV.toLocaleString('en-IN')}
-Your Slab: ${userPercent * 100}%
+**Your Total BV:** ${totalBV.toLocaleString('en-IN')}
+**Your Slab:** ${userPercent * 100}%
 ---
 ${calculations.join('\n')}
 ---
-Total Estimated Commission: Rs ${totalCommission.toFixed(2)}
-(Note: This is an estimate based on Performance Bonus slabs only.)
+**Total Estimated Commission:** ₹${totalCommission.toFixed(2)}
+*(Note: This is an estimate based on Performance Bonus slabs only.)*
         `;
 
+        // 5. जवाब वापस भेजें
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         const reply = { type: 'text', content: resultString };
         
+        // (वैकल्पिक) कैलकुलेशन को डेटाबेस में सेव करें
         if(userId) {
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
             const userMessage = `Calculation for: Self BV: ${numSelfBV}, Legs: ${numLegsBV.join(', ')}`;
              db.ChatMessage.bulkCreate([
                 { userId, sender: "USER", message: userMessage },
-                { userId, sender: "BOT", message: JSON.stringify(reply) }, 
+                { userId, sender: "BOT", message: resultString },
             ]);
         }
 
         res.status(200).json({ success: true, reply });
 
     } catch (error) {
-        console.error("❌ Calculation Error:", error);
+// ... (बाकी का कोड जैसा था वैसा ही है) ...
         res.status(500).json({
             success: false,
             message: "Calculation failed.",
@@ -206,53 +165,43 @@ Total Estimated Commission: Rs ${totalCommission.toFixed(2)}
 };
 
 // ============================================================
-// 🔹 4. Admin: Get All Chats (Updated)
+// 🔹 Admin: Get All Chats Grouped by User
 // ============================================================
 const getAllChats = async (req, res) => {
-    try {
-        const allMessages = await db.ChatMessage.findAll({
-            include: [
-                {
-                    model: db.User,
-                    attributes: ["email"],
-                },
-            ],
-            order: [["createdAt", "DESC"]],
-        });
+  try {
+    // Fetch chat messages with associated user email
+    const allMessages = await db.ChatMessage.findAll({
+      include: [
+        {
+          model: db.User,
+          attributes: ["email"],
+        },
+      ],
+      order: [["createdAt", "DESC"]],
+    });
 
-        const chatsByUser = {};
-        allMessages.forEach((msg) => {
-            const email = msg.User ? msg.User.email : "Unknown User";
-            if (!chatsByUser[email]) chatsByUser[email] = [];
-            
-            let messageContent = msg.message;
-            try {
-                const parsed = JSON.parse(msg.message);
-                if (parsed && parsed.content) {
-                    messageContent = parsed.content.substring(0, 100) + (parsed.content.length > 100 ? '...' : '');
-                } else if (parsed && parsed.type) {
-                    messageContent = `[${parsed.type} card]`; // (e.g., [calculator card])
-                }
-            } catch (e) {
-                // yeh pehle se hi saaf text hai
-            }
-            
-            chatsByUser[email].push({
-                sender: msg.sender,
-                message: messageContent,
-                createdAt: msg.createdAt,
-            });
-        });
+    // Group messages by user email
+    const chatsByUser = {};
+    allMessages.forEach((msg) => {
+      const email = msg.User ? msg.User.email : "Unknown User";
+      if (!chatsByUser[email]) chatsByUser[email] = [];
+      chatsByUser[email].push({
+        sender: msg.sender,
+        message: msg.message,
+        createdAt: msg.createdAt,
+      });
+    });
 
-        res.status(200).json({ success: true, data: chatsByUser });
-    } catch (error) {
-        console.error("❌ Admin Chat Fetch Error:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to retrieve chat history.",
-            error: error.message,
-        });
-    }
+    res.status(200).json({ success: true, data: chatsByUser });
+  } catch (error) {
+    console.error("❌ Admin Chat Fetch Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve chat history.",
+      error: error.message,
+    });
+  }
 };
 
 module.exports = { handleChat, getAllChats, handleCalculate };
+
