@@ -1,19 +1,34 @@
+// backend/controllers/adminController.js
 const { db } = require('../config/db');
 const { Op } = require('sequelize'); // Sequelize operators के लिए
 
+// ✅ क्रिटिकल फिक्स: मॉडल्स को सीधे 'db' ऑब्जेक्ट से लें
+// (initialize() को यहाँ से हटा दिया गया है)
+const { User, ChatMessage, sequelize } = db; 
+
 // फ़ील्ड्स जिन्हें Admin Users और Regular Users दोनों के लिए चुना जाएगा
-const userSelectFields = ['id', 'fullName', 'rcmId', 'email', 'phone', 'role', 'status', 'autoPayStatus', 'createdAt'];
+const userSelectFields = [
+    'id', 
+    'fullName', 
+    'rcmId', 
+    'email', 
+    'phone', 
+    'role', 
+    'status', 
+    'autoPayStatus', 
+    'createdAt'
+];
 
 // =======================================================
 // 1️⃣ GET ALL REGULAR USERS (Admin Only)
 // Route: GET /api/admin/users
 // =======================================================
 const getRegularUsers = async (req, res) => {
-    // मॉडल्स को फ़ंक्शन के अंदर डीस्ट्रक्चर करें ताकि वे निश्चित रूप से लोड हों
-    const { User } = db; 
-    
     try {
-        if (!User) throw new Error('User model is not initialized.');
+        // ✅ फिक्स: पक्का करें कि 'User' मॉडल लोड हो चुका है
+        if (!User) {
+            return res.status(500).json({ success: false, message: 'Server error: User model is not available.' });
+        }
 
         const users = await User.findAll({
             where: { 
@@ -34,10 +49,10 @@ const getRegularUsers = async (req, res) => {
 // Route: GET /api/admin/admins
 // =======================================================
 const getAllAdmins = async (req, res) => {
-    const { User } = db;
-    
     try {
-        if (!User) throw new Error('User model is not initialized.');
+        if (!User) {
+            return res.status(500).json({ success: false, message: 'Server error: User model is not available.' });
+        }
 
         const admins = await User.findAll({
             where: { role: 'ADMIN' },
@@ -57,7 +72,6 @@ const getAllAdmins = async (req, res) => {
 // ============================================================
 const deleteUser = async (req, res) => {
     const { userId } = req.params;
-    const { User, ChatMessage, sequelize } = db; // sequelize instance भी लें
 
     if (!User || !ChatMessage || !sequelize) {
         return res.status(500).json({ success: false, message: 'Server models not fully ready for operation.' });
@@ -113,8 +127,7 @@ const deleteUser = async (req, res) => {
 // ============================================================
 const updateUserData = async (req, res) => {
     const { userId } = req.params;
-    const { User } = db;
-
+    
     // Admin द्वारा अपडेट किए जा सकने वाले फ़ील्ड्स
     const { fullName, email, rcmId, status, role, autoPayStatus, nextBillingDate } = req.body;
     
@@ -180,4 +193,3 @@ module.exports = {
     deleteUser, 
     updateUserData
 };
-
