@@ -1,16 +1,15 @@
-// backend/services/aiService.js
 const Groq = require("groq-sdk");
+// ✅ Naye prompt ko yahaan import karein
+const { SYSTEM_PROMPT } = require('../utils/prompts');
 
 // --- 1. कॉन्फिगरेशन (Configuration) ---
 
 let groqClient = null;
 
 try {
-    // एनवायरनमेंट वेरिएबल्स से API की (key) लोड करें
     const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
-        // यह एक चेतावनी (warning) है, एरर (error) नहीं, ताकि ऐप क्रैश न हो
         console.warn(
             "⚠️ GROQ_API_KEY is missing! Groq AI features will be disabled. Service will return fallback messages."
         );
@@ -19,66 +18,51 @@ try {
         console.info("✅ Groq client initialized successfully.");
     }
 } catch (err) {
-    // यह एक गंभीर एरर है, अगर SDK लोड होने में विफल हो
     console.error("❌ Failed to initialize Groq client:", err.message);
 }
 
-// प्रोडक्शन-रेडी मॉडल लिस्ट (Failover क्रम में)
-// हम सबसे तेज़ और शक्तिशाली मॉडल को पहले ट्राई करेंगे।
+// ✅ Production-Ready Model List (Naye models)
 const MODELS_TO_ATTEMPT = [
-    "llama-3.3-70b-versatile", // 1. प्राइमरी (सबसे पावरफुल)
-    "gemma2-9b-it"             // 2. फॉलबैक (अगर प्राइमरी फेल हो)
+    "llama-3.1-70b-versatile", // 1. Primary (Sabse Smart)
+    "llama-3.1-8b-instant",    // 2. Fast Fallback
+    "gemma2-9b-it"             // 3. Secondary Fallback
 ];
 
-// डिफ़ॉल्ट सिस्टम प्रॉम्प्ट, अगर क्लाइंट नहीं भेजता है
-const DEFAULT_SYSTEM_PROMPT = "You are a helpful and concise assistant.";
+// ✅ --- YEH HAI MUKHYA FIX (PART 1) ---
+// Default system prompt ab aapka RCM prompt hai.
+const DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT; 
+// --- FIX ENDS ---
 
 // --- 2. हेल्पर फंक्शन (Helper Function) ---
 
 /**
  * 🚨 यह फंक्शन API में भेजने से पहले 'messages' ऐरे को साफ और सुरक्षित करता है।
- * यह उस 400 एरर को ठीक करता है जो आपने लॉग्स में देखा था।
+ * ✅ Isko saral (simplify) kar diya gaya hai.
  *
  * @param {Array<Object>} incomingMessages - क्लाइंट से आया हुआ मैसेज ऐरे।
  * @returns {Array<Object>} - Groq API के लिए एक सुरक्षित और मान्य (valid) ऐरे।
  */
 function prepareMessagesForGroq(incomingMessages) {
-    let hasSystemPrompt = false;
     
-    // 1. सभी मैसेज को साफ करें और सिस्टम प्रॉम्प्ट को ठीक करें
-    const cleanedMessages = incomingMessages
-        .map((msg) => {
-            // अमान्य मैसेज को यहीं रोक दें
-            if (!msg || !msg.role || typeof msg.content !== 'string') {
-                return null;
-            }
+    // 1. Sabhi valid messages ko filter karein
+    const cleanedMessages = incomingMessages.filter(
+        (msg) => msg && msg.role && typeof msg.content === 'string' && msg.content.trim() !== ''
+    );
 
-            if (msg.role === "system") {
-                hasSystemPrompt = true;
-                // 🚨 क्रिटिकल फिक्स:
-                // अगर 'role: system' है, लेकिन 'content' खाली (empty) या मौजूद नहीं है,
-                // तो हम डिफ़ॉल्ट प्रॉम्प्ट सेट करते हैं। यह 400 एरर को रोकता है।
-                return {
-                    role: "system",
-                    content: msg.content || DEFAULT_SYSTEM_PROMPT,
-                };
-            }
-            
-            return {
-                role: msg.role,
-                content: msg.content
-            };
-        })
-        .filter(Boolean); // सभी null (अमान्य) मैसेज को हटा दें
+    // 2. Check karein ki 'system' role ka message pehle se hai ya nahi
+    const hasSystemPrompt = cleanedMessages.some(msg => msg.role === "system");
 
-    // 2. अगर कोई भी सिस्टम प्रॉम्प्ट नहीं मिला, तो एक डिफ़ॉल्ट प्रॉम्प्ट सबसे आगे जोड़ें
+    // 3. Agar koi system prompt nahi mila, toh hamara RCM wala default prompt sabse aage jod dein
+    // (Aapka chatController hamesha bhejta hai, lekin yeh ek suraksha kavach hai)
     if (!hasSystemPrompt) {
         cleanedMessages.unshift({
             role: "system",
             content: DEFAULT_SYSTEM_PROMPT,
         });
     }
-
+    
+    // Agar chatController ne 'system' prompt bheja hai, toh yeh function
+    // use respect karega aur overwrite nahi karega.
     return cleanedMessages;
 }
 
@@ -125,37 +109,62 @@ async function getAIChatResponse(messages) {
         );
     }
 
-    // 3️⃣ 🚨 महत्वपूर्ण: मैसेज को API के लिए तैयार करें (यही फिक्स है)
+    // 3️⃣ 🚨 महत्वपूर्ण: मैसेज को API के लिए तैयार करें (Updated logic)
     const processedMessages = prepareMessagesForGroq(messages);
 
     // 4️⃣ मॉडल फेलओवर लूप: एक-एक करके मॉडल ट्राई करें
     for (const model of MODELS_TO_ATTEMPT) {
         try {
+            // console.log(`Attempting model: ${model}`); // Debugging ke liye
             const chatCompletion = await groqClient.chat.completions.create({
                 model: model,
                 messages: processedMessages,
-                temperature: 0.5, // थोड़ी क्रिएटिविटी के लिए
-                max_tokens: 1024,  // बहुत लंबा जवाब न दे
+                temperature: 0.5, 
+                max_tokens: 1024,
+                // ✅ Naya parameter: JSON output ke liye force karein
+                // Taa ki 'type: "calculator"' hamesha JSON mein aaye
+                response_format: { type: "json_object" }, 
             });
             
             const content = chatCompletion?.choices?.[0]?.message?.content;
             
             if (content) {
                 // 5️⃣ ✅ सफलता!
-                // एक जैसा रिस्पॉन्स स्ट्रक्चर भेजें (एरर जैसा ही)
-                return JSON.stringify({
-                    type: "text",
-                    content: content,
-                });
+                // Hum seedha JSON string return kar rahe hain kyunki humne 'response_format: json_object' maanga hai
+                // Ismein { "type": "text", "content": "..." } ya { "type": "calculator", "content": "..." } hoga
+                return content; 
             }
             
-            // यह तब होगा जब API 200 OK भेजे, लेकिन content खाली हो
             console.warn(`⚠️ Groq model "${model}" returned empty content.`);
 
         } catch (error) {
-            // यह तब होगा जब API क्रैश हो (जैसे 500, 429, या 400 एरर)
-            console.warn(`❌ Groq model "${model}" failed:`, error.message);
-            // अगले मॉडल को ट्राई करने के लिए लूप जारी रखें...
+            console.warn(`❌ Groq model "${model}" failed (JSON format):`, error.message);
+            
+            // ✅ Production-Ready Fallback:
+            // Agar model JSON format support nahi karta ya fail hota hai,
+            // toh hum bina JSON format ke dobara try karenge.
+            console.warn(`Retrying model "${model}" without JSON response format...`);
+            try {
+                const fallbackCompletion = await groqClient.chat.completions.create({
+                    model: model,
+                    messages: processedMessages,
+                    temperature: 0.5,
+                    max_tokens: 1024,
+                    // response_format hata diya
+                });
+                
+                const fallbackContent = fallbackCompletion?.choices?.[0]?.message?.content;
+                if (fallbackContent) {
+                        // Isse JSON structure mein wrap karein
+                    return JSON.stringify({
+                        type: "text",
+                        content: fallbackContent,
+                    });
+                }
+            } catch (fallbackError) {
+                    console.warn(`❌ Fallback attempt for model "${model}" also failed:`, fallbackError.message);
+            }
+            // Agle model ko try karne ke liye loop jaari rakhein...
         }
     }
 
