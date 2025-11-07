@@ -1,4 +1,3 @@
-// backend/config/db.js
 const config = require('./config.json');
 const mysql = require('mysql2/promise');
 const { Sequelize } = require('sequelize');
@@ -39,20 +38,13 @@ async function initialize() {
     db.Sequelize = Sequelize;
     db.sequelize = sequelize;
 
-    // --- 👇 YEH BADLAAV ZAROORI HAI (STEP 1) ---
-    console.log('Syncing models with alter: true and foreignKeyChecks: false...');
-    
-    // Temporarily foreign key checks ko disable karein (ChatMessage error ke liye)
-    await sequelize.query('SET FOREIGN_KEY_CHECKS = 0', null, {});
+    // --- 👇 YEH BADLAAV ZAROORI HAI (FINAL STEP) ---
+    // Wapas Production mode par aa jaayein
+    // 'alter: true' aur 'SET FOREIGN_KEY_CHECKS' ko hata diya gaya hai
+    await sequelize.sync({ alter: false }); // alter: false production ke liye safe hai
+    // --- 👆 YEH BADLAAV ZAROORI HAI (FINAL STEP) ---
 
-    // Ab alter chalayein (ProductVideo column ke liye)
-    await sequelize.sync({ alter: true });
-
-    // Wapas enable karein
-    await sequelize.query('SET FOREIGN_KEY_CHECKS = 1', null, {});
-    // --- 👆 YEH BADLAAV ZAROORI HAI (STEP 1) ---
-
-    console.log('✅ All models were synchronized successfully (Step 1 Complete).');
+    console.log('✅ All models were synchronized successfully (Production Mode).');
   } catch (error) {
     console.error('❌ Unable to initialize the database:', error);
     throw error;

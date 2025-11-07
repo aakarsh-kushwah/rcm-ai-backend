@@ -42,7 +42,9 @@ module.exports = (sequelize) => {
       timestamps: false,
       indexes: [
         { fields: ['title'] },
-        { fields: ['category'] }, // <-- STEP 2: Ise wapas UNCOMMENT karein
+        // --- 👇 YEH BADLAAV ZAROORI HAI (FINAL STEP) ---
+        { fields: ['category'] }, // <-- Ise wapas UNCOMMENT kar diya gaya hai
+        // --- 👆 YEH BADLAAV ZAROORI HAI (FINAL STEP) ---
       ],
     }
   );
