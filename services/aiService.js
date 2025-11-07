@@ -21,17 +21,16 @@ try {
     console.error("❌ Failed to initialize Groq client:", err.message);
 }
 
-// ✅ Production-Ready Model List (Naye models)
+// ✅ --- YEH HAI MUKHYA FIX (Models Update) ---
+// In models ko update kar diya gaya hai kyunki 'llama-3.1-70b-versatile' band ho chuka hai.
 const MODELS_TO_ATTEMPT = [
-    "llama-3.1-70b-versatile", // 1. Primary (Sabse Smart)
-    "llama-3.1-8b-instant",    // 2. Fast Fallback
-    "gemma2-9b-it"             // 3. Secondary Fallback
+    "openai/gpt-oss-120b",     
 ];
 
-// ✅ --- YEH HAI MUKHYA FIX (PART 1) ---
-// Default system prompt ab aapka RCM prompt hai.
+
+
+// ✅ Default system prompt ab aapka RCM prompt hai.
 const DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT; 
-// --- FIX ENDS ---
 
 // --- 2. हेल्पर फंक्शन (Helper Function) ---
 
@@ -53,7 +52,6 @@ function prepareMessagesForGroq(incomingMessages) {
     const hasSystemPrompt = cleanedMessages.some(msg => msg.role === "system");
 
     // 3. Agar koi system prompt nahi mila, toh hamara RCM wala default prompt sabse aage jod dein
-    // (Aapka chatController hamesha bhejta hai, lekin yeh ek suraksha kavach hai)
     if (!hasSystemPrompt) {
         cleanedMessages.unshift({
             role: "system",
@@ -61,8 +59,6 @@ function prepareMessagesForGroq(incomingMessages) {
         });
     }
     
-    // Agar chatController ne 'system' prompt bheja hai, toh yeh function
-    // use respect karega aur overwrite nahi karega.
     return cleanedMessages;
 }
 
@@ -130,8 +126,6 @@ async function getAIChatResponse(messages) {
             
             if (content) {
                 // 5️⃣ ✅ सफलता!
-                // Hum seedha JSON string return kar rahe hain kyunki humne 'response_format: json_object' maanga hai
-                // Ismein { "type": "text", "content": "..." } ya { "type": "calculator", "content": "..." } hoga
                 return content; 
             }
             
@@ -150,12 +144,11 @@ async function getAIChatResponse(messages) {
                     messages: processedMessages,
                     temperature: 0.5,
                     max_tokens: 1024,
-                    // response_format hata diya
                 });
                 
                 const fallbackContent = fallbackCompletion?.choices?.[0]?.message?.content;
                 if (fallbackContent) {
-                        // Isse JSON structure mein wrap karein
+                    // Isse JSON structure mein wrap karein
                     return JSON.stringify({
                         type: "text",
                         content: fallbackContent,
@@ -164,7 +157,6 @@ async function getAIChatResponse(messages) {
             } catch (fallbackError) {
                     console.warn(`❌ Fallback attempt for model "${model}" also failed:`, fallbackError.message);
             }
-            // Agle model ko try karne ke liye loop jaari rakhein...
         }
     }
 
