@@ -1,3 +1,4 @@
+// models/productVideo.model.js
 const { DataTypes } = require('sequelize');
 
 module.exports = (sequelize) => {
@@ -17,6 +18,12 @@ module.exports = (sequelize) => {
         type: DataTypes.TEXT,
         allowNull: true,
       },
+      // --- Naya Column ---
+      category: {
+        type: DataTypes.STRING(255),
+        allowNull: true,
+        defaultValue: 'General',
+      },
       videoUrl: {
         type: DataTypes.STRING(500),
         allowNull: false,
@@ -35,7 +42,10 @@ module.exports = (sequelize) => {
     {
       tableName: 'product_videos',
       timestamps: false,
-      indexes: [{ fields: ['title'] }],
+      indexes: [
+        { fields: ['title'] },
+        // { fields: ['category'] }, // <-- STEP 1: Ise temporarily COMMENT OUT karein
+      ],
     }
   );
 
