@@ -24,7 +24,13 @@ try {
 // ✅ --- YEH HAI MUKHYA FIX (Models Update) ---
 // In models ko update kar diya gaya hai kyunki 'llama-3.1-70b-versatile' band ho chuka hai.
 const MODELS_TO_ATTEMPT = [
-    "openai/gpt-oss-120b",     
+     'llama-3.3-70b-versatile', 
+    'gemma2-9b-it',            
+    'openai/gpt-oss-120b',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'openai/gpt-oss-20b',
+
+'moonshotai/kimi-k2-instruct-0905'     
 ];
 
 
