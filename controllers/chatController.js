@@ -1,6 +1,6 @@
 const { getAIChatResponse } = require('../services/aiService');
 const { db } = require('../config/db');
-const { SYSTEM_PROMPT } = require('../utils/prompts'); 
+const { MASTER_PROMPT: SYSTEM_PROMPT } = require('../utils/prompts');
 const asyncHandler = require('express-async-handler');
 
 // ============================================================
