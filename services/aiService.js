@@ -28,7 +28,7 @@ const MODELS_TO_ATTEMPT = [
     'gemma2-9b-it',            
     'openai/gpt-oss-120b',
     'meta-llama/llama-4-scout-17b-16e-instruct',
-    'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
 
 'moonshotai/kimi-k2-instruct-0905'     
 ];
