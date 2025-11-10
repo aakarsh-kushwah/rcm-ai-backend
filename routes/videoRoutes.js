@@ -1,4 +1,3 @@
-// backend/routes/videoRoutes.js
 const express = require('express');
 const router = express.Router();
 
@@ -11,7 +10,9 @@ const {
     deleteLeaderVideo,
     getProductVideos,
     updateProductVideo,
-    deleteProductVideo
+    deleteProductVideo,
+    // ✅ Naya: Category list ke liye
+    getProductCategories 
 } = require('../controllers/videoController'); 
 
 // ============================================================
@@ -19,6 +20,8 @@ const {
 // ============================================================
 router.get('/leaders', isAuthenticated, getLeaderVideos); 
 router.get('/products', isAuthenticated, getProductVideos);
+// ✅ NAYA: Product categories fetch karne ke liye
+router.get('/products/categories', isAuthenticated, getProductCategories);
 
 // ============================================================
 // 2. Admin Routes (एडमिन के लिए)

@@ -273,12 +273,12 @@ const getProductCategories = asyncHandler(async (req, res) => {
   
   // Performance: 'DISTINCT' ki jagah 'GROUP BY' ka istemaal karein
   const categories = await db.ProductVideo.findAll({
-      attributes: ['category'], // Sirf category column chahiye
-      group: ['category'], // Isse distinct values milengi
-      where: {
-          category: { [Op.ne]: null, [Op.ne]: '' } // Empty ya null na ho
-      },
-      order: [['category', 'ASC']] // Alphabetical sort
+       attributes: ['category'], // Sirf category column chahiye
+       group: ['category'], // Isse distinct values milengi
+       where: {
+           category: { [Op.ne]: null, [Op.ne]: '' } // Empty ya null na ho
+       },
+       order: [['category', 'ASC']] // Alphabetical sort
   });
 
   const categoryList = categories.map(item => item.category);
