@@ -2,16 +2,22 @@
 
 const express = require('express');
 const router = express.Router();
-// ✅ सिर्फ userController से इम्पोर्ट करें
-const { getMyProfile } = require('../controllers/userController'); 
+
+// ✅ Dono controllers ko import karein
+const { 
+    getMyProfile, 
+    updateMyProfilePic // ⭐️ YEH NAYA HAI
+} = require('../controllers/userController'); 
+
 const { isAuthenticated } = require('../middleware/authMiddleware');
 
-// ----------------------------------------------------------------
-// 🛑 एरर फिक्स: यहाँ से 'deleteUser' और 'updateUserData' हटा दिया गया है
-// ----------------------------------------------------------------
-
-// ✅ यह रूट सिर्फ़ लॉग-इन यूज़र को उसका *अपना* प्रोफ़ाइल दिखाता है
 // GET /api/users/me
+// Logged-in user ki profile data get karein
 router.get('/me', isAuthenticated, getMyProfile);
+
+// ⭐️ NAYA ROUTE (404 Error fix karne ke liye)
+// PATCH /api/users/update-profile-pic
+// Logged-in user ki profile pic update karein
+router.patch('/update-profile-pic', isAuthenticated, updateMyProfilePic);
 
 module.exports = router;
