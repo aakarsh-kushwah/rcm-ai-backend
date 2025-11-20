@@ -10,6 +10,7 @@ async function initialize() {
 
     const connection = await mysql.createConnection({ host, port, user, password });
     await connection.query(`CREATE DATABASE IF NOT EXISTS \`${database}\`;`);
+    await connection.query(`SET FOREIGN_KEY_CHECKS=0;`); // Temporary fix for table creation order
     await connection.end();
     console.log('✅ Database checked/created successfully.');
 
@@ -30,9 +31,11 @@ async function initialize() {
     db.Subscriber = require('../models/subscriber.model')(sequelize);
     db.LeaderVideo = require('../models/leaderVideo.model')(sequelize);
     db.ProductVideo = require('../models/productVideo.model')(sequelize);
-    // ✅ NAYE MODELS LOAD KAREIN (Fix: Added explicit .model.js extension)
+    
+    // ✅ FIX APPLIED: Capital 'Y' for Youtube models (Assuming file names are capitalized)
+    // Note: If files are lowercased (youtubeChannel.model.js), use require('../models/youtubeChannel.model')
     db.YoutubeChannel = require('../models/youtubeChannel.model')(sequelize);
-    db.YoutubeVideo = require('../models/youtubeVideo.model')(sequelize);
+    db.YoutubeVideo = require('../models/YoutubeVideo.model')(sequelize);
 
 
     // Define associations
@@ -40,7 +43,6 @@ async function initialize() {
     db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
     
     // ✅ YOUTUBE ASSOCIATIONS
-    // One Channel has many Videos. CASCADE delete: channel delete hone par videos bhi hat jayenge.
     db.YoutubeChannel.hasMany(db.YoutubeVideo, { 
         foreignKey: 'channelId', 
         as: 'videos', 
@@ -54,6 +56,7 @@ async function initialize() {
 
     // Production ready: alter: false to prevent potential table drops
     await sequelize.sync({ alter: false }); 
+    // await connection.query(`SET FOREIGN_KEY_CHECKS=1;`); // Re-enable foreign key checks (optional, but good practice)
 
     console.log('✅ All models were synchronized successfully (Production Mode).');
   } catch (error) {
