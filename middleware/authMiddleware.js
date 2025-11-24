@@ -1,55 +1,55 @@
 const jwt = require('jsonwebtoken');
 
-// ✅ High-Traffic Handled: यह फ़ंक्शन JWT को पढ़कर सीधे req.user में यूजर डेटा (id, role) सेट करता है, 
-// जिससे प्रत्येक रिक्वेस्ट पर डेटाबेस कॉल की आवश्यकता समाप्त हो जाती है। (बहुत तेज़)
+// ✅ Ye function main logic hai (ise hum dono naam se export karenge)
+const verifyTokenLogic = (req, res, next) => {
+    let token;
+    
+    // Case-insensitive header check
+    const authHeader = req.headers.authorization || req.headers.Authorization;
 
-const isAuthenticated = (req, res, next) => {
-    let token;
-    // FIX: Case-insensitive header access: Render/Linux पर 'authorization' (lowercase) होने की संभावना है
-    const authHeader = req.headers.authorization || req.headers.Authorization;
-    
-    // 1. Bearer Token की जाँच करें
-    if (authHeader && authHeader.startsWith('Bearer')) {
-        token = authHeader.split(' ')[1];
-    } else {
-        // टोकन प्रदान नहीं किया गया या गलत फॉर्मेट
-        return res.status(401).json({ success: false, message: 'Authorization token is required and must be in Bearer format.' });
-    }
+    // Bearer token extract
+    if (authHeader && authHeader.startsWith('Bearer')) {
+        token = authHeader.split(' ')[1];
+    }
 
-    // 2. JWT Verification और Error Handling
-    try {
-        if (!token) {
-             // दोबारा जाँच (वैसे तो ऊपर हैंडल हो चुका है, लेकिन सुरक्षा के लिए)
-             throw new Error('No token found.');
-        }
-        
-        // JWT को वेरिफाई करें
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!token) {
+        return res.status(401).json({ success: false, message: 'Access denied. No token provided.' });
+    }
 
-        // User Data को सीधे रिक्वेस्ट ऑब्जेक्ट से अटैच करें (Role के लिए जरूरी)
-        req.user = decoded; 
-        
-        next(); 
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        
+        // ✅ Compatibility Layer (Purane aur Naye dono code ke liye data set karein)
+        req.user = decoded;                         // Purane controllers (req.user.role) ke liye
+        req.userId = decoded.id || decoded.userId;  // Naye controllers (req.userId) ke liye
 
-    } catch (error) {
-        // 'jwt malformed', 'jwt expired', 'invalid signature' जैसी त्रुटियों को हैंडल करें
-        console.error('Token verification failed:', error.message);
-        // 403 Forbidden का उपयोग करें (वैधता की कमी के लिए)
-        return res.status(403).json({ success: false, message: `Not authorized, token failed: ${error.message}` });
-    }
+        next();
+    } catch (error) {
+        console.error("Auth Error:", error.message);
+        return res.status(403).json({ success: false, message: 'Invalid or expired token.' });
+    }
 };
 
-// 🛡️ Admin Access Middleware (isAuthenticated के बाद ही चलाएँ)
 const isAdmin = (req, res, next) => {
-    // req.user सीधे JWT से आ रहा है
-    if (req.user && req.user.role === 'ADMIN') {
-        next();
-    } else {
-        res.status(403).json({ success: false, message: 'Forbidden: Requires Admin privileges.' });
-    }
+    // Role check (Admin or admin)
+    if (req.user && (req.user.role === 'ADMIN' || req.user.role === 'admin')) {
+        next();
+    } else {
+        res.status(403).json({ success: false, message: 'Admin access required.' });
+    }
 };
 
+// ============================================================
+// ⭐️ MAGIC FIX YAHAN HAI
+// ============================================================
 module.exports = {
-    isAuthenticated,
-    isAdmin
+    // 1. Naye routes ke liye
+    verifyToken: verifyTokenLogic, 
+
+    // 2. Purane routes (Subscriber, User, etc.) ke liye
+    // Hum 'isAuthenticated' ko bhi same logic point kar rahe hain
+    isAuthenticated: verifyTokenLogic, 
+
+    // 3. Admin middleware
+    isAdmin
 };
