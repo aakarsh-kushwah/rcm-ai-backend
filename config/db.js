@@ -2,19 +2,22 @@ require('dotenv').config();
 const mysql = require('mysql2/promise');
 const { Sequelize } = require('sequelize');
 
+// Config.json fallback
+let config;
+try {
+    config = require('./config.json');
+} catch (error) {
+    config = { database: {} };
+}
+
 const db = {};
 
-/**
- * ⚙️ DATABASE CONFIGURATION
- */
 const dbConfig = {
-    // ✅ FIX: 'localhost' ki jagah '127.0.0.1' use karein
-    // Isse ECONNREFUSED ::1:3306 wala error solve ho jayega
-    host: process.env.DB_HOST || '127.0.0.1', 
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'rcm_db',
-    port: process.env.DB_PORT || 3306,
+    host: process.env.DB_HOST || config.database.host || '127.0.0.1',
+    user: process.env.DB_USER || config.database.user || 'root',
+    password: process.env.DB_PASSWORD || config.database.password || '',
+    database: process.env.DB_NAME || config.database.database || 'rcm_db',
+    port: process.env.DB_PORT || config.database.port || 3306,
     dialect: 'mysql',
     
     pool: {
@@ -36,7 +39,9 @@ const dbConfig = {
 
 async function initialize() {
     try {
-        // 1. DATABASE CHECK & CREATION
+        console.log(`📡 Connecting to Database Host: ${dbConfig.host}`);
+
+        // 1. Connection & DB Check
         const connection = await mysql.createConnection({ 
             host: dbConfig.host, 
             port: dbConfig.port, 
@@ -46,7 +51,7 @@ async function initialize() {
         await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\`;`);
         await connection.end();
 
-        // 2. SEQUELIZE INSTANCE INITIALIZATION
+        // 2. Sequelize Init
         const sequelize = new Sequelize(
             dbConfig.database,
             dbConfig.user,
@@ -61,34 +66,43 @@ async function initialize() {
             }
         );
 
-        // 3. CONNECTION TEST
         await sequelize.authenticate();
         console.log('🚀 Database connection established successfully.');
 
-        // 4. LOAD MODELS
+        // 3. Load Models
         db.User = require('../models/user.model')(sequelize);
         db.ChatMessage = require('../models/chatMessage.model')(sequelize);
         db.Subscriber = require('../models/subscriber.model')(sequelize);
         db.LeaderVideo = require('../models/leaderVideo.model')(sequelize);
         db.ProductVideo = require('../models/productVideo.model')(sequelize);
+        // ✅ Ensure spelling is correct here
         db.DailyReport = require('../models/DailyReport.model')(sequelize); 
 
-        // 5. DEFINE ASSOCIATIONS
+        // 4. Define Associations
         db.User.hasMany(db.ChatMessage, { foreignKey: 'userId', as: 'chatMessages' });
         db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
 
         db.User.hasMany(db.DailyReport, { foreignKey: 'user_id', as: 'dailyReports' });
         db.DailyReport.belongsTo(db.User, { foreignKey: 'user_id', as: 'user' });
 
-        // 6. EXPORT INSTANCE
         db.Sequelize = Sequelize;
         db.sequelize = sequelize;
 
-        // 7. SYNC DATABASE
-        const syncOptions = { alter: true }; 
-        await sequelize.sync(syncOptions);
+        // =========================================================
+        // 🛠️ FIX FOR FOREIGN KEY ERROR
+        // =========================================================
+        console.log("🔄 Syncing Database (Safe Mode)...");
+        
+        // Step A: Disable Foreign Key Checks (Rules todne ki permission)
+        await sequelize.query('SET FOREIGN_KEY_CHECKS = 0', { raw: true });
 
-        console.log(`✅ All models synchronized successfully. Mode: ${process.env.NODE_ENV || 'Production'}`);
+        // Step B: Sync Tables (Ab error nahi aayega)
+        await sequelize.sync({ alter: true });
+
+        // Step C: Enable Foreign Key Checks (Rules wapas lagao)
+        await sequelize.query('SET FOREIGN_KEY_CHECKS = 1', { raw: true });
+
+        console.log(`✅ All models synchronized successfully.`);
 
     } catch (error) {
         console.error('❌ FATAL: Database Initialization Failed:', error.message);
