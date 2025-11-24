@@ -1,5 +1,4 @@
-const { db } = require('../config/db'); // Import DB
-const { Op } = require('sequelize');
+const { db } = require('../config/db');
 
 module.exports = {
     postDailyReport,
@@ -12,66 +11,80 @@ async function postDailyReport(params, userId) {
         const results = [];
 
         for (const entry of entries) {
-            if (!entry || typeof entry !== 'object') continue;
+            // Frontend se date "2025-11-24" aayegi
+            const fullDate = new Date(entry.date);
+            const day = fullDate.getDate().toString(); // "24"
+            const month = fullDate.getMonth() + 1;     // 11
+            const year = fullDate.getFullYear();       // 2025
+            const amount = Number(entry.amount);
 
-            const { date, amount } = entry;
-
-            // Validation
-            if (!date || amount === null || amount === undefined || isNaN(Number(amount))) {
-                console.warn("Skipping invalid entry:", entry);
-                continue;
-            }
-
-            // Upsert: Create if not exists, Update if exists
-            const [report, created] = await db.DailyReport.upsert({
-                user_id: userId,
-                date,
-                amount: Number(amount)
+            // 1. Check karo ki is mahine ki row exist karti hai ya nahi
+            let report = await db.DailyReport.findOne({
+                where: { user_id: userId, month, year }
             });
 
-            results.push({ date, amount, status: created ? 'created' : 'updated' });
+            // 2. Agar nahi hai, to nayi row banao
+            if (!report) {
+                report = await db.DailyReport.build({
+                    user_id: userId,
+                    month,
+                    year,
+                    daily_data: {},
+                    monthly_total: 0
+                });
+            }
+
+            // 3. JSON Data Update karo
+            // Purana data copy karo aur naya din add/update karo
+            const currentData = { ...report.daily_data };
+            currentData[day] = amount;
+
+            // 4. Update JSON & Total
+            report.daily_data = currentData;
+            
+            // Total Recalculate (Cumulative logic jo aapne maanga tha)
+            // Aapka logic: Latest date ki value hi total hai.
+            // Lekin JSON me hum max value nikalenge ya last entered value.
+            
+            // Yahan hum latest day dhoondh rahe hain
+            const days = Object.keys(currentData).map(d => parseInt(d)).sort((a,b) => b-a);
+            const latestDay = days[0];
+            report.monthly_total = currentData[latestDay];
+
+            await report.save();
+            results.push(report);
         }
 
         return results;
     } catch (error) {
-        console.error("Error in postDailyReport service:", error);
-        throw new Error(`Error saving daily report: ${error.message || error}`);
+        throw new Error(`Error saving report: ${error.message}`);
     }
 }
 
 async function getDailyReport(params, userId) {
     try {
-        let { month, year } = params;
+        const { month, year } = params;
 
-        if (!month || !year) {
-            throw new Error("Month and year are required to fetch the daily report.");
-        }
-
-        // Ensure month is 2-digit
-        month = month.toString().padStart(2, '0');
-
-        const startDate = new Date(`${year}-${month}-01`);
-        const endDate = new Date(startDate);
-        endDate.setMonth(endDate.getMonth() + 1);
-        endDate.setDate(0); // last day of the month
-
-        const reports = await db.DailyReport.findAll({
-            where: {
-                user_id: userId,
-                date: {
-                    [Op.between]: [
-                        startDate.toISOString().slice(0, 10),
-                        endDate.toISOString().slice(0, 10)
-                    ]
-                }
-            },
-            attributes: ['date', 'amount', 'createdAt', 'updatedAt'],
-            order: [['date', 'ASC']]
+        // Sirf 1 Row fetch karni hai! Super Fast.
+        const report = await db.DailyReport.findOne({
+            where: { 
+                user_id: userId, 
+                month: parseInt(month), 
+                year: parseInt(year) 
+            }
         });
 
-        return reports.map(r => r.get({ plain: true }));
+        if (!report) return [];
+
+        // Frontend ko wahi purana format chahiye (Array of objects)
+        // To hum JSON ko wapas Array mein convert karke bhejenge
+        const formattedData = Object.entries(report.daily_data).map(([day, amount]) => ({
+            date: `${year}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`,
+            amount: amount
+        }));
+
+        return formattedData;
     } catch (error) {
-        console.error("Error in getDailyReport service:", error);
-        throw new Error(`Error fetching daily report: ${error.message || error}`);
+        throw new Error(`Error fetching report: ${error.message}`);
     }
 }

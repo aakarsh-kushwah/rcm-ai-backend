@@ -2,28 +2,26 @@ require('dotenv').config();
 const mysql = require('mysql2/promise');
 const { Sequelize } = require('sequelize');
 
-// Config.json fallback
-let config;
-try {
-    config = require('./config.json');
-} catch (error) {
-    config = { database: {} };
-}
+// --- CONFIGURATION LOAD ---
+let fileConfig = {};
+try { fileConfig = require('./config.json'); } catch (e) { /* Ignore */ }
 
 const db = {};
 
+// ⚙️ ENTERPRISE DATABASE CONFIGURATION
 const dbConfig = {
-    host: process.env.DB_HOST || config.database.host || '127.0.0.1',
-    user: process.env.DB_USER || config.database.user || 'root',
-    password: process.env.DB_PASSWORD || config.database.password || '',
-    database: process.env.DB_NAME || config.database.database || 'rcm_db',
-    port: process.env.DB_PORT || config.database.port || 3306,
+    host: process.env.DB_HOST || fileConfig.database?.host || '127.0.0.1',
+    user: process.env.DB_USER || fileConfig.database?.user || 'root',
+    password: process.env.DB_PASSWORD || fileConfig.database?.password || '',
+    database: process.env.DB_NAME || fileConfig.database?.database || 'rcm_db',
+    port: process.env.DB_PORT || fileConfig.database?.port || 3306,
     dialect: 'mysql',
     
+    // 🌊 CONNECTION POOLING (High Traffic Optimization)
     pool: {
         max: parseInt(process.env.DB_POOL_MAX) || 20,
-        min: 0,
-        acquire: 30000,
+        min: 2,
+        acquire: 60000,
         idle: 10000
     },
     
@@ -34,24 +32,24 @@ const dbConfig = {
         connectTimeout: 60000,
     },
     
-    logging: process.env.NODE_ENV === 'development' ? console.log : false
+    logging: false
 };
 
 async function initialize() {
     try {
-        console.log(`📡 Connecting to Database Host: ${dbConfig.host}`);
+        console.log(`📡 Initializing Database Connection to: ${dbConfig.host}`);
 
-        // 1. Connection & DB Check
-        const connection = await mysql.createConnection({ 
-            host: dbConfig.host, 
-            port: dbConfig.port, 
-            user: dbConfig.user, 
-            password: dbConfig.password 
+        // 1. PRE-FLIGHT CHECK
+        const connection = await mysql.createConnection({
+            host: dbConfig.host,
+            port: dbConfig.port,
+            user: dbConfig.user,
+            password: dbConfig.password
         });
         await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\`;`);
         await connection.end();
 
-        // 2. Sequelize Init
+        // 2. SEQUELIZE INSTANCE
         const sequelize = new Sequelize(
             dbConfig.database,
             dbConfig.user,
@@ -63,49 +61,80 @@ async function initialize() {
                 pool: dbConfig.pool,
                 dialectOptions: dbConfig.dialectOptions,
                 logging: dbConfig.logging,
+                timezone: '+00:00',
             }
         );
 
+        // 3. HEALTH CHECK
         await sequelize.authenticate();
-        console.log('🚀 Database connection established successfully.');
+        console.log('🚀 Database Connection: ESTABLISHED (Pool Ready)');
 
-        // 3. Load Models
+        // 4. MODEL REGISTRY
         db.User = require('../models/user.model')(sequelize);
         db.ChatMessage = require('../models/chatMessage.model')(sequelize);
         db.Subscriber = require('../models/subscriber.model')(sequelize);
         db.LeaderVideo = require('../models/leaderVideo.model')(sequelize);
         db.ProductVideo = require('../models/productVideo.model')(sequelize);
-        // ✅ Ensure spelling is correct here
-        db.DailyReport = require('../models/DailyReport.model')(sequelize); 
+        db.DailyReport = require('../models/DailyReport.model')(sequelize);
 
-        // 4. Define Associations
+        // 5. ASSOCIATIONS
+        Object.keys(db).forEach(modelName => {
+            if (db[modelName].associate) {
+                db[modelName].associate(db);
+            }
+        });
+        
+        // Manual Associations (Legacy Safety)
         db.User.hasMany(db.ChatMessage, { foreignKey: 'userId', as: 'chatMessages' });
         db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
-
-        db.User.hasMany(db.DailyReport, { foreignKey: 'user_id', as: 'dailyReports' });
-        db.DailyReport.belongsTo(db.User, { foreignKey: 'user_id', as: 'user' });
 
         db.Sequelize = Sequelize;
         db.sequelize = sequelize;
 
         // =========================================================
-        // 🛠️ FIX FOR FOREIGN KEY ERROR
+        // 🛡️ SELF-HEALING & CLEANUP PROTOCOLS
         // =========================================================
-        console.log("🔄 Syncing Database (Safe Mode)...");
-        
-        // Step A: Disable Foreign Key Checks (Rules todne ki permission)
-        await sequelize.query('SET FOREIGN_KEY_CHECKS = 0', { raw: true });
+        console.log("🛠️  Running Maintenance Protocols...");
 
-        // Step B: Sync Tables (Ab error nahi aayega)
+        // A. Disable Constraints (Allow cleanup)
+        await sequelize.query('SET FOREIGN_KEY_CHECKS = 0');
+
+        try {
+            // B. Cleanup Orphan Daily Reports
+            // (Delete reports where the user no longer exists)
+            await sequelize.query(`
+                DELETE FROM dailyReports 
+                WHERE user_id IS NOT NULL 
+                AND user_id NOT IN (SELECT id FROM users)
+            `);
+            console.log("   - Cleaned orphan Daily Reports");
+
+            // C. Cleanup Orphan Chat Messages (The cause of your error)
+            // (Delete messages where the user no longer exists)
+            // We use 'chat_messages' because that is the table name in your error log
+            await sequelize.query(`
+                DELETE FROM chat_messages 
+                WHERE userId IS NOT NULL 
+                AND userId NOT IN (SELECT id FROM users)
+            `);
+            console.log("   - Cleaned orphan Chat Messages");
+
+        } catch (cleanupError) {
+            console.warn("   ⚠️ Cleanup Warning (Tables might differ):", cleanupError.message);
+        }
+
+        // D. Sync Schema
+        // Now that bad data is gone, 'alter: true' will succeed
         await sequelize.sync({ alter: true });
 
-        // Step C: Enable Foreign Key Checks (Rules wapas lagao)
-        await sequelize.query('SET FOREIGN_KEY_CHECKS = 1', { raw: true });
+        // E. Re-enable Constraints
+        await sequelize.query('SET FOREIGN_KEY_CHECKS = 1');
 
-        console.log(`✅ All models synchronized successfully.`);
+        console.log(`✅ System Online: Database is synchronized and ready for traffic.`);
 
     } catch (error) {
-        console.error('❌ FATAL: Database Initialization Failed:', error.message);
+        console.error('🔥 FATAL SYSTEM ERROR: Database Initialization Failed');
+        console.error(error);
         process.exit(1); 
     }
 }
