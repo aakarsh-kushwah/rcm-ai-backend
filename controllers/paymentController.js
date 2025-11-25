@@ -2,96 +2,115 @@ const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const { db } = require("../config/db");
 
-// 1. Razorpay इंस्टेंस को .env फ़ाइल से Keys लेकर बनाएँ
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// ✅ Step 1: Create subscription
-// (यह 'exports.' सिंटैक्स 'routes' फ़ाइल में 'require' के साथ सही काम करता है)
+// -----------------------------------------------------
+// STEP 1 : Create Subscription with 7-Day Trial
+// -----------------------------------------------------
+
 exports.createSubscription = async (req, res) => {
   try {
-    // req.user 'isAuthenticated' मिडलवेयर से आ रहा है
-    const { id: userId, email, fullName: name } = req.user; 
+    const { id: userId, email, fullName: name } = req.user;
 
-    // ✅ Use the plan ID from .env
     const planId = process.env.RAZORPAY_PLAN_ID;
     if (!planId) {
-      return res
-        .status(500)
-        .json({ success: false, message: "Razorpay Plan ID not configured." });
+      return res.status(500).json({
+        success: false,
+        message: "Razorpay Plan ID not configured.",
+      });
     }
 
-    // ✅ Create a subscription
+    // 🔥 Subscription with Trial & Max Duration
     const subscription = await razorpay.subscriptions.create({
       plan_id: planId,
-      total_count: 12, // 12 महीने
+      total_count: 120,            // 120 months (10 years max)
       customer_notify: 1,
-      notes: { userId, email, name }, // ट्रैकिंग के लिए नोट्स
+      trial_period: 604800,        // 7 days trial (in seconds)
+      notes: { userId, email, name }
     });
 
-    // ✅ Save subscription ID to user table
-    // (findByPk ज़्यादा सुरक्षित है, ताकि हम सही यूज़र को अपडेट करें)
+    // Save subscription ID
     const user = await db.User.findByPk(userId);
-    if (user) {
-        user.razorpayCustomerId = subscription.id;
-        await user.save();
-    } else {
-        return res.status(404).json({ success: false, message: "User not found." });
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found."
+      });
     }
 
-    res.status(200).json({
+    user.razorpayCustomerId = subscription.id;
+    await user.save();
+
+    return res.status(200).json({
       success: true,
       subscriptionId: subscription.id,
-      key: process.env.RAZORPAY_KEY_ID, // Key को फ्रंटएंड पर भेजें
+      key: process.env.RAZORPAY_KEY_ID,
     });
+
   } catch (err) {
     console.error("Subscription creation error:", err);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to create subscription." });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create subscription."
+    });
   }
 };
 
-// ✅ Step 2: Verify payment
+// -----------------------------------------------------
+// STEP 2 : Verify Payment + Auto Refund ₹1
+// -----------------------------------------------------
+
 exports.verifyPayment = async (req, res) => {
   try {
-    const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } =
-      req.body;
+    const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } = req.body;
 
     if (!razorpay_payment_id || !razorpay_subscription_id || !razorpay_signature) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing payment verification data." });
+      return res.status(400).json({
+        success: false,
+        message: "Missing payment data."
+      });
     }
 
-    // ✅ सुरक्षित रूप से सिग्नेचर को वेरिफ़ाई करें
     const generated_signature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(`${razorpay_payment_id}|${razorpay_subscription_id}`)
       .digest("hex");
 
     if (generated_signature !== razorpay_signature) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Payment verification failed." });
+      return res.status(400).json({
+        success: false,
+        message: "Payment verification failed."
+      });
     }
 
-    // ✅ यूज़र को 'active' और 'autopay' के लिए मार्क करें
+    // -----------------------------------------------------
+    // 🔥 Auto Refund ₹1 authentication payment
+    // -----------------------------------------------------
+    await razorpay.payments.refund(razorpay_payment_id, {
+      amount: 100 // ₹1 = 100 paise
+    });
+
+    // -----------------------------------------------------
+    // Mark user active + AutoPay On
+    // -----------------------------------------------------
     await db.User.update(
       { status: "active", autoPayStatus: true },
       { where: { razorpayCustomerId: razorpay_subscription_id } }
     );
 
-    res
-      .status(200)
-      .json({ success: true, message: "Payment verified successfully!" });
+    return res.status(200).json({
+      success: true,
+      message: "Payment verified & ₹1 refunded!"
+    });
+
   } catch (error) {
     console.error("Payment verification error:", error);
-    res
-      .status(500)
-      .json({ success: false, message: "Error verifying payment." });
+    return res.status(500).json({
+      success: false,
+      message: "Error verifying payment."
+    });
   }
 };
-
