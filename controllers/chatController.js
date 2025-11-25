@@ -1,11 +1,11 @@
 const { getAIChatResponse } = require('../services/aiService');
 const { db } = require('../config/db');
 const { MASTER_PROMPT: SYSTEM_PROMPT } = require('../utils/prompts');
-const asyncHandler = require('express-async-handler');
+const asyncHandler = require('express-async-handler'); // ✅ Yeh line missing thi
 const axios = require('axios');
 
 // ============================================================
-// 🔹 1. Handle User Chat (Text) - Groq AI
+// 🔹 1. Handle User Chat (Text)
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const { message, chatHistory } = req.body; 
@@ -15,7 +15,7 @@ const handleChat = asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: "Message required" });
     }
 
-    // 1. Message Structure for Groq
+    // Prepare messages for AI
     let groqMessages = [{ role: "system", content: SYSTEM_PROMPT }];
     
     if (chatHistory && Array.isArray(chatHistory)) {
@@ -23,24 +23,23 @@ const handleChat = asyncHandler(async (req, res) => {
     }
     groqMessages.push({ role: "user", content: message });
     
-    // 2. Get AI Response
+    // Get AI Response
     const replyString = await getAIChatResponse(groqMessages);
 
-    // 3. Parse Response safely
+    // Parse JSON Response
     let replyContent = "";
     let jsonReply = null;
 
     try {
         jsonReply = JSON.parse(replyString);
         replyContent = jsonReply.content || jsonReply.text || replyString;
-        // Ensure structure consistency
         if (!jsonReply.type) jsonReply = { type: 'text', content: replyContent };
     } catch (e) {
         replyContent = replyString;
         jsonReply = { type: 'text', content: replyString };
     }
 
-    // 4. Save History to DB
+    // Save to DB
     if (userId) {
         await db.ChatMessage.bulkCreate([
             { userId, sender: "USER", message: message },
@@ -52,50 +51,62 @@ const handleChat = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🔹 2. Handle Speak (Voice) - SWITCHED TO OPENAI TTS 🚀
+// 🔹 2. Handle Speak (Voice with Debugging)
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
+    const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
     
-    // ✅ Ab hum OpenAI Key use karenge (ElevenLabs nahi)
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY; 
+    // Voice ID: "Rachel" (Professional) 
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
+
+    // 🔍 Debug Logs
+    console.log("🎤 Voice Request Received:", text ? "Text Present" : "No Text");
 
     if (!text) return res.status(400).json({ error: 'Text is required' });
     
-    if (!OPENAI_API_KEY) {
-        console.error("❌ CRITICAL: OPENAI_API_KEY is missing in Render Environment!");
-        return res.status(500).json({ error: 'Server Config Error: OpenAI Key Missing' });
+    if (!ELEVENLABS_API_KEY) {
+        console.error("❌ CRITICAL: ELEVENLABS_API_KEY missing in Environment Variables!");
+        return res.status(500).json({ error: 'Server Config Error: Voice Key Missing' });
     }
 
     try {
-        // console.log("📡 Generating Voice via OpenAI...");
-
+        console.log("📡 Calling ElevenLabs API...");
+        
         const response = await axios({
             method: 'POST',
-            url: 'https://api.openai.com/v1/audio/speech',
+            url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
             headers: {
-                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Accept': 'audio/mpeg',
+                'xi-api-key': ELEVENLABS_API_KEY,
                 'Content-Type': 'application/json',
             },
             data: {
-                model: "tts-1", // 'tts-1-hd' for ultra high quality (slower)
-                input: text,
-                voice: "nova",  // Options: alloy, echo, fable, onyx, nova, shimmer
-                response_format: "mp3",
-                speed: 1.0
+                text: text,
+                model_id: "eleven_monolingual_v1", // Low latency model
+                voice_settings: {
+                    stability: 0.5,
+                    similarity_boost: 0.75
+                }
             },
-            responseType: 'stream' // Stream audio directly to frontend
+            responseType: 'stream' // ⚡ Important: Stream audio
         });
 
-        // Send Audio Stream
+        console.log("✅ Voice Generated Successfully. Streaming to client...");
         res.set('Content-Type', 'audio/mpeg');
         response.data.pipe(res);
 
     } catch (error) {
-        console.error('🔥 OpenAI Voice Error:', error.response?.data || error.message);
-        
-        if (error.response?.status === 401) {
-            console.error("❌ Cause: Invalid OpenAI API Key.");
+        // 🔥 Detailed Error Logging for Debugging
+        console.error("🔥 ElevenLabs API Failed:");
+        if (error.response) {
+            console.error("Status:", error.response.status);
+            // Note: Stream error data might not be readable directly as JSON, 
+            // but status code tells the story.
+            if (error.response.status === 401) console.error("👉 Cause: Invalid API Key.");
+            if (error.response.status === 429) console.error("👉 Cause: Quota Exceeded (Free limit over).");
+        } else {
+            console.error("Error Message:", error.message);
         }
         
         res.status(500).json({ error: 'Failed to generate voice' });
