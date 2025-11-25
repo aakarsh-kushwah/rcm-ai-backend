@@ -4,13 +4,13 @@ const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-// 1. AI चैट के लिए (Text Response)
+// AI Chat (Text)
 router.post('/', isAuthenticated, handleChat);
 
-// 2. ✅ NEW: AI वॉइस के लिए (Audio Response)
+// ✅ AI Voice (Audio)
 router.post('/speak', isAuthenticated, handleSpeak);
 
-// 3. एडमिन के लिए (All Chats)
+// Admin
 router.get('/all', isAuthenticated, isAdmin, getAllChats); 
 
 module.exports = router;
