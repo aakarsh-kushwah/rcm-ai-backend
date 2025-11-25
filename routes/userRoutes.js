@@ -1,17 +1,14 @@
-// routes/userRoutes.js
-
+// routes/chatRoutes.js
 const express = require('express');
 const router = express.Router();
-// ✅ सिर्फ userController से इम्पोर्ट करें
-const { getMyProfile } = require('../controllers/userController'); 
-const { isAuthenticated } = require('../middleware/authMiddleware');
 
-// ----------------------------------------------------------------
-// 🛑 एरर फिक्स: यहाँ से 'deleteUser' और 'updateUserData' हटा दिया गया है
-// ----------------------------------------------------------------
+const { handleChat, getAllChats } = require('../controllers/chatController');
+const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware');
 
-// ✅ यह रूट सिर्फ़ लॉग-इन यूज़र को उसका *अपना* प्रोफ़ाइल दिखाता है
-// GET /api/users/me
-router.get('/me', isAuthenticated, getMyProfile);
+// POST /api/chat
+router.post('/', isAuthenticated, handleChat);
+
+// GET /api/chat/all  (admin only)
+router.get('/all', isAuthenticated, isAdmin, getAllChats);
 
 module.exports = router;
