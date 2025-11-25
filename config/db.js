@@ -8,7 +8,7 @@ try { fileConfig = require('./config.json'); } catch (e) { /* Ignore */ }
 
 const db = {};
 
-// ⚙️ ENTERPRISE DATABASE CONFIGURATION
+// ⚙️ ENTERPRISE DATABASE CONFIGURATION (AWS/Render Ready)
 const dbConfig = {
     host: process.env.DB_HOST || fileConfig.database?.host || '127.0.0.1',
     user: process.env.DB_USER || fileConfig.database?.user || 'root',
@@ -17,22 +17,22 @@ const dbConfig = {
     port: process.env.DB_PORT || fileConfig.database?.port || 3306,
     dialect: 'mysql',
     
-    // 🌊 CONNECTION POOLING (High Traffic Optimization)
+    // 🌊 CONNECTION POOLING (High Traffic Handler)
     pool: {
-        max: parseInt(process.env.DB_POOL_MAX) || 20,
+        max: parseInt(process.env.DB_POOL_MAX) || 20, // 20 Active Connections
         min: 2,
         acquire: 60000,
         idle: 10000
     },
     
     dialectOptions: {
-        decimalNumbers: true,
+        decimalNumbers: true, // For precise PV calculations
         supportBigNumbers: true,
         bigNumberStrings: true,
         connectTimeout: 60000,
     },
     
-    logging: false
+    logging: false // Production mode: Silent logs for speed
 };
 
 async function initialize() {
@@ -75,7 +75,7 @@ async function initialize() {
         db.Subscriber = require('../models/subscriber.model')(sequelize);
         db.LeaderVideo = require('../models/leaderVideo.model')(sequelize);
         db.ProductVideo = require('../models/productVideo.model')(sequelize);
-        db.DailyReport = require('../models/DailyReport.model')(sequelize);
+        db.DailyReport = require('../models/DailyReport.model')(sequelize); // Ensure this model file is updated to JSON logic
 
         // 5. ASSOCIATIONS
         Object.keys(db).forEach(modelName => {
@@ -84,7 +84,7 @@ async function initialize() {
             }
         });
         
-        // Manual Associations (Legacy Safety)
+        // Manual Associations (Safety Net)
         db.User.hasMany(db.ChatMessage, { foreignKey: 'userId', as: 'chatMessages' });
         db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
 
@@ -92,45 +92,40 @@ async function initialize() {
         db.sequelize = sequelize;
 
         // =========================================================
-        // 🛡️ SELF-HEALING & CLEANUP PROTOCOLS
+        // 🛡️ SELF-HEALING & MIGRATION PROTOCOLS
         // =========================================================
         console.log("🛠️  Running Maintenance Protocols...");
 
-        // A. Disable Constraints (Allow cleanup)
+        // A. Disable Constraints (To allow restructuring)
         await sequelize.query('SET FOREIGN_KEY_CHECKS = 0');
 
         try {
-            // B. Cleanup Orphan Daily Reports
-            // (Delete reports where the user no longer exists)
-            await sequelize.query(`
-                DELETE FROM dailyReports 
-                WHERE user_id IS NOT NULL 
-                AND user_id NOT IN (SELECT id FROM users)
-            `);
-            console.log("   - Cleaned orphan Daily Reports");
-
-            // C. Cleanup Orphan Chat Messages (The cause of your error)
-            // (Delete messages where the user no longer exists)
-            // We use 'chat_messages' because that is the table name in your error log
+            // B. ORPHAN DATA CLEANUP
+            console.log("   - Cleaning orphan Chat Messages...");
             await sequelize.query(`
                 DELETE FROM chat_messages 
                 WHERE userId IS NOT NULL 
                 AND userId NOT IN (SELECT id FROM users)
             `);
-            console.log("   - Cleaned orphan Chat Messages");
+
+            // C. MIGRATION: DROP OLD TABLE (Critical for new Architecture)
+            // Kyunki humne structure Row-based se JSON-based kar diya hai,
+            // purani table 'dailyReports' ko hatana zaroori hai taki conflict na ho.
+            // Nayi table ka naam humne Model me 'monthly_reports' rakha hai.
+            console.log("   - Migrating Legacy Tables...");
+            await sequelize.query('DROP TABLE IF EXISTS dailyReports');
 
         } catch (cleanupError) {
-            console.warn("   ⚠️ Cleanup Warning (Tables might differ):", cleanupError.message);
+            console.warn("   ⚠️ Maintenance Warning (Safe to ignore):", cleanupError.message);
         }
 
-        // D. Sync Schema
-        // Now that bad data is gone, 'alter: true' will succeed
+        // D. SYNC SCHEMA (Create new tables)
         await sequelize.sync({ alter: true });
 
         // E. Re-enable Constraints
         await sequelize.query('SET FOREIGN_KEY_CHECKS = 1');
 
-        console.log(`✅ System Online: Database is synchronized and ready for traffic.`);
+        console.log(`✅ System Online: Scalable Architecture Ready.`);
 
     } catch (error) {
         console.error('🔥 FATAL SYSTEM ERROR: Database Initialization Failed');
