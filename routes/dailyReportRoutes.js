@@ -1,17 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const controller = require('../controllers/dailyReport.controller');
+const { postDailyReport, getDailyReport } = require('../controllers/dailyReport.controller');
+const { verifyToken } = require('../middleware/authMiddleware'); // नाम चेक करें
 
-// 👇 IMP: Agar aapke folder ka naam 'middlewares' (s ke sath) hai, toh path badal dein
-// Abhi ye 'middleware' folder dhund raha hai.
-const { verifyToken } = require('../middleware/authMiddleware'); 
-
-// --- Final Debug Check ---
-if (!verifyToken) {
-    console.error("❌ ABHI BHI ERROR: Path galat hai! '../middleware' vs '../middlewares' check karein.");
-}
-
-router.post('/post-dailyReport', verifyToken, controller.postDailyReport);
-router.post('/get-dailyReport', verifyToken, controller.getDailyReport);
+// 👇 ये पाथ बिल्कुल सही होने चाहिए
+router.post('/post-dailyReport', verifyToken, postDailyReport);
+router.post('/get-dailyReport', verifyToken, getDailyReport);
 
 module.exports = router;
