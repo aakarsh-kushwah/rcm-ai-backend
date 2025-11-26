@@ -6,6 +6,7 @@ const axios = require('axios');
 
 // ============================================================
 // 🔹 1. Handle User Chat (Text Logic) - Groq AI
+// (Code unchanged - Focus is on TTS)
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const { message, chatHistory } = req.body; 
@@ -67,12 +68,12 @@ const handleChat = asyncHandler(async (req, res) => {
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     
-    // ✅ Render se Key uthayega
+    // ✅ 1. Render Environment Variable से Key उठाएगा
     const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
     
-    // 🎙️ Voice ID: "Rachel" (Professional & Clear)
-    // Ye ID ElevenLabs ki default 'Rachel' voice ki hai
-    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
+    // 🎙️ Voice ID: Environment Variable Preferred, Fallback to 'Domi' (Multilingual V2 compatible)
+    // NOTE: आप अपनी custom Hindi voice ID यहाँ Environment Variable में सेट कर सकते हैं।
+    const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "LruHrtVF6PSyGItzMNHS"; 
 
     if (!text) {
         return res.status(400).json({ error: 'Text is required for speech generation.' });
@@ -80,11 +81,12 @@ const handleSpeak = asyncHandler(async (req, res) => {
     
     if (!ELEVENLABS_API_KEY) {
         console.error("❌ CRITICAL ERROR: ELEVENLABS_API_KEY is missing in Render Environment Variables!");
-        return res.status(500).json({ error: 'Server Configuration Error: Voice Key Missing' });
+        // 500 status code ही रखें क्योंकि यह server-side config error है
+        return res.status(500).json({ error: 'Server Configuration Error: ElevenLabs Key Missing' }); 
     }
 
     try {
-        // console.log("📡 Requesting Realistic Voice from ElevenLabs...");
+        console.log(`📡 Requesting Realistic Voice for ID: ${VOICE_ID}`);
 
         // Call ElevenLabs API
         const response = await axios({
@@ -97,19 +99,20 @@ const handleSpeak = asyncHandler(async (req, res) => {
             },
             data: {
                 text: text,
-                model_id: "eleven_monolingual_v1", // Low latency model
+                // ⚡ FIX: Multilingual support के लिए eleven_multilingual_v2 का उपयोग करें
+                model_id: "eleven_multilingual_v2", 
                 voice_settings: {
-                    stability: 0.5,       // 50% stability allows emotional range
-                    similarity_boost: 0.75 // High clarity
+                    stability: 0.5, 
+                    similarity_boost: 0.75 
                 }
             },
-            responseType: 'stream' // ⚡ Critical: Stream audio directly to client
+            responseType: 'stream' // Critical: Stream audio directly to client
         });
 
-        // Pipe the audio stream directly to the frontend
+        // 4. Pipe the audio stream directly to the frontend
         res.set({
-            'Content-Type': 'audio/mpeg',
-            'Transfer-Encoding': 'chunked'
+            'Content-Type': 'audio/mpeg', // ✅ Correct MIME type for audio stream
+            'Cache-Control': 'no-cache', // Ensure browser re-fetches each time
         });
         
         response.data.pipe(res);
@@ -119,24 +122,26 @@ const handleSpeak = asyncHandler(async (req, res) => {
         console.error('🔥 ElevenLabs Voice Generation Failed:', error.message);
         
         if (error.response) {
-            console.error('   Status:', error.response.status);
-            console.error('   Data:', error.response.data); 
-
+            console.error('   Status:', error.response.status);
+            // ElevenLabs error details often come in the response data stream
+            // Since responseType is 'stream', we can't easily read JSON error body here.
+            // A common fix is to read the stream for logs or use responseType: 'arraybuffer' first.
             if (error.response.status === 401) {
-                console.error("❌ KEY ERROR: The API Key on Render is invalid or restricted. Please create a new FULL ACCESS key.");
-                return res.status(500).json({ error: 'Invalid ElevenLabs API Key configured on server.' });
+                console.error("❌ API Key is invalid or restricted.");
+                return res.status(401).json({ error: 'Invalid ElevenLabs API Key configured on server.' });
             }
             if (error.response.status === 429) {
                 return res.status(429).json({ error: 'Voice quota exceeded. Free limit reached.' });
             }
         }
         
-        res.status(500).json({ error: 'Failed to generate voice. Please try again later.' });
+        res.status(500).json({ error: 'Failed to generate voice. Internal Server Error.' });
     }
 });
 
 // ============================================================
 // 🔹 3. Admin: Get All Chats (Grouped by User)
+// (Code unchanged)
 // ============================================================
 const getAllChats = asyncHandler(async (req, res) => {
     try {
