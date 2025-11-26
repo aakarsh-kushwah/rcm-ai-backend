@@ -1,14 +1,10 @@
 const Groq = require("groq-sdk");
-// ✅ Naye prompt ko yahaan import karein
 const { SYSTEM_PROMPT } = require('../utils/prompts');
-
-// --- 1. कॉन्फिगरेशन (Configuration) ---
 
 let groqClient = null;
 
 try {
     const apiKey = process.env.GROQ_API_KEY;
-
     if (!apiKey) {
         console.warn(
             "⚠️ GROQ_API_KEY is missing! Groq AI features will be disabled. Service will return fallback messages."
@@ -21,53 +17,55 @@ try {
     console.error("❌ Failed to initialize Groq client:", err.message);
 }
 
-// ✅ --- YEH HAI MUKHYA FIX (Models Update) ---
-// In models ko update kar diya gaya hai kyunki 'llama-3.1-70b-versatile' band ho chuka hai.
+// Models list updated to current supported ones
 const MODELS_TO_ATTEMPT = [
-     'llama-3.3-70b-versatile'
-     
+    'llama-3.3-70b-versatile',
+    'llama3-70b-8192',
+    'mixtral-8x7b-32768'
 ];
 
-
-
-// ✅ Default system prompt ab aapka RCM prompt hai.
 const DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT; 
 
-// --- 2. हेल्पर फंक्शन (Helper Function) ---
-
 /**
- * 🚨 यह फंक्शन API में भेजने से पहले 'messages' ऐरे को साफ और सुरक्षित करता है।
- * ✅ Isko saral (simplify) kar diya gaya hai.
- *
- * @param {Array<Object>} incomingMessages - क्लाइंट से आया हुआ मैसेज ऐरे।
- * @returns {Array<Object>} - Groq API के लिए एक सुरक्षित और मान्य (valid) ऐरे।
+ * Prepares messages for Groq API.
+ * CRITICAL FIX: Injects the word "JSON" into the system prompt if missing.
+ * This resolves the 400 error: "'messages' must contain the word 'json'..."
  */
 function prepareMessagesForGroq(incomingMessages) {
-    
-    // 1. Sabhi valid messages ko filter karein
+    // 1. Filter valid messages
     const cleanedMessages = incomingMessages.filter(
         (msg) => msg && msg.role && typeof msg.content === 'string' && msg.content.trim() !== ''
     );
 
-    // 2. Check karein ki 'system' role ka message pehle se hai ya nahi
-    const hasSystemPrompt = cleanedMessages.some(msg => msg.role === "system");
+    // 2. Check if system prompt exists and update it
+    let hasSystemPrompt = false;
+    
+    // We use map to create a new array with modified content where necessary
+    const finalMessages = cleanedMessages.map(msg => {
+        if (msg.role === "system") {
+            hasSystemPrompt = true;
+            // ✅ Fix: If we want JSON output, the prompt MUST say "JSON" explicitly.
+            if (!msg.content.toLowerCase().includes("json")) {
+                return { 
+                    ...msg, 
+                    content: msg.content + " IMPORTANT: You must respond in strict JSON format." 
+                };
+            }
+        }
+        return msg;
+    });
 
-    // 3. Agar koi system prompt nahi mila, toh hamara RCM wala default prompt sabse aage jod dein
+    // 3. If no system prompt found, add default with JSON instruction
     if (!hasSystemPrompt) {
-        cleanedMessages.unshift({
+        finalMessages.unshift({
             role: "system",
-            content: DEFAULT_SYSTEM_PROMPT,
+            content: DEFAULT_SYSTEM_PROMPT + " IMPORTANT: You must respond in strict JSON format.",
         });
     }
     
-    return cleanedMessages;
+    return finalMessages;
 }
 
-/**
- * एक मानकीकृत (standardized) एरर रिस्पॉन्स बनाता है।
- * @param {string} message - क्लाइंट को दिखाने वाला एरर मैसेज।
- * @returns {string} - JSON स्ट्रिंग
- */
 function createErrorResponse(message) {
     return JSON.stringify({
         type: "text",
@@ -75,71 +73,42 @@ function createErrorResponse(message) {
     });
 }
 
-// --- 3. मुख्य सर्विस फंक्शन (Main Service Function) ---
-
-/**
- * AI चैट रिस्पॉन्स को सुरक्षित रूप से हैंडल करता है, जिसमें मॉडल फेलओवर (failover) भी शामिल है।
- * ✅ यह फंक्शन हमेशा एक JSON स्ट्रिंग ही रिटर्न करेगा (सफलता या विफलता दोनों में)।
- *
- * @param {Array<Object>} messages - क्लाइंट से आया हुआ चैट मैसेज ऐरे।
- * @returns {Promise<string>} - एक JSON स्ट्रिंग जिसमें 'type' और 'content' होगा।
- */
 async function getAIChatResponse(messages) {
-    // 1️⃣ गार्ड क्लॉज: क्या Groq क्लाइंट शुरू हुआ था?
     if (!groqClient) {
-        console.error("🚫 Groq service called, but client is not initialized (missing API key).");
-        return createErrorResponse(
-            "⚠️ AI service is unavailable. Please contact the administrator."
-        );
+        return createErrorResponse("AI service is currently unavailable.");
     }
 
-    // 2️⃣ गार्ड क्लॉज: क्या इनपुट वैलिड है?
-    if (
-        !messages ||
-        !Array.isArray(messages) ||
-        messages.length === 0 ||
-        !messages.some((m) => m.role === "user")
-    ) {
-        console.warn("🚫 Invalid input blocked: No user message provided.");
-        return createErrorResponse(
-            "⚠️ Invalid input: No user message provided."
-        );
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        return createErrorResponse("Invalid input provided.");
     }
 
-    // 3️⃣ 🚨 महत्वपूर्ण: मैसेज को API के लिए तैयार करें (Updated logic)
+    // ✅ Apply the fix to messages
     const processedMessages = prepareMessagesForGroq(messages);
 
-    // 4️⃣ मॉडल फेलओवर लूप: एक-एक करके मॉडल ट्राई करें
     for (const model of MODELS_TO_ATTEMPT) {
         try {
-            // console.log(`Attempting model: ${model}`); // Debugging ke liye
+            // Attempt 1: Strict JSON Mode
             const chatCompletion = await groqClient.chat.completions.create({
                 model: model,
                 messages: processedMessages,
                 temperature: 0.5, 
                 max_tokens: 1024,
-                // ✅ Naya parameter: JSON output ke liye force karein
-                // Taa ki 'type: "calculator"' hamesha JSON mein aaye
-                response_format: { type: "json_object" }, 
+                response_format: { type: "json_object" }, // Requires "json" in prompt
             });
             
             const content = chatCompletion?.choices?.[0]?.message?.content;
             
             if (content) {
-                // 5️⃣ ✅ सफलता!
                 return content; 
             }
             
-            console.warn(`⚠️ Groq model "${model}" returned empty content.`);
-
         } catch (error) {
-            console.warn(`❌ Groq model "${model}" failed (JSON format):`, error.message);
+            console.warn(`❌ Groq model "${model}" failed (JSON mode):`, error.message);
             
-            // ✅ Production-Ready Fallback:
-            // Agar model JSON format support nahi karta ya fail hota hai,
-            // toh hum bina JSON format ke dobara try karenge.
-            console.warn(`Retrying model "${model}" without JSON response format...`);
+            // Attempt 2: Fallback to Standard Text Mode
+            // (Some older models or specific prompts might fail JSON mode validation)
             try {
+                console.warn(`Retrying model "${model}" without JSON format enforcement...`);
                 const fallbackCompletion = await groqClient.chat.completions.create({
                     model: model,
                     messages: processedMessages,
@@ -149,23 +118,28 @@ async function getAIChatResponse(messages) {
                 
                 const fallbackContent = fallbackCompletion?.choices?.[0]?.message?.content;
                 if (fallbackContent) {
-                    // Isse JSON structure mein wrap karein
-                    return JSON.stringify({
-                        type: "text",
-                        content: fallbackContent,
-                    });
+                    // If the model returned plain text, wrap it in our JSON structure manually
+                    // so the frontend doesn't break.
+                    try {
+                        // Check if it happens to be valid JSON anyway
+                        JSON.parse(fallbackContent);
+                        return fallbackContent;
+                    } catch (e) {
+                        // Not JSON, wrap it
+                        return JSON.stringify({
+                            type: "text",
+                            content: fallbackContent,
+                        });
+                    }
                 }
             } catch (fallbackError) {
-                    console.warn(`❌ Fallback attempt for model "${model}" also failed:`, fallbackError.message);
+                console.warn(`❌ Fallback attempt for model "${model}" also failed:`, fallbackError.message);
             }
         }
     }
 
-    // 6️⃣ ❌ अंतिम विफलता: अगर सारे मॉडल फेल हो जाएँ
-    console.error("❌ All Groq models failed to respond. Service is likely overloaded.");
-    return createErrorResponse(
-        "⚠️ AI service is temporarily overloaded. Please try again in a moment."
-    );
+    console.error("❌ All Groq models failed to respond.");
+    return createErrorResponse("I'm having trouble thinking right now. Please try again in a moment.");
 }
 
 module.exports = { getAIChatResponse };
