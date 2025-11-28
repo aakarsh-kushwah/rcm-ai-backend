@@ -93,9 +93,9 @@ async function initialize() {
         db.LeaderVideo = require('../models/leaderVideo.model')(sequelize);
         db.ProductVideo = require('../models/productVideo.model')(sequelize);
         
-        // ✅ IMPORTANT: File name casing must match exactly
-        // Humne ise 'dailyReport.model.js' maan kar load kiya hai
-        db.DailyReport = require('../models/dailyReport.model')(sequelize); 
+        // ✅ CORRECTED: Direct Import with Capital 'D'
+        // Kyunki aapne confirm kiya hai ki file ka naam 'DailyReport.model.js' hai.
+        db.DailyReport = require('../models/DailyReport.model')(sequelize); 
 
         // =========================================================
         // 4. DEFINE ASSOCIATIONS (Relationship Map)
