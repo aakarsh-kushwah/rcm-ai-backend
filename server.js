@@ -4,35 +4,35 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
-const compression = require('compression'); // ✅ NEW: Speed Booster
+const compression = require('compression'); // ⚡ Fast Response
 
-// ✅ DB IMPORT
+// ✅ DB IMPORT (Engine)
 const { db, initialize } = require('./config/db');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ============================================================
-// 🛡️ SECURITY & PERFORMANCE MIDDLEWARES
+// 🛡️ SECURITY & PERFORMANCE (Enterprise Level)
 // ============================================================
 
-// 1. Trust Proxy (Render/Cloudflare/AWS ke liye zaroori)
+// 1. Trust Proxy (Render/AWS ke liye zaroori)
 app.set('trust proxy', 1);
 
-// 2. Compression (Response ko chhota karta hai -> Faster App)
+// 2. Compression (Google uses this to make sites fast)
 app.use(compression());
 
-// 3. Secure HTTP Headers
+// 3. Secure Headers (Helmet)
 app.use(helmet());
 
-// 4. Logging (Production mein Clean logs, Dev mein Detailed)
+// 4. Smart Logging (Prod me clean, Dev me detailed)
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-// 5. Payload Size (Badi files/audio ke liye limit badhayi)
+// 5. Payload Limit (Audio/Image upload ke liye bada size)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// 6. CORS (Sirf apni websites ko allow karein)
+// 6. CORS (Sirf aapki sites allow karega)
 const allowedOrigins = [
   'https://rcm-ai-admin-ui.vercel.app',
   'https://rcm-ai-frontend.vercel.app',
@@ -57,7 +57,7 @@ app.use(cors({
 // 7. Rate Limiting (DDoS Protection)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 Minutes
-  max: 50, // Thoda badhaya taaki users block na hon
+  max: 50, // Login attempts limit
   message: 'Too many login attempts, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -65,7 +65,7 @@ const authLimiter = rateLimit({
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 1000, // Chat/Voice ke liye limit badhayi
+  max: 1000, // Chat/Voice ke liye high limit
   message: 'Server is busy, please wait a moment.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -76,39 +76,41 @@ const apiLimiter = rateLimit({
 // ============================================================
 async function startServer() {
   try {
-    // Step 1: Database Initialization (Critical)
+    // Step 1: Database Engine Start
     console.log('⏳ Initializing Database...');
     await initialize();
     console.log('✅ Database Connected & Models Synced.');
 
-    // Step 2: Load Routes (Lazy Loading for Performance)
-    console.log('⏳ Loading Application Routes...');
+    // Step 2: Load Routes (Lazy Loading)
+    console.log('⏳ Loading Routes...');
     const healthRoutes = require('./routes/health');
     const authRoutes = require('./routes/authRoutes');
     const subscriberRoutes = require('./routes/subscriberRoutes');
     const chatRoutes = require('./routes/chatRoutes');
+    const dailyReportRoutes = require('./routes/dailyReportRoutes'); // ✅ Daily Reports
     const userRoutes = require('./routes/userRoutes');
     const videoRoutes = require('./routes/videoRoutes');
     const adminRoutes = require('./routes/adminRoutes');
     const paymentRoutes = require('./routes/paymentRoutes');
-    
-    // ✅ MISSING ROUTE ADDED (Daily Reports)
-    const dailyReportRoutes = require('./routes/dailyReportRoutes'); 
 
     // Step 3: Register Routes
     app.use('/', healthRoutes); // Health Check
     app.use('/api/auth', authLimiter, authRoutes);
     app.use('/api', apiLimiter, subscriberRoutes);
-    app.use('/api/chat', apiLimiter, chatRoutes);       // Text & Voice
-    app.use('/api/reports', apiLimiter, dailyReportRoutes); // ✅ Fixed: Daily Report Route
+    
+    // Core Features
+    app.use('/api/chat', apiLimiter, chatRoutes);       // AI Chat & Voice
+    app.use('/api/reports', apiLimiter, dailyReportRoutes); // Reports
+    
+    // Other Features
     app.use('/api/users', apiLimiter, userRoutes);
     app.use('/api/videos', apiLimiter, videoRoutes);
     app.use('/api/admin', apiLimiter, adminRoutes);
     app.use('/api/payment', apiLimiter, paymentRoutes);
 
-    console.log('✅ All Routes Successfully Configured.');
+    console.log('✅ All Routes Configured.');
 
-    // Step 4: Global Error Handling (Last Middleware)
+    // Step 4: Global Error Handling
     app.use((req, res) => {
       res.status(404).json({ success: false, message: `Endpoint Not Found: ${req.originalUrl}` });
     });
@@ -134,11 +136,10 @@ async function startServer() {
     });
 
     // ============================================================
-    // 🛑 GRACEFUL SHUTDOWN (Data Loss Prevention)
-    // Google/Amazon servers aise hi band hote hain
+    // 🛑 GRACEFUL SHUTDOWN (No Data Loss)
     // ============================================================
     const shutdown = () => {
-      console.log('🛑 SIGTERM signal received: closing HTTP server');
+      console.log('🛑 Signal received: closing HTTP server');
       server.close(() => {
         console.log('🛑 HTTP server closed');
         db.sequelize.close().then(() => {
@@ -157,5 +158,5 @@ async function startServer() {
   }
 }
 
-// Start the engine
+// Start Engine
 startServer();
