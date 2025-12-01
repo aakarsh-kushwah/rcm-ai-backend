@@ -56,6 +56,12 @@ const handleSpeak = asyncHandler(async (req, res) => {
     // ✅ ElevenLabs API Key from Render Environment
     const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
+
+    // 🔥 नया Debugging Code (इसे बाद में हटा दें)
+    console.log("-----------------------------------------");
+    console.log("Is API Key loaded:", !!ELEVENLABS_API_KEY); // 'true' या 'false' बताएगा
+    console.log("Key first 5 chars:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) : 'N/A');
+    console.log("-----------------------------------------");
     // 🎙️ Voice ID: "Rachel" (American, Clear, Professional)
     // You can change this ID from ElevenLabs Voice Library
     const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
