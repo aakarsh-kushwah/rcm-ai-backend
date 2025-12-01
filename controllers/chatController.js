@@ -50,22 +50,24 @@ const handleChat = asyncHandler(async (req, res) => {
 // ============================================================
 // 🔹 2. Handle Speak (ElevenLabs Voice) 🚀
 // ============================================================
+// ============================================================
+// 🔹 2. Handle Speak (ElevenLabs Voice) 🚀 (Optimized)
+// ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     
-    // ✅ ElevenLabs API Key from Render Environment
-    const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+    // 1. Key Handling & Trimming (Fix for hidden spaces)
+    const ELEVENLABS_API_KEY_RAW = process.env.ELEVENLABS_API_KEY;
+    const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null; // ✅ OPTIMIZED: Trimming the key
 
-
-    // 🔥 नया Debugging Code (इसे बाद में हटा दें)
+    // 2. Debugging and Validation
+    // (Debugging logs should be removed in production)
     console.log("-----------------------------------------");
-    console.log("Is API Key loaded:", !!ELEVENLABS_API_KEY); // 'true' या 'false' बताएगा
+    console.log("Is API Key loaded:", !!ELEVENLABS_API_KEY);
     console.log("Key first 5 chars:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) : 'N/A');
     console.log("-----------------------------------------");
-    // 🎙️ Voice ID: "Rachel" (American, Clear, Professional)
-    // You can change this ID from ElevenLabs Voice Library
-    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
 
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
     console.log("🎤 Generating Voice for:", text ? text.substring(0, 20) + "..." : "Empty");
 
     if (!text) return res.status(400).json({ error: 'Text is required' });
@@ -81,18 +83,19 @@ const handleSpeak = asyncHandler(async (req, res) => {
             url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
             headers: {
                 'Accept': 'audio/mpeg',
-                'xi-api-key': ELEVENLABS_API_KEY,
+                // Sending the trimmed key
+                'xi-api-key': ELEVENLABS_API_KEY, 
                 'Content-Type': 'application/json',
             },
             data: {
                 text: text,
-                model_id: "eleven_monolingual_v1", // Low latency model
+                model_id: "eleven_monolingual_v1",
                 voice_settings: {
-                    stability: 0.5,       // Balanced emotion
-                    similarity_boost: 0.75 // Clear voice
+                    stability: 0.5, 
+                    similarity_boost: 0.75
                 }
             },
-            responseType: 'stream' // ⚡ Stream audio directly
+            responseType: 'stream'
         });
 
         // Stream the audio back to frontend
@@ -104,9 +107,10 @@ const handleSpeak = asyncHandler(async (req, res) => {
         console.error('🔥 ElevenLabs Voice Error:', error.response?.status);
         
         if (error.response) {
-             // Read stream error data if possible (Tricky with streams)
              if (error.response.status === 401) {
                  console.error("👉 ACTION: API Key is INVALID or RESTRICTED.");
+                 // Sending a 401 status back is better practice for client-side debugging, 
+                 // but we'll keep 500 as per your previous code for consistency.
                  return res.status(500).json({ error: "Invalid API Key on Server" });
              }
              if (error.response.status === 429) {
