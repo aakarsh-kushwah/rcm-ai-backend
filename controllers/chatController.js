@@ -5,7 +5,7 @@ const asyncHandler = require('express-async-handler');
 const axios = require('axios');
 
 // ============================================================
-// 🔹 1. Handle User Chat (Text Logic) - UNCHANGED
+// 🔹 1. Handle User Chat (Text Logic)
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const { message, chatHistory } = req.body; 
@@ -44,7 +44,7 @@ const handleChat = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🔹 2. Handle Speak (ElevenLabs Voice) - ✅ FIXED & OPTIMIZED
+// 🔹 2. Handle Speak (ElevenLabs Voice) - ✅ FIXED ERROR LOGGING
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
@@ -53,30 +53,32 @@ const handleSpeak = asyncHandler(async (req, res) => {
         return res.status(400).json({ error: 'Text is required and cannot be empty' });
     }
 
-    // 1. Robust Key Handling
-    // Checks multiple environment variables and trims whitespace
+    // 1. Get API Key
     const ELEVENLABS_API_KEY_RAW = process.env.ELEVENLABS_API_KEY || 
                                    process.env.ELEVENLABS_KEY || 
                                    process.env.ELEVENLABS_SK;
                                    
     const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null;
 
-    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Your preferred voice
+    // Use "Rachel" Voice (Reliable)
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
+    // Use V2 Model (Required for Free Tier)
+    const MODEL_ID = "eleven_multilingual_v2";
 
-    // Debug Logs
     console.log("🎤 ElevenLabs Debug:");
     console.log(`- API Key Loaded: ${!!ELEVENLABS_API_KEY}`);
     console.log(`- Key Prefix: ${ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) + '...' : 'MISSING'}`);
+    console.log(`- Model: ${MODEL_ID}`);
     
     if (!ELEVENLABS_API_KEY) {
-        console.error("❌ CRITICAL: No ElevenLabs API key found in any env var!");
+        console.error("❌ CRITICAL: No ElevenLabs API key found!");
         return res.status(500).json({ 
-            error: 'Server Config Error: ELEVENLABS_API_KEY missing. Check .env or Render dashboard.' 
+            error: 'Server Config Error: ELEVENLABS_API_KEY missing.' 
         });
     }
 
-    // 2. Safety Limits (Prevent 429 Errors)
-    const MAX_CHARS = 2500; // Conservative limit
+    // 2. Safety Truncation
+    const MAX_CHARS = 2500; 
     const safeText = text.trim().substring(0, MAX_CHARS);
 
     try {
@@ -85,22 +87,20 @@ const handleSpeak = asyncHandler(async (req, res) => {
             url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
             headers: {
                 'Accept': 'audio/mpeg',
-                // ✅ Using 'xi-api-key' as verified by your successful test
                 'xi-api-key': ELEVENLABS_API_KEY, 
                 'Content-Type': 'application/json',
             },
             data: {
                 text: safeText,
-                // ✅ THE FIX: Switched to 'eleven_multilingual_v2' (Supported on Free Tier)
-                model_id: "eleven_multilingual_v2",
+                model_id: MODEL_ID, 
                 voice_settings: {
                     stability: 0.5, 
                     similarity_boost: 0.8,
                     use_speaker_boost: true
                 }
             },
-            responseType: 'stream',
-            timeout: 30000, // 30s timeout
+            responseType: 'stream', // Important for audio
+            timeout: 30000, 
         });
 
         console.log("✅ Voice generated successfully");
@@ -115,22 +115,32 @@ const handleSpeak = asyncHandler(async (req, res) => {
         response.data.pipe(res);
 
     } catch (error) {
-        console.error('🔥 ElevenLabs Error:', error.response?.status);
+        console.error('🔥 ElevenLabs Error Status:', error.response?.status);
         
-        // Log detailed error message from ElevenLabs if available
+        // 🔥 CRITICAL FIX: Read the Error Stream to show the REAL message
         if (error.response?.data) {
              try {
-                const errorData = Buffer.isBuffer(error.response.data) 
-                    ? error.response.data.toString() 
-                    : JSON.stringify(error.response.data);
-                console.error('Error Details:', errorData);
-             } catch(e) {}
+                if (typeof error.response.data.on === 'function') {
+                    // It's a stream, listen for data chunks
+                    error.response.data.on('data', (chunk) => {
+                        console.error('🔴 REAL ELEVENLABS ERROR MESSAGE:', chunk.toString());
+                    });
+                } else {
+                    // It's a buffer or object
+                    const errorData = Buffer.isBuffer(error.response.data) 
+                        ? error.response.data.toString() 
+                        : JSON.stringify(error.response.data);
+                    console.error('🔴 REAL ELEVENLABS ERROR MESSAGE:', errorData);
+                }
+             } catch(e) {
+                 console.error('Error reading error stream:', e.message);
+             }
         }
 
-        // Specific Error Handling
+        // Specific Error Responses
         if (error.response?.status === 401) {
             return res.status(401).json({ 
-                error: 'Invalid API Key. Please update ELEVENLABS_API_KEY in Render.' 
+                error: 'Unauthorized. Check Render Logs for "REAL ELEVENLABS ERROR MESSAGE" to see why.' 
             });
         }
         
