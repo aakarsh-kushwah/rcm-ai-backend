@@ -47,27 +47,24 @@ const handleChat = asyncHandler(async (req, res) => {
     res.status(200).json({ success: true, reply: jsonReply });
 });
 
+
 // ============================================================
-// 🔹 2. Handle Speak (ElevenLabs Voice) 🚀
-// ============================================================
-// ============================================================
-// 🔹 2. Handle Speak (ElevenLabs Voice) 🚀 (Optimized)
+// 🔹 2. Handle Speak (ElevenLabs Voice) 🚀 (FIXED: Header for sk_ Key)
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     
-    // 1. Key Handling & Trimming (Fix for hidden spaces)
+    // 1. Key Handling & Trimming 
     const ELEVENLABS_API_KEY_RAW = process.env.ELEVENLABS_API_KEY;
-    const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null; // ✅ OPTIMIZED: Trimming the key
+    const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null; // Key is now trimmed
+
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
 
     // 2. Debugging and Validation
-    // (Debugging logs should be removed in production)
     console.log("-----------------------------------------");
     console.log("Is API Key loaded:", !!ELEVENLABS_API_KEY);
     console.log("Key first 5 chars:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) : 'N/A');
     console.log("-----------------------------------------");
-
-const VOICE_ID = "EXAVITQu4vr4xnSDxMaL";
     console.log("🎤 Generating Voice for:", text ? text.substring(0, 20) + "..." : "Empty");
 
     if (!text) return res.status(400).json({ error: 'Text is required' });
@@ -83,8 +80,9 @@ const VOICE_ID = "EXAVITQu4vr4xnSDxMaL";
             url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
             headers: {
                 'Accept': 'audio/mpeg',
-                // Sending the trimmed key
-                'xi-api-key': ELEVENLABS_API_KEY, 
+                // 🔥 FIX: Replaced 'xi-api-key' with the standard 'Authorization: Bearer' header 
+                // to correctly handle the 'sk_' prefixed key.
+                'Authorization': `Bearer ${ELEVENLABS_API_KEY}`, 
                 'Content-Type': 'application/json',
             },
             data: {
@@ -109,8 +107,6 @@ const VOICE_ID = "EXAVITQu4vr4xnSDxMaL";
         if (error.response) {
              if (error.response.status === 401) {
                  console.error("👉 ACTION: API Key is INVALID or RESTRICTED.");
-                 // Sending a 401 status back is better practice for client-side debugging, 
-                 // but we'll keep 500 as per your previous code for consistency.
                  return res.status(500).json({ error: "Invalid API Key on Server" });
              }
              if (error.response.status === 429) {
@@ -123,6 +119,6 @@ const VOICE_ID = "EXAVITQu4vr4xnSDxMaL";
     }
 });
 
-const getAllChats = asyncHandler(async (req, res) => { /* ... */ });
+const getAllChats = asyncHandler(async (req, res) => { /* Placeholder */ });
 
 module.exports = { handleChat, handleSpeak, getAllChats };
