@@ -5,7 +5,7 @@ const asyncHandler = require('express-async-handler');
 const axios = require('axios');
 
 // ============================================================
-// 🔹 1. Handle User Chat (Text Logic)
+// 🔹 1. Handle User Chat (Text Logic) - UNCHANGED
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const { message, chatHistory } = req.body; 
@@ -13,17 +13,14 @@ const handleChat = asyncHandler(async (req, res) => {
 
     if (!message) return res.status(400).json({ success: false, message: "Message required" });
 
-    // 1. Message Context
     let groqMessages = [{ role: "system", content: SYSTEM_PROMPT }];
     if (chatHistory && Array.isArray(chatHistory)) {
         groqMessages = [...groqMessages, ...chatHistory];
     }
     groqMessages.push({ role: "user", content: message });
     
-    // 2. Get AI Response
     const replyString = await getAIChatResponse(groqMessages);
 
-    // 3. Parse Response
     let replyContent = "";
     let jsonReply = null;
 
@@ -36,7 +33,6 @@ const handleChat = asyncHandler(async (req, res) => {
         jsonReply = { type: 'text', content: replyString };
     }
 
-    // 4. Save History
     if (userId) {
         await db.ChatMessage.bulkCreate([
             { userId, sender: "USER", message: message },
@@ -47,75 +43,123 @@ const handleChat = asyncHandler(async (req, res) => {
     res.status(200).json({ success: true, reply: jsonReply });
 });
 
-
 // ============================================================
-// 🔹 2. Handle Speak (ElevenLabs Voice) 🚀 (FIXED: Header for sk_ Key)
+// 🔹 2. Handle Speak (ElevenLabs Voice) - FIXED ✅
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     
-    // 1. Key Handling & Trimming 
-    const ELEVENLABS_API_KEY_RAW = process.env.ELEVENLABS_API_KEY;
-    const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null; // Key is now trimmed
+    if (!text?.trim()) {
+        return res.status(400).json({ error: 'Text is required and cannot be empty' });
+    }
 
-    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
+    // 🔧 FIXED: Multiple API key sources + validation
+    let apiKey = process.env.ELEVENLABS_API_KEY?.trim() || 
+                 process.env.ELEVENLABS_KEY?.trim() ||
+                 null;
 
-    // 2. Debugging and Validation
-    console.log("-----------------------------------------");
-    console.log("Is API Key loaded:", !!ELEVENLABS_API_KEY);
-    console.log("Key first 5 chars:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) : 'N/A');
-    console.log("-----------------------------------------");
-    console.log("🎤 Generating Voice for:", text ? text.substring(0, 20) + "..." : "Empty");
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Verify this voice exists in your account
 
-    if (!text) return res.status(400).json({ error: 'Text is required' });
+    // 🔧 ENHANCED Debugging
+    console.log("🎤 ElevenLabs Request Debug:");
+    console.log("- API Key loaded:", !!apiKey);
+    console.log("- Key prefix:", apiKey ? apiKey.substring(0, 4) + "..." : "MISSING");
+    console.log("- Text length:", text.length);
+    console.log("- Voice ID:", VOICE_ID);
+    console.log("─".repeat(50));
+
+    if (!apiKey) {
+        console.error("❌ CRITICAL: No valid ElevenLabs API key found!");
+        return res.status(500).json({ 
+            error: 'Server configuration error: ElevenLabs API key missing. Check environment variables.' 
+        });
+    }
+
+    // 🔧 FIXED: Rate limiting & text truncation
+    const MAX_CHARS = 5000; // Safe limit for most plans
+    const safeText = text.trim().substring(0, MAX_CHARS);
     
-    if (!ELEVENLABS_API_KEY) {
-        console.error("❌ CRITICAL: ELEVENLABS_API_KEY missing on Render!");
-        return res.status(500).json({ error: 'Server Config Error: Key Missing' });
+    if (text.length > MAX_CHARS) {
+        console.warn(`📏 Text truncated from ${text.length} to ${MAX_CHARS} chars`);
     }
 
     try {
-        const response = await axios({
-            method: 'POST',
-            url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
-            headers: {
-                'Accept': 'audio/mpeg',
-                // 🔥 FIX: Replaced 'xi-api-key' with the standard 'Authorization: Bearer' header 
-                // to correctly handle the 'sk_' prefixed key.
-                'Authorization': `Bearer ${ELEVENLABS_API_KEY}`, 
-                'Content-Type': 'application/json',
-            },
-            data: {
-                text: text,
-                model_id: "eleven_monolingual_v1",
+        const response = await axios.post(
+            `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
+            {
+                text: safeText,
+                model_id: "eleven_multilingual_v2", // 🔧 UPDATED: Better multilingual support
                 voice_settings: {
-                    stability: 0.5, 
-                    similarity_boost: 0.75
+                    stability: 0.5,
+                    similarity_boost: 0.8, // Slightly higher for clarity
+                    style: 0,
+                    use_speaker_boost: true
                 }
             },
-            responseType: 'stream'
+            {
+                headers: {
+                    'Accept': 'audio/mpeg',
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    'xi-api-key': apiKey // 🔧 BACKUP: Some endpoints still accept this
+                },
+                responseType: 'stream',
+                timeout: 30000, // 30s timeout
+                maxRedirects: 5
+            }
+        );
+
+        // 🔧 ENHANCED Response headers for debugging
+        console.log("✅ Success - Rate limit info:", {
+            remaining: response.headers['x-ratelimit-remaining'],
+            reset: response.headers['x-ratelimit-reset']
         });
 
-        // Stream the audio back to frontend
-        res.set('Content-Type', 'audio/mpeg');
+        res.set({
+            'Content-Type': 'audio/mpeg',
+            'Content-Length': response.headers['content-length'],
+            'Cache-Control': 'no-cache'
+        });
+        
         response.data.pipe(res);
 
     } catch (error) {
-        // 🔥 Better Error Logging for Debugging
-        console.error('🔥 ElevenLabs Voice Error:', error.response?.status);
+        console.error("🔥 ElevenLabs Error Details:", {
+            status: error.response?.status,
+            statusText: error.response?.statusText,
+            headers: error.response?.headers,
+            message: error.message
+        });
+
+        // 🔧 COMPREHENSIVE Error Handling
+        if (error.response?.status === 401) {
+            return res.status(401).json({ 
+                error: 'Invalid API key. Please regenerate in ElevenLabs dashboard and update ELEVENLABS_API_KEY env variable.' 
+            });
+        }
         
-        if (error.response) {
-             if (error.response.status === 401) {
-                 console.error("👉 ACTION: API Key is INVALID or RESTRICTED.");
-                 return res.status(500).json({ error: "Invalid API Key on Server" });
-             }
-             if (error.response.status === 429) {
-                 console.error("👉 ACTION: Quota Exceeded (Free tier limit reached).");
-                 return res.status(429).json({ error: "Voice Quota Exceeded" });
-             }
+        if (error.response?.status === 404) {
+            return res.status(404).json({ 
+                error: `Voice ID "${VOICE_ID}" not found. Use /v1/voices endpoint to list available voices.` 
+            });
         }
 
-        res.status(500).json({ error: 'Failed to generate voice' });
+        if (error.response?.status === 429) {
+            const resetTime = error.response.headers['x-ratelimit-reset'];
+            return res.status(429).json({ 
+                error: 'Rate limit exceeded. Free tier: ~10k chars/month. Upgrade or wait.',
+                retryAfter: resetTime || 60
+            });
+        }
+
+        if (error.code === 'ECONNABORTED') {
+            return res.status(408).json({ error: 'Request timeout. Text too long or server busy.' });
+        }
+
+        res.status(500).json({ 
+            error: 'Voice generation failed. Check server logs.',
+            debug: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 });
 
