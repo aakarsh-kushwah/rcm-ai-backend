@@ -67,7 +67,7 @@ const handleSpeak = asyncHandler(async (req, res) => {
     console.log("Key first 5 chars:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) : 'N/A');
     console.log("-----------------------------------------");
 
-    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
+const VOICE_ID = "EXAVITQu4vr4xnSDxMaL";
     console.log("🎤 Generating Voice for:", text ? text.substring(0, 20) + "..." : "Empty");
 
     if (!text) return res.status(400).json({ error: 'Text is required' });
