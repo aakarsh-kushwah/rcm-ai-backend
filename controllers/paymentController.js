@@ -31,6 +31,7 @@ exports.createSubscription = async (req, res) => {
     // ✅ Create a subscription
     const subscription = await razorpay.subscriptions.create({
       plan_id: planId,
+      total_count: 360,
       quantity: 1,
       start_at: startAtTimestamp, // <--- THIS LINE ADDS THE 7-DAY DELAY
       customer_notify: 1,
