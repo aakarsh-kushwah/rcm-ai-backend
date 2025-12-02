@@ -61,7 +61,7 @@ const handleSpeak = asyncHandler(async (req, res) => {
                                    
     const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null;
 
-    const VOICE_ID = "EXAVITQu4vr4xnSDxMaL"; // Your preferred voice
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Your preferred voice
 
     // Debug Logs
     console.log("🎤 ElevenLabs Debug:");
