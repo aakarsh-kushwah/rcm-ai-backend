@@ -27,10 +27,6 @@ const MODELS_TIER_1 = 'llama-3.3-70b-versatile'; // Best Quality
 const MODELS_TIER_2 = 'llama3-70b-8192';         // Faster
 const MODELS_TIER_3 = 'mixtral-8x7b-32768';      // Backup
 
-// Default Brain Instructions
-const DEFAULT_SYSTEM_PROMPT = MASTER_PROMPT || "You are a highly intelligent business consultant.";
-
-// --- 2. ADVANCED UTILITIES ---
 
 /**
  * Generates a unique hash for the conversation to use as Cache Key.
