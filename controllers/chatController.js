@@ -60,13 +60,8 @@ const handleSpeak = asyncHandler(async (req, res) => {
                                    
     const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null;
 
-<<<<<<< Updated upstream
-    // Use "leo" Voice (Reliable)
-    const VOICE_ID = "IvLWq57RKibBrqZGpQrC"; 
-=======
     // Use "Rachel" Voice (Reliable)
-    const VOICE_ID = ""; 
->>>>>>> Stashed changes
+    const VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; 
     // Use V2 Model (Required for Free Tier)
     const MODEL_ID = "eleven_multilingual_v2";
 
