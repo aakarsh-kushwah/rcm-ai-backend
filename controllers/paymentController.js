@@ -8,7 +8,7 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// ✅ Step 1: Create subscription (FIXED)
+// ✅ Step 1: Create subscription
 exports.createSubscription = async (req, res) => {
   try {
     const { id: userId, email, fullName: name } = req.user; 
@@ -19,10 +19,12 @@ exports.createSubscription = async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // 🔥 NEW LOGIC: Calculate 7 Days from Now
+    // 🔥 UPDATED LOGIC: Calculate 1 Day from Now (for Testing)
     // ---------------------------------------------------------
     const date = new Date();
-    date.setDate(date.getDate() + 7); // Add 7 days to current time
+    
+    // 👇 CHANGED FROM 7 TO 1
+    date.setDate(date.getDate() + 1); 
     
     // Razorpay requires the date in "Unix Timestamp" format (seconds, not milliseconds)
     const startAtTimestamp = Math.floor(date.getTime() / 1000); 
@@ -33,14 +35,12 @@ exports.createSubscription = async (req, res) => {
       plan_id: planId,
       total_count: 360,
       quantity: 1,
-      start_at: startAtTimestamp, // <--- THIS LINE ADDS THE 7-DAY DELAY
+      start_at: startAtTimestamp, // Will now start exactly 24 hours from now
       customer_notify: 1,
       notes: { userId, email, name }, 
     });
 
     // ✅ Save subscription ID to user table
-    // Note: You are saving subscription.id into a column named 'razorpayCustomerId'. 
-    // Ensure your database column is intended for Subscription IDs (starts with 'sub_').
     const user = await db.User.findByPk(userId);
     if (user) {
         user.razorpayCustomerId = subscription.id; 
@@ -59,6 +59,7 @@ exports.createSubscription = async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to create subscription." });
   }
 };
+
 
 // ✅ Step 2: Verify payment (ALREADY CORRECT)
 // Your verification logic is correct for Subscriptions. 
