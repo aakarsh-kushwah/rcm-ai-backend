@@ -1,11 +1,14 @@
 const { getAIChatResponse } = require('../services/aiService');
 const { db } = require('../config/db');
+const { uploadAudioToCloudinary } = require('../services/cloudinaryService');
 const { MASTER_PROMPT: SYSTEM_PROMPT } = require('../utils/prompts');
 const asyncHandler = require('express-async-handler');
 const axios = require('axios');
+const crypto = require('crypto');
+const { Op } = require('sequelize');
 
 // ============================================================
-// 🔹 1. Handle User Chat (Text Logic)
+// 🔹 1. Handle User Chat (Smart FAQ + AI Fallback)
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const { message, chatHistory } = req.body; 
@@ -13,26 +16,49 @@ const handleChat = asyncHandler(async (req, res) => {
 
     if (!message) return res.status(400).json({ success: false, message: "Message required" });
 
-    let groqMessages = [{ role: "system", content: SYSTEM_PROMPT }];
-    if (chatHistory && Array.isArray(chatHistory)) {
-        groqMessages = [...groqMessages, ...chatHistory];
-    }
-    groqMessages.push({ role: "user", content: message });
-    
-    const replyString = await getAIChatResponse(groqMessages);
-
     let replyContent = "";
-    let jsonReply = null;
+    let audioUrl = null;
+    let source = "AI";
 
+    // --- 🕵️ STEP A: Check FAQ Database (Zero Cost Strategy) ---
+    // Checks if the user's question matches any "Smart Response" stored by Admin
     try {
-        jsonReply = JSON.parse(replyString);
-        replyContent = jsonReply.content || jsonReply.text || replyString;
-        if (!jsonReply.type) jsonReply = { type: 'text', content: replyContent };
-    } catch (e) {
-        replyContent = replyString;
-        jsonReply = { type: 'text', content: replyString };
+        const faqMatch = await db.FAQ.findOne({
+            where: {
+                question: { [Op.substring]: message.trim() } // Partial match (e.g., "what is rcm" matches "what is rcm business")
+            }
+        });
+
+        if (faqMatch) {
+            console.log(`✅ FAQ HIT: Serving pre-set answer for "${message}"`);
+            replyContent = faqMatch.answer;
+            audioUrl = faqMatch.audioUrl; // We get the audio URL immediately!
+            source = "FAQ_DB";
+        }
+    } catch (err) {
+        console.warn("⚠️ FAQ Check Failed (continuing to AI):", err.message);
     }
 
+    // --- 🤖 STEP B: Call Groq AI (Only if no FAQ found) ---
+    if (!replyContent) {
+        console.log("🤖 FAQ MISS: Calling Groq AI...");
+        let groqMessages = [{ role: "system", content: SYSTEM_PROMPT }];
+        if (chatHistory && Array.isArray(chatHistory)) {
+            groqMessages = [...groqMessages, ...chatHistory];
+        }
+        groqMessages.push({ role: "user", content: message });
+        
+        const replyString = await getAIChatResponse(groqMessages);
+
+        try {
+            const jsonReply = JSON.parse(replyString);
+            replyContent = jsonReply.content || jsonReply.text || replyString;
+        } catch (e) {
+            replyContent = replyString;
+        }
+    }
+
+    // Save Chat History
     if (userId) {
         await db.ChatMessage.bulkCreate([
             { userId, sender: "USER", message: message },
@@ -40,118 +66,114 @@ const handleChat = asyncHandler(async (req, res) => {
         ]);
     }
 
-    res.status(200).json({ success: true, reply: jsonReply });
+    // Return Data
+    res.status(200).json({ 
+        success: true, 
+        reply: { type: 'text', content: replyContent },
+        audioUrl: audioUrl, // Frontend can play this directly!
+        source: source
+    });
 });
 
 // ============================================================
-// 🔹 2. Handle Speak (ElevenLabs Voice) - ✅ FIXED ERROR LOGGING
+// 🔹 2. Handle Speak (Cached ElevenLabs Voice)
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     
-    if (!text?.trim()) {
-        return res.status(400).json({ error: 'Text is required and cannot be empty' });
-    }
+    if (!text?.trim()) return res.status(400).json({ error: 'Text is required' });
 
-    // 1. Get API Key
-    const ELEVENLABS_API_KEY_RAW = process.env.ELEVENLABS_API_KEY || 
-                                   process.env.ELEVENLABS_KEY || 
-                                   process.env.ELEVENLABS_SK;
-                                   
-    const ELEVENLABS_API_KEY = ELEVENLABS_API_KEY_RAW ? ELEVENLABS_API_KEY_RAW.trim() : null;
-
-    // Use "leo" Voice (Reliable)
-    const VOICE_ID = "IvLWq57RKibBrqZGpQrC"; 
-    // Use V2 Model (Required for Free Tier)
-    const MODEL_ID = "eleven_multilingual_v2";
-
-    console.log("🎤 ElevenLabs Debug:");
-    console.log(`- API Key Loaded: ${!!ELEVENLABS_API_KEY}`);
-    console.log(`- Key Prefix: ${ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.substring(0, 5) + '...' : 'MISSING'}`);
-    console.log(`- Model: ${MODEL_ID}`);
-    
-    if (!ELEVENLABS_API_KEY) {
-        console.error("❌ CRITICAL: No ElevenLabs API key found!");
-        return res.status(500).json({ 
-            error: 'Server Config Error: ELEVENLABS_API_KEY missing.' 
-        });
-    }
-
-    // 2. Safety Truncation
-    const MAX_CHARS = 2500; 
-    const safeText = text.trim().substring(0, MAX_CHARS);
+    // Normalize and Hash
+    const normalizedText = text.trim().toLowerCase();
+    const textHash = crypto.createHash('sha256').update(normalizedText).digest('hex');
 
     try {
+        // --- Check Database Cache ---
+        const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
+
+        if (cachedVoice) {
+            console.log("✅ VOICE CACHE HIT: Serving from DB");
+            return res.json({ success: true, audioUrl: cachedVoice.audioUrl, source: "cache" });
+        }
+
+        console.log("⚠️ VOICE CACHE MISS: Calling ElevenLabs...");
+
+        // --- Call ElevenLabs ---
+        const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVENLABS_KEY;
+        if (!ELEVENLABS_API_KEY) return res.status(500).json({ error: 'ELEVENLABS_API_KEY missing.' });
+
         const response = await axios({
             method: 'POST',
-            url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
-            headers: {
-                'Accept': 'audio/mpeg',
-                'xi-api-key': ELEVENLABS_API_KEY, 
-                'Content-Type': 'application/json',
-            },
+            url: `https://api.elevenlabs.io/v1/text-to-speech/IvLWq57RKibBrqZGpQrC`, // Leo Voice
+            headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
             data: {
-                text: safeText,
-                model_id: MODEL_ID, 
-                voice_settings: {
-                    stability: 0.5, 
-                    similarity_boost: 0.8,
-                    use_speaker_boost: true
-                }
+                text: text.substring(0, 2500),
+                model_id: "eleven_multilingual_v2",
+                voice_settings: { stability: 0.5, similarity_boost: 0.8 }
             },
-            responseType: 'stream', // Important for audio
-            timeout: 30000, 
+            responseType: 'arraybuffer'
         });
 
-        console.log("✅ Voice generated successfully");
-        
-        // Stream audio with proper headers
-        res.set({
-            'Content-Type': 'audio/mpeg',
-            'Connection': 'keep-alive',
-            'Cache-Control': 'no-cache'
+        // --- Upload & Save ---
+        const cloudinaryUrl = await uploadAudioToCloudinary(response.data, textHash);
+
+        await db.VoiceResponse.create({
+            textHash: textHash,
+            originalText: text,
+            audioUrl: cloudinaryUrl,
+            voiceId: "IvLWq57RKibBrqZGpQrC"
         });
-        
-        response.data.pipe(res);
+
+        res.json({ success: true, audioUrl: cloudinaryUrl, source: "api" });
 
     } catch (error) {
-        console.error('🔥 ElevenLabs Error Status:', error.response?.status);
-        
-        // 🔥 CRITICAL FIX: Read the Error Stream to show the REAL message
-        if (error.response?.data) {
-             try {
-                if (typeof error.response.data.on === 'function') {
-                    // It's a stream, listen for data chunks
-                    error.response.data.on('data', (chunk) => {
-                        console.error('🔴 REAL ELEVENLABS ERROR MESSAGE:', chunk.toString());
-                    });
-                } else {
-                    // It's a buffer or object
-                    const errorData = Buffer.isBuffer(error.response.data) 
-                        ? error.response.data.toString() 
-                        : JSON.stringify(error.response.data);
-                    console.error('🔴 REAL ELEVENLABS ERROR MESSAGE:', errorData);
-                }
-             } catch(e) {
-                 console.error('Error reading error stream:', e.message);
-             }
-        }
-
-        // Specific Error Responses
-        if (error.response?.status === 401) {
-            return res.status(401).json({ 
-                error: 'Unauthorized. Check Render Logs for "REAL ELEVENLABS ERROR MESSAGE" to see why.' 
-            });
-        }
-        
-        if (error.response?.status === 429) {
-            return res.status(429).json({ error: 'Quota exceeded (Free Tier Limit). Please wait or upgrade.' });
-        }
-
+        console.error('🔥 Voice Gen Error:', error.message);
         res.status(500).json({ error: 'Voice generation failed.' });
     }
 });
 
-const getAllChats = asyncHandler(async (req, res) => { /* Placeholder */ });
+// ============================================================
+// 🔹 3. Admin: Add Smart Response (Saves to FAQ + Voice Cache)
+// ============================================================
+const addSmartResponse = asyncHandler(async (req, res) => {
+    const { question, answer, audioUrl } = req.body;
 
-module.exports = { handleChat, handleSpeak, getAllChats };
+    if (!question || !answer || !audioUrl) {
+        return res.status(400).json({ success: false, message: "Question, Answer, and Audio URL are required." });
+    }
+
+    try {
+        // 1. Save to FAQ Table (Stops Groq usage for this question)
+        const newFaq = await db.FAQ.create({
+            question: question.toLowerCase(),
+            answer: answer,
+            audioUrl: audioUrl
+        });
+
+        // 2. Save to VoiceResponse Table (Stops ElevenLabs usage for this answer)
+        const textHash = crypto.createHash('sha256').update(answer.trim().toLowerCase()).digest('hex');
+        
+        const existingVoice = await db.VoiceResponse.findOne({ where: { textHash } });
+        if (!existingVoice) {
+            await db.VoiceResponse.create({
+                textHash: textHash,
+                originalText: answer,
+                audioUrl: audioUrl,
+                voiceId: "FAQ_PRESET"
+            });
+        }
+
+        console.log(`✅ ADMIN: Smart Response added for "${question}"`);
+        res.status(201).json({ success: true, message: "Smart Response saved! Costs = ZERO.", data: newFaq });
+
+    } catch (error) {
+        console.error("🔥 Admin FAQ Error:", error);
+        res.status(500).json({ success: false, message: "Failed to save smart response." });
+    }
+});
+
+const getAllChats = asyncHandler(async (req, res) => { 
+    res.status(200).json({ success: true, message: "Chat history route" });
+});
+
+module.exports = { handleChat, handleSpeak, getAllChats, addSmartResponse };
