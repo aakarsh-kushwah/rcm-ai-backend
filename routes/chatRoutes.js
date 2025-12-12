@@ -1,11 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const multer = require('multer'); // Import Multer
+const multer = require('multer'); 
 
-// Setup Multer (RAM Storage)
 const upload = multer({ 
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+    limits: { fileSize: 10 * 1024 * 1024 } 
 });
 
 const { 
@@ -14,16 +13,16 @@ const {
     getAllChats, 
     addSmartResponse 
 } = require('../controllers/chatController');
+
 const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware'); 
 
-// 1. Text Chat
+// 1. Text Chat (Auto-Learning enabled here)
 router.post('/', isAuthenticated, handleChat);
 
 // 2. Voice Chat
 router.post('/speak', isAuthenticated, handleSpeak);
 
-// 3. Admin: Smart Response with File Upload
-// ⚠️ Note: 'audioFile' is the field name we will use in Frontend
+// 3. Admin: Manual Add
 router.post('/admin/smart-response', isAuthenticated, isAdmin, upload.single('audioFile'), addSmartResponse);
 
 // 4. Get Chats

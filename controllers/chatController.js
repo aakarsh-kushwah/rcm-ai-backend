@@ -6,55 +6,93 @@ const asyncHandler = require('express-async-handler');
 const axios = require('axios');
 const crypto = require('crypto');
 const stringSimilarity = require("string-similarity");
+const NodeCache = require("node-cache");
 
+// ✅ Query Cache
+const queryCache = new NodeCache({ stdTTL: 600 });
 
-// --- 🧠 Helper: Clean Input (Text को साफ करता है) ---
+// ============================================================
+// 🛠️ HELPER FUNCTIONS
+// ============================================================
+
 function cleanInput(text) {
     if (!text) return "";
-    return text.toLowerCase()
-        .replace(/[^\w\s]/gi, '') // सिम्बल्स (?, !, .) हटाता है
-        .replace(/\s+/g, ' ')     // एक्स्ट्रा स्पेस हटाता है
-        .trim();
+    return text.toLowerCase().replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 }
 
-// --- 🧠 Helper: Smart Hinglish Tag Generator ---
-// यह फंक्शन एक सवाल से 10-12 अलग-अलग तरीके के सवाल बना देता है
+// ✅ NEW: Smart Filter to check if question is worth saving
+function isSaveableQuestion(text) {
+    const t = cleanInput(text);
+    
+    // 1. Too short? (e.g. "Hi", "Hello", "Kyu", "Nahi")
+    if (t.length < 5) return false;
+    if (t.split(' ').length < 2) return false; // Single word messages (e.g. "Nutricharge" is ok, but "Nahi" is not)
+
+    // 2. Contextual / Conversational junk?
+    const junkWords = ['nahi suna', 'fir se bolo', 'aur batao', 'thank you', 'ok thanks', 'bye', 'hello', 'hi', 'kya hua', 'samjha nahi'];
+    if (junkWords.some(junk => t.includes(junk))) return false;
+
+    // 3. Must have some substance (Optional check)
+    return true;
+}
+
 function generateVariations(sentence) {
-    // 1. Core Topic निकालें (जैसे "What is RCM" से "RCM")
     const stopWords = ['what', 'is', 'the', 'a', 'an', 'explain', 'tell', 'me', 'about', 'kya', 'he', 'hai', 'h', 'ka', 'ki', 'ke', '?'];
     const words = cleanInput(sentence).split(' ');
     const topicWords = words.filter(w => !stopWords.includes(w));
-    const topic = topicWords.join(' '); // e.g., "rcm" or "body lotion"
+    const topic = topicWords.join(' '); 
 
     if (!topic) return [cleanInput(sentence)];
 
-    // 2. Variations (Tags) बनाएं
     return [
-        cleanInput(sentence),        // Original: "what is rcm"
-        topic,                       // Raw: "rcm"
-        
-        // English Variations
-        `explain ${topic}`,
-        `define ${topic}`,
+        cleanInput(sentence),
+        topic,
+        `explain ${topic}`, 
+        `${topic} kya hai`, 
         `${topic} details`,
         `about ${topic}`,
-        `benefits of ${topic}`,
-        
-        // Hinglish Variations (ये सबसे जरूरी है)
-        `${topic} kya hai`,
-        `${topic} kya he`,
-        `${topic} kya h`,
-        `${topic} ke fayde`,
-        `${topic} ki jankari`,
-        `${topic} kaise kare`,
-        `${topic} kyu kare`,
-        `${topic} details batao`,
-        `${topic} ka matlab`
+        `${topic} ke fayde`
     ];
 }
 
+async function getOrGenerateVoice(text) {
+    if (!text) return null;
+    try {
+        const cleanText = cleanInput(text);
+        const textHash = crypto.createHash('sha256').update(cleanText).digest('hex');
+
+        // A. Check Voice Table
+        const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
+        if (cachedVoice) return cachedVoice.audioUrl;
+
+        // B. Generate New Voice
+        const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+        if (!ELEVENLABS_API_KEY) return null;
+
+        console.log("🎙️ Generating New Audio...");
+        const response = await axios({
+            method: 'POST',
+            url: `https://api.elevenlabs.io/v1/text-to-speech/IvLWq57RKibBrqZGpQrC`, 
+            headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+            data: {
+                text: text.substring(0, 500), 
+                model_id: "eleven_multilingual_v2",
+                voice_settings: { stability: 0.5, similarity_boost: 0.8 }
+            },
+            responseType: 'arraybuffer'
+        });
+
+        const cloudinaryUrl = await uploadAudioToCloudinary(response.data, textHash);
+        await db.VoiceResponse.create({ textHash: textHash, originalText: text, audioUrl: cloudinaryUrl, voiceId: "AUTO_GEN" });
+        return cloudinaryUrl;
+    } catch (error) {
+        console.error("⚠️ Voice Auto-Gen Failed:", error.message);
+        return null;
+    }
+}
+
 // ============================================================
-// 🔹 1. Handle User Chat (SMART TAG SEARCH)
+// 🔹 MAIN CHAT HANDLER
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const { message, chatHistory } = req.body; 
@@ -65,62 +103,89 @@ const handleChat = asyncHandler(async (req, res) => {
     let replyContent = "";
     let audioUrl = null;
     let source = "AI";
-
-    // 1. यूजर के मैसेज को साफ करें
     const userMsgClean = cleanInput(message);
-    console.log(`🔍 User Input: "${userMsgClean}"`);
 
-    // --- 🕵️ STEP A: Smart DB Search ---
-    try {
-        // सारे FAQs लाओ
-        const allFaqs = await db.FAQ.findAll({
-            attributes: ['id', 'question', 'answer', 'audioUrl', 'tags']
-        });
-
-        let bestMatch = { rating: 0, faq: null };
-
-        // हर FAQ के Tags में ढूंढो
-        allFaqs.forEach(faq => {
-            // हम मुख्य सवाल और उसके सारे Tags में मैच करेंगे
-            const candidates = [cleanInput(faq.question), ...(faq.tags || [])];
-            
-            // Fuzzy Match ढूंढो
-            const match = stringSimilarity.findBestMatch(userMsgClean, candidates);
-            
-            if (match.bestMatch.rating > bestMatch.rating) {
-                bestMatch = { rating: match.bestMatch.rating, faq: faq };
-            }
-        });
-
-        console.log(`📊 Best Match Score: ${(bestMatch.rating * 100).toFixed(0)}%`);
-
-        // ✅ अगर 45% से ज्यादा मैच हो, तो सही जवाब दे दो
-        if (bestMatch.rating > 0.45) {
-            console.log(`✅ DATABASE HIT: Found answer for "${userMsgClean}"`);
-            replyContent = bestMatch.faq.answer;
-            audioUrl = bestMatch.faq.audioUrl;
-            source = "FAQ_DB";
-        }
-
-    } catch (err) {
-        console.warn("⚠️ Database Search Error:", err.message);
+    // --- STEP A: Check RAM Cache ---
+    const cachedReply = queryCache.get(userMsgClean);
+    if (cachedReply) {
+        replyContent = cachedReply;
+        source = "CACHE_RAM";
+        audioUrl = await getOrGenerateVoice(replyContent);
     }
 
-    // --- 🤖 STEP B: Call Groq AI (अगर DB में कुछ नहीं मिला) ---
+    // --- STEP B: Check Database ---
     if (!replyContent) {
-        console.log("🤖 DB Miss -> Calling Groq AI...");
+        try {
+            const allFaqs = await db.FAQ.findAll({
+                where: { status: 'APPROVED' }, 
+                attributes: ['id', 'question', 'answer', 'audioUrl', 'tags']
+            });
+
+            let bestMatch = { rating: 0, faq: null };
+            allFaqs.forEach(faq => {
+                const candidates = [cleanInput(faq.question), ...(faq.tags || [])];
+                const match = stringSimilarity.findBestMatch(userMsgClean, candidates);
+                if (match.bestMatch.rating > bestMatch.rating) {
+                    bestMatch = { rating: match.bestMatch.rating, faq: faq };
+                }
+            });
+
+            if (bestMatch.rating > 0.50) {
+                console.log(`✅ DB HIT: Found answer`);
+                replyContent = bestMatch.faq.answer;
+                audioUrl = bestMatch.faq.audioUrl; 
+                source = "DATABASE";
+                if (!audioUrl) {
+                    audioUrl = await getOrGenerateVoice(replyContent);
+                    if (audioUrl) await bestMatch.faq.update({ audioUrl: audioUrl });
+                }
+            }
+        } catch (err) { console.warn("DB Search Error:", err.message); }
+    }
+
+    // --- STEP C: Ask AI (If DB Miss) ---
+    if (!replyContent) {
+        console.log("🤖 DB MISS: Asking AI...");
         let groqMessages = [{ role: "system", content: SYSTEM_PROMPT }];
         if (chatHistory) groqMessages = [...groqMessages, ...chatHistory];
         groqMessages.push({ role: "user", content: message });
         
-        const replyString = await getAIChatResponse(groqMessages);
+        replyContent = await getAIChatResponse(groqMessages);
 
+        // Clean JSON if present
         try {
-            const jsonReply = JSON.parse(replyString);
-            replyContent = jsonReply.content || jsonReply.text || replyString;
-        } catch (e) {
-            replyContent = replyString;
+            if (replyContent.trim().startsWith('{')) {
+                const json = JSON.parse(replyContent);
+                replyContent = json.answer || json.content || json.text || replyContent;
+            }
+        } catch (e) { }
+
+        audioUrl = await getOrGenerateVoice(replyContent);
+
+        // ✅ AUTO-TRAINING FILTER
+        // Ab hum check karenge ki kya ye sawal save karne layak hai?
+        // Agar "Nahi suna" jaisa kuch hai, toh AI jawab dega par hum DB me save nahi karenge.
+        
+        const validToSave = isSaveableQuestion(message);
+
+        if (validToSave && replyContent && !replyContent.includes("Error")) {
+            const variations = generateVariations(message);
+            try {
+                await db.FAQ.create({
+                    question: userMsgClean,
+                    answer: replyContent, 
+                    tags: variations,
+                    audioUrl: audioUrl,
+                    status: 'APPROVED',
+                    isUserSubmitted: false
+                });
+                console.log("💾 SAVED to DB: Useful Question");
+            } catch (dbErr) { console.error("Auto-save error:", dbErr.message); }
+        } else {
+            console.log("🚫 SKIP SAVING: Conversational/Short input.");
         }
+        
+        queryCache.set(userMsgClean, replyContent);
     }
 
     if (userId) {
@@ -132,119 +197,55 @@ const handleChat = asyncHandler(async (req, res) => {
 
     res.status(200).json({ 
         success: true, 
-        reply: { type: 'text', content: replyContent },
-        audioUrl: audioUrl, 
-        source: source
+        reply: { type: 'text', content: replyContent }, 
+        audioUrl, 
+        source 
     });
 });
 
-// ============================================================
-// 🔹 2. Handle Speak
-// ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     if (!text?.trim()) return res.status(400).json({ error: 'Text required' });
-
-    const normalizedText = cleanInput(text); 
-    const textHash = crypto.createHash('sha256').update(normalizedText).digest('hex');
-
-    try {
-        const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
-        if (cachedVoice) return res.json({ success: true, audioUrl: cachedVoice.audioUrl, source: "cache" });
-
-        const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-        if (!ELEVENLABS_API_KEY) return res.status(500).json({ error: 'API Key missing.' });
-
-        const response = await axios({
-            method: 'POST',
-            url: `https://api.elevenlabs.io/v1/text-to-speech/IvLWq57RKibBrqZGpQrC`, 
-            headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
-            data: {
-                text: text.substring(0, 2500),
-                model_id: "eleven_multilingual_v2",
-                voice_settings: { stability: 0.5, similarity_boost: 0.8 }
-            },
-            responseType: 'arraybuffer'
-        });
-
-        const cloudinaryUrl = await uploadAudioToCloudinary(response.data, textHash);
-
-        await db.VoiceResponse.create({
-            textHash: textHash, originalText: text, audioUrl: cloudinaryUrl, voiceId: "IvLWq57RKibBrqZGpQrC"
-        });
-
-        res.json({ success: true, audioUrl: cloudinaryUrl, source: "api" });
-    } catch (error) {
-        console.error('🔥 Voice Error:', error.message);
-        res.status(500).json({ error: 'Voice generation failed.' });
-    }
+    const url = await getOrGenerateVoice(text);
+    if (url) res.json({ success: true, audioUrl: url, source: "api" });
+    else res.status(500).json({ error: 'Voice generation failed.' });
 });
 
-// ============================================================
-// 🔹 3. Admin: Add Smart Response (With Direct File Upload)
-// ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
-    // Note: When using Multer, text fields are in req.body and file is in req.file
     const { question, answer } = req.body;
-    const audioFile = req.file; // This comes from Multer
+    const audioFile = req.file;
 
-    if (!question || !answer) {
-        return res.status(400).json({ success: false, message: "Question and Answer are required." });
-    }
+    if (!question || !answer) return res.status(400).json({ success: false, message: "Missing fields." });
 
-    if (!audioFile) {
-        return res.status(400).json({ success: false, message: "Please upload an audio file." });
-    }
-
-    try {
-        console.log(`📤 Uploading file for: "${question}"...`);
-
-        // 1. Upload File to Cloudinary
-        // We use the question text to make a readable filename
+    let cloudinaryUrl = null;
+    if (audioFile) {
         const filenameSafe = question.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-        const cloudinaryUrl = await uploadAudioToCloudinary(audioFile.buffer, filenameSafe);
-
-        console.log("✅ Cloudinary Upload Success:", cloudinaryUrl);
-
-        // 2. Generate Smart Tags
-        const variations = generateVariations(question);
-
-        // 3. Save to FAQ Table
-        const newFaq = await db.FAQ.create({
-            question: cleanInput(question),
-            tags: variations,
-            answer: answer,
-            audioUrl: cloudinaryUrl // Save the new URL
-        });
-
-        // 4. Save to VoiceResponse Table (For Speak button consistency)
-        const textHash = crypto.createHash('sha256').update(cleanInput(answer)).digest('hex');
-        
-        // Remove old entry if exists to update with new audio
-        await db.VoiceResponse.destroy({ where: { textHash } });
-        
-        await db.VoiceResponse.create({
-            textHash: textHash,
-            originalText: answer,
-            audioUrl: cloudinaryUrl,
-            voiceId: "ADMIN_UPLOAD"
-        });
-
-        res.status(201).json({ 
-            success: true, 
-            message: "File Uploaded & Smart Response Saved!", 
-            data: newFaq 
-        });
-
-    } catch (error) {
-        console.error("🔥 Admin Upload Error:", error);
-        res.status(500).json({ success: false, message: "Failed to upload/save." });
+        cloudinaryUrl = await uploadAudioToCloudinary(audioFile.buffer, filenameSafe);
     }
-});
 
+    const variations = generateVariations(question);
+    
+    await db.FAQ.create({
+        question: cleanInput(question),
+        tags: variations,
+        answer: answer,
+        audioUrl: cloudinaryUrl,
+        isUserSubmitted: false,
+        status: 'APPROVED'
+    });
+
+    if (cloudinaryUrl) {
+        const textHash = crypto.createHash('sha256').update(cleanInput(answer)).digest('hex');
+        await db.VoiceResponse.destroy({ where: { textHash } });
+        await db.VoiceResponse.create({ textHash, originalText: answer, audioUrl: cloudinaryUrl, voiceId: "ADMIN_UPLOAD" });
+    }
+
+    queryCache.flushAll(); 
+    res.status(201).json({ success: true, message: "Saved!" });
+});
 
 const getAllChats = asyncHandler(async (req, res) => { 
-    res.status(200).json({ success: true, message: "Chat history route" });
+    res.status(200).json({ success: true, message: "Chat history" });
 });
 
 module.exports = { handleChat, handleSpeak, getAllChats, addSmartResponse };

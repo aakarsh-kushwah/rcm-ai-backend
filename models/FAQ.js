@@ -12,22 +12,33 @@ module.exports = (sequelize) => {
       question: {
         type: DataTypes.STRING,
         allowNull: false,
-        // Stores the main trigger, e.g., "what is rcm"
       },
       tags: {
         type: DataTypes.JSON, 
         defaultValue: [],
-        // Stores variations like ["define rcm", "rcm details"]
       },
       answer: {
         type: DataTypes.TEXT,
         allowNull: false,
-        // The fixed answer text
       },
       audioUrl: {
         type: DataTypes.STRING,
         allowNull: true,
-        // The pre-recorded audio URL
+      },
+      // --- NEW FIELDS FOR USER CONTRIBUTIONS ---
+      isUserSubmitted: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: false,
+        comment: "True if submitted by a normal user, False if by Admin"
+      },
+      status: {
+        type: DataTypes.ENUM('PENDING', 'APPROVED', 'REJECTED'),
+        defaultValue: 'APPROVED', // Admin data is auto-approved. User data depends on AI.
+      },
+      rejectionReason: {
+        type: DataTypes.STRING,
+        allowNull: true,
+        comment: "Why AI rejected this submission"
       }
     },
     {
