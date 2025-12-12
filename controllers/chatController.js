@@ -7,6 +7,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const stringSimilarity = require("string-similarity");
 
+
 // --- 🧠 Helper: Clean Input (Text को साफ करता है) ---
 function cleanInput(text) {
     if (!text) return "";
@@ -180,48 +181,67 @@ const handleSpeak = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🔹 3. Admin: Add Smart Response (AUTO TAG GENERATION)
+// 🔹 3. Admin: Add Smart Response (With Direct File Upload)
 // ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
-    const { question, answer, audioUrl } = req.body;
+    // Note: When using Multer, text fields are in req.body and file is in req.file
+    const { question, answer } = req.body;
+    const audioFile = req.file; // This comes from Multer
 
-    if (!question || !answer || !audioUrl) {
-        return res.status(400).json({ success: false, message: "Missing fields." });
+    if (!question || !answer) {
+        return res.status(400).json({ success: false, message: "Question and Answer are required." });
+    }
+
+    if (!audioFile) {
+        return res.status(400).json({ success: false, message: "Please upload an audio file." });
     }
 
     try {
-        // ✅ यहाँ जादू हो रहा है: एक सवाल से 10-15 Tags बन रहे हैं
+        console.log(`📤 Uploading file for: "${question}"...`);
+
+        // 1. Upload File to Cloudinary
+        // We use the question text to make a readable filename
+        const filenameSafe = question.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        const cloudinaryUrl = await uploadAudioToCloudinary(audioFile.buffer, filenameSafe);
+
+        console.log("✅ Cloudinary Upload Success:", cloudinaryUrl);
+
+        // 2. Generate Smart Tags
         const variations = generateVariations(question);
-        console.log(`🧠 Generated Tags for "${question}":`, variations);
-        
+
+        // 3. Save to FAQ Table
         const newFaq = await db.FAQ.create({
-            question: cleanInput(question), 
-            tags: variations, // यह सारे variations DB में save होंगे
+            question: cleanInput(question),
+            tags: variations,
             answer: answer,
-            audioUrl: audioUrl
+            audioUrl: cloudinaryUrl // Save the new URL
         });
 
-        // Voice DB Sync
+        // 4. Save to VoiceResponse Table (For Speak button consistency)
         const textHash = crypto.createHash('sha256').update(cleanInput(answer)).digest('hex');
-        const existingVoice = await db.VoiceResponse.findOne({ where: { textHash } });
-        if (!existingVoice) {
-            await db.VoiceResponse.create({
-                textHash: textHash, originalText: answer, audioUrl: audioUrl, voiceId: "FAQ_PRESET"
-            });
-        }
+        
+        // Remove old entry if exists to update with new audio
+        await db.VoiceResponse.destroy({ where: { textHash } });
+        
+        await db.VoiceResponse.create({
+            textHash: textHash,
+            originalText: answer,
+            audioUrl: cloudinaryUrl,
+            voiceId: "ADMIN_UPLOAD"
+        });
 
         res.status(201).json({ 
             success: true, 
-            message: "Smart Response Saved with Hinglish Tags!", 
-            tags: variations,
+            message: "File Uploaded & Smart Response Saved!", 
             data: newFaq 
         });
 
     } catch (error) {
-        console.error("🔥 Admin FAQ Error:", error);
-        res.status(500).json({ success: false, message: "Failed to save." });
+        console.error("🔥 Admin Upload Error:", error);
+        res.status(500).json({ success: false, message: "Failed to upload/save." });
     }
 });
+
 
 const getAllChats = asyncHandler(async (req, res) => { 
     res.status(200).json({ success: true, message: "Chat history route" });

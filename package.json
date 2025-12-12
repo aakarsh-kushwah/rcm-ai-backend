@@ -23,6 +23,7 @@
     "hpp": "^0.2.3",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.1",
+    "multer": "^2.0.2",
     "mysql2": "^3.15.3",
     "node-cache": "^5.1.2",
     "qrcode-terminal": "^0.12.0",
