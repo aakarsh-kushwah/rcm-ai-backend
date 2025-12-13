@@ -9,7 +9,21 @@ const razorpay = new Razorpay({
 
 exports.createSubscription = async (req, res) => {
   try {
-    const { id: userId, email, fullName: name, phone } = req.user;
+    // 1. Get User ID from Token
+    const { id: userId } = req.user;
+
+    // 2. FETCH FRESH DATA FROM DB (Best Practice)
+    // Token ka data purana ho sakta hai, isliye DB se nikalo
+    const user = await db.User.findByPk(userId);
+
+    if (!user) {
+        return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    const { email, fullName, phone } = user; // Ab ye DB se aa raha hai
+
+    // Agar phone abhi bhi nahi hai, tabhi dummy use karo (aur log karo taaki pata chale)
+    if (!phone) console.warn(`⚠️ User ${userId} has no phone number! Using dummy.`);
     const userPhone = phone || "9000090000"; 
 
     const planId = process.env.RAZORPAY_PLAN_ID;
@@ -17,54 +31,35 @@ exports.createSubscription = async (req, res) => {
       return res.status(500).json({ success: false, message: "Plan ID missing." });
     }
 
-    // 1. Check DB for existing Customer ID
-    let user = await db.User.findByPk(userId);
+    // 3. Customer Logic (Same as before with fail-safe)
     let customerId = user.razorpayCustomerId;
 
-    // 2. Logic to Get or Create Customer ID
     if (!customerId || !customerId.startsWith("cust_")) {
-        console.log("Local ID missing. Creating Razorpay Customer...");
-        
+        console.log("Creating Razorpay Customer for:", email);
         try {
-            // Attempt to create
             const customer = await razorpay.customers.create({
-                name: name,
+                name: fullName,
                 contact: userPhone,
                 email: email,
                 fail_existing: 0, 
             });
             customerId = customer.id;
-            console.log("✅ Created New Customer:", customerId);
-
         } catch (error) {
-            // If customer exists, Fetch by Email
             if (error.statusCode === 400 && error.error.description.includes('already exists')) {
-                console.log("⚠️ Customer exists. Fetching from Razorpay...");
                 const existing = await razorpay.customers.all({ email: email, count: 1 });
-                
-                if (existing.items && existing.items.length > 0) {
-                    customerId = existing.items[0].id;
-                    console.log("✅ Fetched Existing ID:", customerId);
-                } else {
-                    // Fallback: If email not found, create with a slightly modified email or throw
-                    throw new Error("Customer exists but could not be fetched.");
-                }
-            } else {
-                throw error;
-            }
+                if (existing.items.length > 0) customerId = existing.items[0].id;
+                else throw new Error("Customer exists but fetch failed.");
+            } else throw error;
         }
-
-        // Save to DB
         user.razorpayCustomerId = customerId;
         await user.save();
     }
 
-    // 3. Time Logic (Start Tomorrow)
+    // 4. Create Subscription
     const date = new Date();
     date.setDate(date.getDate() + 1); 
     const startAtTimestamp = Math.floor(date.getTime() / 1000); 
 
-    // 4. Create Subscription
     const subscription = await razorpay.subscriptions.create({
       plan_id: planId,
       customer_id: customerId,
@@ -72,21 +67,22 @@ exports.createSubscription = async (req, res) => {
       quantity: 1,
       start_at: startAtTimestamp,
       customer_notify: 1,
-      notes: { userId, email, name }, 
+      notes: { userId, email, name: fullName }, 
     });
 
     res.status(200).json({
       success: true,
       subscriptionId: subscription.id,
       key: process.env.RAZORPAY_KEY_ID,
-      user_name: name,
+      // Send FRESH DB data back to frontend
+      user_name: fullName,
       user_email: email,
-      user_contact: userPhone
+      user_contact: userPhone 
     });
 
   } catch (err) {
     console.error("Subscription Error:", err);
-    res.status(500).json({ success: false, message: err.message || "Failed to create subscription." });
+    res.status(500).json({ success: false, message: "Failed to create subscription." });
   }
 };
 
