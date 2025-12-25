@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Firebase / Secrets
+firebase-service-account.json
+.env
+.env.local
+.env.production
+
+# WhatsApp Session Files (CRITICAL to fix your error)
+auth_session/
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Logs (Optional but recommended)
+npm-debug.log
+logs/
+*.log
