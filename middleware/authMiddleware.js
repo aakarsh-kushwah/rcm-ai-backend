@@ -1,13 +1,17 @@
 const jwt = require('jsonwebtoken');
 
-// ✅ Ye function main logic hai (ise hum dono naam se export karenge)
+// ✅ CORRECT IMPORT: We destructure { db } because your config exports { db, initialize }
+// This keeps the reference to the 'db' object, which gets filled later.
+const { db } = require('../config/db'); 
+
+// ============================================================
+// 1. CORE AUTH LOGIC (Verifies Token)
+// ============================================================
 const verifyTokenLogic = (req, res, next) => {
     let token;
     
-    // Case-insensitive header check
     const authHeader = req.headers.authorization || req.headers.Authorization;
 
-    // Bearer token extract
     if (authHeader && authHeader.startsWith('Bearer')) {
         token = authHeader.split(' ')[1];
     }
@@ -18,11 +22,8 @@ const verifyTokenLogic = (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        
-        // ✅ Compatibility Layer (Purane aur Naye dono code ke liye data set karein)
-        req.user = decoded;                         // Purane controllers (req.user.role) ke liye
-        req.userId = decoded.id || decoded.userId;  // Naye controllers (req.userId) ke liye
-
+        req.user = decoded;                     
+        req.userId = decoded.id || decoded.userId;  
         next();
     } catch (error) {
         console.error("Auth Error:", error.message);
@@ -30,8 +31,54 @@ const verifyTokenLogic = (req, res, next) => {
     }
 };
 
+// ============================================================
+// 2. ACTIVE STATUS CHECK (The New Security Layer)
+// ============================================================
+const isActiveUser = async (req, res, next) => {
+    try {
+        const userId = req.userId || req.user?.id;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'User verification failed.' });
+        }
+
+        // ✅ FIX: Access db.User HERE, inside the request.
+        // By the time a user requests a page, the DB is definitely connected.
+        const User = db.User;
+
+        // Safety Check: If DB crashed or failed to load
+        if (!User) {
+            console.error("❌ Database Error: User model not loaded yet.");
+            return res.status(500).json({ success: false, message: 'System initializing, please try again.' });
+        }
+
+        // Fetch fresh status
+        const user = await User.findByPk(userId);
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User account not found.' });
+        }
+
+        // 🛑 CRITICAL CHECK
+        if (user.status !== 'active') {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'Subscription Inactive. Please renew.',
+                code: 'SUBSCRIPTION_REQUIRED' 
+            });
+        }
+
+        next(); 
+    } catch (error) {
+        console.error('Status Check Error:', error);
+        res.status(500).json({ success: false, message: 'Server error checking subscription status.' });
+    }
+};
+
+// ============================================================
+// 3. ADMIN CHECK
+// ============================================================
 const isAdmin = (req, res, next) => {
-    // Role check (Admin or admin)
     if (req.user && (req.user.role === 'ADMIN' || req.user.role === 'admin')) {
         next();
     } else {
@@ -39,17 +86,9 @@ const isAdmin = (req, res, next) => {
     }
 };
 
-// ============================================================
-// ⭐️ MAGIC FIX YAHAN HAI
-// ============================================================
 module.exports = {
-    // 1. Naye routes ke liye
-    verifyToken: verifyTokenLogic, 
-
-    // 2. Purane routes (Subscriber, User, etc.) ke liye
-    // Hum 'isAuthenticated' ko bhi same logic point kar rahe hain
+    verifyToken: verifyTokenLogic,    
     isAuthenticated: verifyTokenLogic, 
-
-    // 3. Admin middleware
+    isActiveUser,                     
     isAdmin
 };

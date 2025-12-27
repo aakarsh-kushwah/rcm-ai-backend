@@ -1,12 +1,11 @@
-// routes/chatRoutes.js
 const express = require('express');
 const router = express.Router();
+const { handleChat } = require('../controllers/chatController');
 
-const { handleChat, getAllChats } = require('../controllers/chatController');
-const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware');
+// ✅ Import all 3 middlewares
+const { isAuthenticated, isAdmin, isActiveUser } = require('../middleware/authMiddleware');
 
-// POST /api/chat
-router.post('/', isAuthenticated, handleChat);
-
+// User Chat (Login + Active Subscription Required)
+router.post('/', isAuthenticated, isActiveUser, handleChat);
 
 module.exports = router;

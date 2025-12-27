@@ -13,21 +13,27 @@ const {
     handleChat, 
     handleSpeak, 
     addSmartResponse,
-    upgradeToPremium // 👈 New: Pending sawalon ko update karne ke liye
+    upgradeToPremium 
 } = require('../controllers/chatController');
 
-// ✅ Middleware
-const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware'); 
+// ✅ Middleware: Added 'isActiveUser'
+const { isAuthenticated, isAdmin, isActiveUser } = require('../middleware/authMiddleware'); 
 
 // ============================================================
 // 💬 CHAT ROUTES
 // ============================================================
 
 // 1. User Chat (Text + Hybrid Audio)
-router.post('/', isAuthenticated, handleChat);
+// ✅ FIX: Added isActiveUser (Blocks pending/expired users)
+router.post('/', isAuthenticated, isActiveUser, handleChat);
 
 // 2. Direct TTS (Explicit Request)
-router.post('/speak', isAuthenticated, handleSpeak);
+// ✅ FIX: Added isActiveUser
+router.post('/speak', isAuthenticated, isActiveUser, handleSpeak);
+
+// ============================================================
+// 🛡️ ADMIN ROUTES (Admin role implies access, usually skips active check)
+// ============================================================
 
 // 3. Admin: Add NEW Q&A Manually
 router.post(
@@ -38,7 +44,7 @@ router.post(
     addSmartResponse
 );
 
-// 4. Admin: Upgrade Existing/Pending Q&A (New Route)
+// 4. Admin: Upgrade Existing/Pending Q&A
 router.post(
     '/admin/upgrade', 
     isAuthenticated, 

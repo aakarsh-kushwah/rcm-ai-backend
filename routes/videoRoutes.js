@@ -1,35 +1,36 @@
 const express = require('express');
 const router = express.Router();
 
-const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware'); 
+// ✅ Import all necessary middleware
+const { isAuthenticated, isAdmin, isActiveUser } = require('../middleware/authMiddleware'); 
 
 const { 
-    batchScrapeImport, // ✅ Naya import
+    batchScrapeImport, 
     getLeaderVideos, 
     updateLeaderVideo, 
     deleteLeaderVideo,
     getProductVideos,
     updateProductVideo,
     deleteProductVideo,
-    // ✅ Naya: Category list ke liye
     getProductCategories 
 } = require('../controllers/videoController'); 
 
 // ============================================================
-// 1. Public Routes (यूज़र के लिए)
+// 1. Public Routes (For Users)
 // ============================================================
-router.get('/leaders', isAuthenticated, getLeaderVideos); 
-router.get('/products', isAuthenticated, getProductVideos);
-// ✅ NAYA: Product categories fetch karne ke liye
-router.get('/products/categories', isAuthenticated, getProductCategories);
+// ✅ UPDATE: Added 'isActiveUser' to these routes.
+// Users must be logged in AND have 'active' status to see these.
+router.get('/leaders', isAuthenticated, isActiveUser, getLeaderVideos); 
+router.get('/products', isAuthenticated, isActiveUser, getProductVideos);
+router.get('/products/categories', isAuthenticated, isActiveUser, getProductCategories);
 
 // ============================================================
-// 2. Admin Routes (एडमिन के लिए)
+// 2. Admin Routes (For Admins Only)
 // ============================================================
-router.use(isAuthenticated, isAdmin); // Iske neeche sab routes admin-only hain
+// Admin routes generally don't need 'isActiveUser' checks, just 'isAdmin'
+router.use(isAuthenticated, isAdmin); 
 
-// ✅ Naya Route: Multiple URLs ko scrape aur import karein
-// POST /api/videos/batch-scrape-import
+// ✅ Existing Batch Import Route
 router.post('/batch-scrape-import', batchScrapeImport); 
 
 // --- Leader Video Admin ---
