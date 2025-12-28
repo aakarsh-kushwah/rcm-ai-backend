@@ -1,231 +1,199 @@
 /**
  * @file src/services/edgeTtsService.js
- * @description Advanced RCM Audio Engine with "Voice Controller".
- * FEATURES: 
- * 1. Multi-Mode Support (Leader, Soft, Whisper, Excited).
- * 2. Fine-grained control over Pitch, Rate, and Pauses.
- * 3. Human-like breathing simulation.
- * @version 6.0 (Voice Controller Edition)
+ * @description 🚀 RCM "SWARA" ENGINE (Female Professional Voice)
+ * @tuning Voice: SwaraNeural | Tone: Polite, Soft & Confident
  */
 
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const sdk = require("microsoft-cognitiveservices-speech-sdk");
-const googleTTS = require('google-tts-api');
 const { db } = require('../config/db'); 
+const crypto = require('crypto');
+const googleTTS = require('google-tts-api');
+const sdk = require("microsoft-cognitiveservices-speech-sdk");
+const { uploadAudioToCloudinary } = require('./cloudinaryService'); 
 require('dotenv').config();
 
-// 🔧 CONFIGURATION
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVEN_VOICE_ID = '21m00Tcm4TlvDq8ikWAM'; 
+const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
+const AZURE_REGION = process.env.AZURE_SPEECH_REGION;
 
-// 🎯 MAIN MALE VOICE (RCM Leader)
-const AZURE_VOICE_NAME = "hi-IN-MadhurNeural"; 
-
-const contentDir = path.join(__dirname, '../content');
-if (!fs.existsSync(contentDir)) fs.mkdirSync(contentDir, { recursive: true });
-
-function generateTextHash(text, style) {
-    // Hash now includes style so 'whisper' audio is stored separately from 'shout' audio
-    return crypto.createHash('sha256').update(`${text.trim()}-${style}`).digest('hex');
-}
-
-/**
- * 🎛️ VOICE CONTROLLER (The Magic Layer)
- * This function acts like the ElevenLabs settings slider.
- * @param {string} text - The text to speak
- * @param {string} style - 'professional' | 'polite' | 'whisper' | 'excited'
- */
-const buildAdvancedSSML = (text, style = 'professional') => {
-    // 1. Sanitize
-    const safeText = text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-
-    // 2. Define Styles (Preset Configurations)
-    let ssmlConfig = {
-        styleName: 'chat',      // Azure Style Name
-        styleDegree: '1.0',     // Intensity (0.1 to 2.0)
-        rate: '1.0',            // Speed
-        pitch: '0%',            // Tone
-        volume: '100%'          // Loudness
-    };
-
-    switch (style) {
-        case 'polite': 
-            // Bilkul soft aur humble (Customer Support/Greeting)
-            ssmlConfig = { styleName: 'empathetic', styleDegree: '1.2', rate: '0.95', pitch: '-2%', volume: '90%' };
-            break;
-            
-        case 'whisper': 
-            // Secret share karne jesa (Soft/Private info)
-            // Note: If 'whisper' style fails, we simulate it with low volume/pitch
-            ssmlConfig = { styleName: 'calm', styleDegree: '1.5', rate: '0.9', pitch: '-10%', volume: '60%' };
-            break;
-            
-        case 'excited': 
-            // Motivator / Stage Speaker Mode
-            ssmlConfig = { styleName: 'cheerful', styleDegree: '1.5', rate: '1.1', pitch: '+5%', volume: '110%' };
-            break;
-
-        case 'professional': 
-        default:
-            // Standard RCM Leader (Confident & Clear)
-            ssmlConfig = { styleName: 'cheerful', styleDegree: '1.1', rate: '1.05', pitch: '-5%', volume: '100%' };
-            break;
-    }
-
-    // 3. Construct SSML
-    return `
-    <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="hi-IN">
-        <voice name="${AZURE_VOICE_NAME}">
-            <mstts:express-as style="${ssmlConfig.styleName}" styledegree="${ssmlConfig.styleDegree}">
-                <prosody rate="${ssmlConfig.rate}" pitch="${ssmlConfig.pitch}" volume="${ssmlConfig.volume}">
-                    ${safeText}
-                </prosody>
-            </mstts:express-as>
-        </voice>
-    </speak>`;
+// 🎛️ SWARA TUNING (Female Voice Settings)
+const TUNING = {
+    VOICE_NAME:    "hi-IN-SwaraNeural", // 👈 THE CHANGE
+    SILENCE_BUFFER:"300ms",             // Soft Start
+    
+    // Female voice natural speed par hi achi lagti hai
+    SPEED_FAST:    "+15%", // Josh
+    SPEED_NORMAL:  "+10%", // Normal
+    
+    // Pitch ko '0Hz' rakhenge (Natural), ya thoda badhayenge softness ke liye
+    PITCH_NATURAL: "+0Hz", 
 };
 
-/**
- * 🔷 AZURE ENGINE
- */
-const synthesizeAzure = (text, styleMode) => {
+// 🧹 SAFETY: XML Special Chars
+function escapeXML(unsafe) {
+    if (!unsafe) return "";
+    return unsafe.replace(/[<>&'"]/g, c => {
+        switch (c) {
+            case '<': return '&lt;';
+            case '>': return '&gt;';
+            case '&': return '&amp;';
+            case '\'': return '&apos;';
+            case '"': return '&quot;';
+            default: return c;
+        }
+    });
+}
+
+// 🧠 1. CONTEXT ENGINE (Swara ka Mood)
+function analyzeSentiment(text) {
+    if (!text) return { rate: TUNING.SPEED_NORMAL, pitch: "0Hz", style: "cheerful", degree: "1.0" };
+    const lowerText = text.toLowerCase();
+
+    // 1. Josh / Welcome (Cheerful & Bright)
+    if (lowerText.match(/(swagat|badhai|shandar|zabardast|target|jeet|profit|crore|jai rcm|mission|bada|toofan)/)) {
+        return { rate: TUNING.SPEED_FAST, pitch: "+2Hz", style: "cheerful", degree: "1.5" };
+    }
+    
+    // 2. Empathy / Help (Very Soft & Polite)
+    if (lowerText.match(/(maafi|sorry|samasya|dikkat|dukh|loss|haar|chinta|dhyan|samajh|galti|sochiye)/)) {
+        return { rate: "+5%", pitch: "-2Hz", style: "empathetic", degree: "1.2" };
+    }
+
+    // 3. Default Professional (Confident but Sweet)
+    // Swara ke liye "chat" style best nahi hai, "cheerful" kam degree par best hai
+    return { rate: TUNING.SPEED_NORMAL, pitch: TUNING.PITCH_NATURAL, style: "cheerful", degree: "0.8" };
+}
+
+// 🗣️ 2. HINDI PHONETICS (Swara ke liye optimized)
+function optimizeTextForHumanSpeech(text) {
+    if (!text) return "";
+    
+    let script = escapeXML(text);
+
+    // Filler Emotion (Swara ke 'Hmm' aur 'Achha' soft hone chahiye)
+    script = script.replace(/हम्म/g, `<prosody pitch="-2Hz" rate="-10%" volume="-20%">हम्म...</prosody>`);
+    script = script.replace(/Hmm/gi, `<prosody pitch="-2Hz" rate="-10%" volume="-20%">हम्म...</prosody>`);
+    
+    script = script.replace(/अच्छा/g, `<prosody pitch="+1Hz" rate="-5%">अच्छा...</prosody>`);
+    script = script.replace(/Achha/gi, `<prosody pitch="+1Hz" rate="-5%">अच्छा...</prosody>`);
+
+    script = script.replace(/जी/g, `<prosody pitch="+2Hz" rate="-5%" volume="-10%">जी</prosody>`);
+    script = script.replace(/Ji/gi, `<prosody pitch="+2Hz" rate="-5%" volume="-10%">जी</prosody>`);
+
+    // Dictionary (English words ko Hindi accent dena)
+    const dictionary = {
+        "RCM": "आर सी एम",
+        "Business": "बिज़नेस",
+        "Product": "प्रॉडक्ट",
+        "System": "सिस्टम",
+        "Plan": "प्लान",
+        "Target": "टारगेट",
+        "Meeting": "मीटिंग",
+        "Leader": "लीडर",
+        "Team": "टीम",
+        "Direct Seller": "डायरेक्ट सेलर",
+        "Royalty": "रॉयल्टी",
+        "Upline": "अपलाइन",
+        "Downline": "डाउनलाइन",
+        "Nutricharge": "न्यूट्रीचार्ज",
+        "Gamma": "गामा",
+        "Oryzanol": "ओरिज़ानॉल"
+    };
+
+    Object.keys(dictionary).forEach(key => {
+        const regex = new RegExp(key, "gi");
+        script = script.replace(regex, dictionary[key]);
+    });
+
+    // Random Breathing (Natural Pauses)
+    script = script.replace(/(\||\.)/g, () => {
+        const pause = ["300ms", "400ms"][Math.floor(Math.random() * 2)];
+        return `.<break time="${pause}"/>`;
+    }); 
+    script = script.replace(/(,)/g, `,<break time="150ms"/>`);   
+
+    return script;
+}
+
+// 🎨 3. SSML BUILDER
+function createCinematicSSML(text) {
+    let mood = analyzeSentiment(text);
+    const actingScript = optimizeTextForHumanSpeech(text);
+
+    if (!mood || !mood.style) mood = { rate: "+10%", pitch: "0Hz", style: "cheerful", degree: "1.0" };
+
+    // Single Line Return (No Spaces)
+    return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="hi-IN"><voice name="${TUNING.VOICE_NAME}"><break time="${TUNING.SILENCE_BUFFER}"/><mstts:express-as style="${mood.style}" styledegree="${mood.degree}"><prosody rate="${mood.rate}" pitch="${mood.pitch}">${actingScript}</prosody></mstts:express-as></voice></speak>`;
+}
+
+const synthesizeWithAzureToBuffer = (text) => {
     return new Promise((resolve, reject) => {
+        if (!AZURE_KEY || !AZURE_REGION) return reject("Azure Credentials Missing");
+
+        const speechConfig = sdk.SpeechConfig.fromSubscription(AZURE_KEY, AZURE_REGION);
+        speechConfig.speechSynthesisVoiceName = TUNING.VOICE_NAME; 
+        
+        // 24kHz (Best Balance for Female Voice)
+        speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Audio24Khz96KBitRateMonoMp3;
+
+        const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null); 
+        
         try {
-            if (!process.env.AZURE_SPEECH_KEY || !process.env.AZURE_SPEECH_REGION) {
-                return reject(new Error("Azure Config Missing"));
-            }
-
-            const speechConfig = sdk.SpeechConfig.fromSubscription(
-                process.env.AZURE_SPEECH_KEY, 
-                process.env.AZURE_SPEECH_REGION
-            );
-
-            // High Fidelity Studio Quality
-            speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Audio48Khz192KBitRateMonoMp3;
-
-            const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null);
-            
-            // 🔥 Generate Dynamic SSML based on requested style
-            const ssml = buildAdvancedSSML(text, styleMode);
-
+            const ssml = createCinematicSSML(text);
             synthesizer.speakSsmlAsync(
                 ssml,
-                (result) => {
+                result => {
+                    synthesizer.close();
                     if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
                         resolve(Buffer.from(result.audioData));
                     } else {
-                        const details = sdk.CancellationDetails.fromResult(result);
-                        console.error(`❌ Azure Error: ${details.errorDetails}`);
-                        reject(new Error("Azure Synthesis Failed"));
+                        console.error("Azure SSML Error:", result.errorDetails);
+                        reject(result.errorDetails);
                     }
-                    synthesizer.close();
                 },
-                (err) => {
-                    synthesizer.close();
-                    reject(err);
-                }
+                err => { synthesizer.close(); reject(err); }
             );
-        } catch (e) {
-            reject(e);
-        }
+        } catch (error) { synthesizer.close(); reject(error); }
     });
 };
 
-const synthesizeGoogle = async (text) => {
-    try {
-        const url = googleTTS.getAudioUrl(text.substring(0, 200), { lang: 'hi', slow: false, host: 'https://translate.google.com' });
-        const response = await axios.get(url, { responseType: 'arraybuffer' });
-        return response.data;
-    } catch (e) { throw new Error("Google TTS Failed"); }
-};
-
-/**
- * 🚀 MAIN FUNCTION
- * @param {string} text - Text to speak
- * @param {string} styleMode - 'professional' (default) | 'polite' | 'whisper' | 'excited'
- */
-const generateEdgeAudio = async (text, styleMode = 'professional') => {
+const generateEdgeAudio = async (text) => {
     if (!text) return null;
-    
-    // RCM Text Cleanup
-    const cleanText = text
-        .replace(/[*#]/g, '')
-        .replace(/RCM/g, "R.C.M.") 
-        .replace(/Jai RCM/ig, "Jai R.C.M.")
-        .trim(); 
-        
-    const textHash = generateTextHash(cleanText, styleMode);
+    const cleanText = text.replace(/[*#]/g, '').trim(); 
+    const textHash = generateTextHash(cleanText);
 
-    // 1. ⚡ CACHE CHECK
     try {
         const cachedEntry = await db.VoiceResponse.findOne({ where: { textHash } });
-        if (cachedEntry && cachedEntry.audioUrl) {
-            const fileName = path.basename(cachedEntry.audioUrl);
-            if (fs.existsSync(path.join(contentDir, fileName))) {
-                console.log(`⚡ [Cache Hit] Serving ${styleMode} audio.`);
-                return cachedEntry.audioUrl;
-            }
-        }
+        if (cachedEntry && cachedEntry.audioUrl) return cachedEntry.audioUrl;
     } catch (e) {}
 
     let audioBuffer = null;
-    let voiceSource = 'AZURE_NEURAL'; 
+    let voiceSource = 'AZURE_SWARA_FEMALE';
 
-    // 2. 🔷 LAYER 1: AZURE (With Style Control)
-    try {
-        console.log(`🎙️ Generating (${styleMode}) voice via Azure...`);
-        audioBuffer = await synthesizeAzure(cleanText, styleMode);
-        voiceSource = `AZURE_${styleMode.toUpperCase()}`;
-    } catch (e) {
-        console.warn("⚠️ Azure Failed, switching to fallback...", e.message);
+    try { audioBuffer = await synthesizeWithAzureToBuffer(cleanText); } catch (e) { 
+        console.warn("Azure Failed, switching to Google:", e); 
     }
 
-    // 3. 💎 LAYER 2: ELEVENLABS (Fallback)
-    if (!audioBuffer && ELEVENLABS_API_KEY && cleanText.length < 250) {
-        try {
-            // Mapping styles to ElevenLabs settings
-            let stability = 0.5;
-            if (styleMode === 'excited') stability = 0.3; // More variance
-            if (styleMode === 'whisper') stability = 0.8; // More stable
-
-            const response = await axios({
-                method: 'POST',
-                url: `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
-                data: { 
-                    text: cleanText, 
-                    model_id: "eleven_multilingual_v2",
-                    voice_settings: { stability: stability, similarity_boost: 0.75 }
-                },
-                headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
-                responseType: 'arraybuffer'
-            });
-            audioBuffer = response.data;
-            voiceSource = 'ELEVENLABS';
-        } catch (e) {}
-    }
-
-    // 4. 🟢 LAYER 3: GOOGLE (Fallback)
     if (!audioBuffer) {
-        try { audioBuffer = await synthesizeGoogle(cleanText); voiceSource = 'GOOGLE_FREE'; } catch (e) { return null; }
+        try {
+            const url = googleTTS.getAudioUrl(cleanText.substring(0, 200), { lang: 'hi', slow: false });
+            const axios = require('axios');
+            const response = await axios.get(url, { responseType: 'arraybuffer' });
+            audioBuffer = Buffer.from(response.data);
+            voiceSource = 'GOOGLE_FREE';
+        } catch (err) {}
     }
 
-    // 5. 💾 SAVE
-    try {
-        const fileName = `speech-${textHash}.mp3`;
-        const filePath = path.join(contentDir, fileName);
-        fs.writeFileSync(filePath, audioBuffer);
-        const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 5000}`;
-        const publicUrl = `${baseUrl}/content/${fileName}`;
-        db.VoiceResponse.create({ textHash, originalText: cleanText, audioUrl: publicUrl, voiceId: voiceSource }).catch(()=>{});
-        return publicUrl;
-    } catch (e) { return null; }
+    if (audioBuffer) {
+        const cloudUrl = await uploadAudioToCloudinary(audioBuffer, textHash);
+        if (cloudUrl) {
+            await db.VoiceResponse.create({ textHash, originalText: cleanText, audioUrl: cloudUrl, voiceType: voiceSource }).catch(()=>{});
+            return cloudUrl;
+        }
+    }
+    return null;
 };
+
+function generateTextHash(text) {
+    return crypto.createHash('sha256').update(text.trim().toLowerCase()).digest('hex');
+}
 
 module.exports = { generateEdgeAudio };
