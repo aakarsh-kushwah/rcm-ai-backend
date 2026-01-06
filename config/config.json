@@ -1,9 +1,9 @@
 {
     "database": {
-        "host": "bex00i7kma8gjfdwmo2c-mysql.services.clever-cloud.com",
-        "port": 3306,
-        "user": "uvdz2rnb8ajepqks",
-        "password": "mIvTwBNOBo2FCJB0ks3W",
-        "database": "bex00i7kma8gjfdwmo2c"
+        "host": "gateway01.ap-southeast-1.prod.aws.tidbcloud.com",
+        "port": 4000,
+        "user": "2ZwsbT1UEAt2BGT.root",
+        "password":"fpIW3FdQn6J3CxSX",
+        "database": "test"
     }
 }

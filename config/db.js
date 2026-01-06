@@ -1,58 +1,89 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
 const { Sequelize } = require('sequelize');
+const path = require('path');
 
+// 1. Config.json Load Logic
 let fileConfig = {};
-try { fileConfig = require('./config.json'); } catch (e) { }
+try { 
+    fileConfig = require('./config.json'); 
+} catch (e) { 
+    console.warn("⚠️ config.json not found, falling back to ENV variables.");
+}
 
 const db = {};
 
+// 2. SSL Configuration (TiDB Requires This)
+const tidbSSL = {
+    require: true,
+    rejectUnauthorized: true, // TiDB Cloud certificates are trusted by default
+    minVersion: 'TLSv1.2'
+};
+
 const dbConfig = {
+    // Priority: ENV -> Config.json -> Defaults
     host: process.env.DB_HOST || fileConfig.database?.host || '127.0.0.1',
     user: process.env.DB_USER || fileConfig.database?.user || 'root',
     password: process.env.DB_PASSWORD || fileConfig.database?.password || '',
     database: process.env.DB_NAME || fileConfig.database?.database || 'rcm_db',
-    port: process.env.DB_PORT || fileConfig.database?.port || 3306,
+    port: process.env.DB_PORT || fileConfig.database?.port || 4000, // TiDB uses 4000
     dialect: 'mysql',
     
-    // 🛡️ ULTRA-STABLE POOL SETTINGS
+    // 🛡️ TiDB/Cloud Pool Settings
     pool: {
-        max: 5,
+        max: 5, // TiDB Serverless handles connections well, but keep it safe
         min: 0,
-        acquire: 120000,
-        idle: 20000
+        acquire: 30000,
+        idle: 10000
     },
     
-    // ⚡ NETWORK RESILIENCE & EMOJI SUPPORT
+    // ⚡ Dialect Options with SSL
     dialectOptions: {
         decimalNumbers: true, 
         supportBigNumbers: true,
         bigNumberStrings: true,
         connectTimeout: 60000,
-        enableKeepAlive: true,
-        keepAliveInitialDelay: 10000,
         charset: 'utf8mb4',
+        // 👇 CRITICAL FIX FOR TiDB: ENABLE SSL
+        ssl: tidbSSL
     },
     
     logging: false 
+};
+
+// Helper to safely load models
+const loadModel = (sequelize, filePath, modelName) => {
+    try {
+        const modelDef = require(filePath);
+        db[modelName] = modelDef(sequelize, Sequelize);
+    } catch (e) {
+        // console.warn(`⚠️ Note: Model ${modelName} skipped/missing.`);
+    }
 };
 
 async function initialize() {
     try {
         console.log(`📡 Connecting to Database Host: ${dbConfig.host}`);
 
-        // 1. Pre-flight Check (Raw Connection)
-        const connection = await mysql.createConnection({
-            host: dbConfig.host, 
-            port: dbConfig.port, 
-            user: dbConfig.user, 
-            password: dbConfig.password,
-            connectTimeout: 60000
-        });
+        // 1. Pre-flight Check (Raw Connection) WITH SSL
+        // TiDB requires SSL even for simple checks
+        try {
+            const connection = await mysql.createConnection({
+                host: dbConfig.host, 
+                port: dbConfig.port, 
+                user: dbConfig.user, 
+                password: dbConfig.password,
+                connectTimeout: 20000,
+                ssl: tidbSSL // 👈 Added SSL here too
+            });
 
-        // Create DB with utf8mb4 support explicitly if not exists
-        await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
-        await connection.end();
+            // TiDB Serverless creates DB automatically or restricts CREATE access.
+            // We just check if we can connect.
+            await connection.end();
+        } catch (preError) {
+            console.warn("⚠️ Pre-flight check warning:", preError.message);
+            // Don't exit, let Sequelize try
+        }
 
         // 2. Initialize Sequelize
         const sequelize = new Sequelize(dbConfig.database, dbConfig.user, dbConfig.password, {
@@ -66,38 +97,38 @@ async function initialize() {
                 collate: 'utf8mb4_unicode_ci',
                 timestamps: true
             },
-            logging: (msg) => {
-                if (msg.includes('ALTER') || msg.includes('CREATE')) console.log(msg);
-            }, 
-            timezone: '+00:00'
+            logging: false, 
+            timezone: '+05:30' // IST Timezone
         });
 
         // 3. Authenticate
         await sequelize.authenticate();
-        console.log('🚀 Database Connection: ESTABLISHED');
+        console.log('🚀 TiDB Database Connection: ESTABLISHED');
 
         // --- MODEL REGISTRY ---
-        // ✅ Make sure these paths match your actual file names
-        db.User = require('../models/user.model')(sequelize);
-        db.ChatMessage = require('../models/chatMessage.model')(sequelize);
-        db.VoiceResponse = require('../models/VoiceResponse')(sequelize);
-        db.FAQ = require('../models/FAQ')(sequelize);
-        db.DailyReport = require('../models/DailyReport.model')(sequelize); 
-        db.LeaderVideo = require('../models/leaderVideo.model')(sequelize); 
-        db.ProductVideo = require('../models/productVideo.model')(sequelize);
-
-        // 🔥 FIX: REGISTER THE SUBSCRIBER MODEL HERE
-        // (Ensure the filename matches exactly what you named the file in the models folder)
-        db.Subscriber = require('../models/subscriber.model')(sequelize); 
+        // Ensure paths are correct relative to config folder
+        loadModel(sequelize, '../models/user.model', 'User');
+        loadModel(sequelize, '../models/chatMessage.model', 'ChatMessage');
+        loadModel(sequelize, '../models/VoiceResponse', 'VoiceResponse');
+        loadModel(sequelize, '../models/FAQ', 'FAQ');
+        loadModel(sequelize, '../models/DailyReport.model', 'DailyReport');
+        loadModel(sequelize, '../models/leaderVideo.model', 'LeaderVideo');
+        loadModel(sequelize, '../models/productVideo.model', 'ProductVideo');
+        loadModel(sequelize, '../models/subscriber.model', 'Subscriber'); 
+        loadModel(sequelize, '../models/Payment', 'Payment');
 
         // Associations (Relationships)
         Object.keys(db).forEach(modelName => {
-            if (db[modelName].associate) db[modelName].associate(db);
+            if (db[modelName] && db[modelName].associate) {
+                db[modelName].associate(db);
+            }
         });
         
-        // Define relations
-        db.User.hasMany(db.ChatMessage, { foreignKey: 'userId', as: 'chatMessages' });
-        db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
+        // Manual Associations (Fallback)
+        if (db.User && db.ChatMessage) {
+            db.User.hasMany(db.ChatMessage, { foreignKey: 'userId', as: 'chatMessages' });
+            db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
+        }
 
         if(db.DailyReport && db.User) {
              db.User.hasMany(db.DailyReport, { foreignKey: 'user_id' });
@@ -107,29 +138,11 @@ async function initialize() {
         db.Sequelize = Sequelize;
         db.sequelize = sequelize;
 
-        // 🛡️ SYNC STRATEGY:
+        // 🛡️ SYNC STRATEGY
         console.log("⏳ Syncing Models...");
         try {
             await sequelize.sync({ alter: true });
             console.log(`✅ System Online & Models Synced.`);
-
-            // 4. Auto-Repair Script
-            await sequelize.query(`ALTER DATABASE \`${dbConfig.database}\` CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;`);
-            
-            // Add 'subscribers' to the fix list
-            const tablesToFix = [
-                'faqs', 'voice_responses', 'chat_messages', 
-                'leader_videos', 'product_videos', 'subscribers' 
-            ];
-
-            for (const table of tablesToFix) {
-                try {
-                    await sequelize.query(`ALTER TABLE ${table} CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
-                } catch(e) {
-                    // Ignore error if table doesn't exist yet
-                }
-            }
-            
         } catch (syncErr) {
             console.warn("⚠️ Sync Warning: Could not alter table automatically.");
             console.warn("   Reason:", syncErr.message);
@@ -137,7 +150,8 @@ async function initialize() {
 
     } catch (error) {
         console.error('🔥 FATAL DB ERROR:', error.original ? error.original.message : error.message);
-        process.exit(1); 
+        // Important: Throw error so server.js knows db failed
+        throw error;
     }
 }
 
