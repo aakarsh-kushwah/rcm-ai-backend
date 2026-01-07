@@ -1,7 +1,7 @@
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { db } = require('../config/db');
-const { Op } = require('sequelize'); // ✅ Login में 'OR' के लिए ज़रूरी
+const { Op } = require('sequelize'); // ✅ Login में 'OR' कंडीशन के लिए ज़रूरी
 
 // Helper to safely access model after DB init
 function getUserModel() {
@@ -52,15 +52,24 @@ const register = async (req, res) => {
       status: 'pending',
     });
 
-    // ✅ Create JWT token (Smart Token)
+    // 🛠️ FIX: Ensure ID is strictly an Integer for the Token
+    const tokenPayload = { 
+        id: parseInt(newUser.id, 10), 
+        role: newUser.role || 'USER' 
+    };
+
+    console.log("📝 Registering New User ID:", tokenPayload.id);
+
+    // ✅ Create JWT token
     const token = jwt.sign(
-      { id: newUser.id, role: newUser.role || 'USER' },
+      tokenPayload,
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    // ✅ Send response with token and user info
+    // ✅ Send response
     res.status(201).json({
+      success: true,
       message: 'User created successfully.',
       userId: newUser.id,
       token,
@@ -76,13 +85,12 @@ const register = async (req, res) => {
   } catch (error) {
     console.error('Error creating user:', error);
     res.status(500).json({
+      success: false,
       message: 'Error creating user.',
       error: error.message,
     });
   }
 };
-
-
 
 // ----------------------------------------------------
 // 🔐 LOGIN - User or Admin
@@ -108,31 +116,39 @@ const login = async (req, res) => {
         where: { 
           [Op.or]: [
             { rcmId: loginId },
-            { email: loginId } // RCM ID की तरह दिखने वाले ईमेल के लिए फॉलबैक
+            { email: loginId } // Fallback
           ]
         } 
       });
     }
 
     if (!user) {
-      return res.status(401).json({ message: 'Invalid login ID or password.' });
+      return res.status(401).json({ success: false, message: 'Invalid login ID or password.' });
     }
 
     // ✅ पासवर्ड चेक करें
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-      return res.status(401).json({ message: 'Invalid login ID or password.' });
+      return res.status(401).json({ success: false, message: 'Invalid login ID or password.' });
     }
 
-    // ✅ "Smart" Token बनाएँ (Heavy Traffic के लिए)
+    // 🛠️ CRITICAL FIX: Ensure ID is an Integer inside Token
+    // TiDB/MySQL returns IDs as Numbers, ensuring consistency here.
+    const tokenPayload = { 
+        id: parseInt(user.id, 10), 
+        role: user.role || 'USER' 
+    };
+
+    console.log("🔑 Generating Token for User ID:", tokenPayload.id);
+
     const token = jwt.sign(
-      { id: user.id, role: user.role || 'USER' },
+      tokenPayload,
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
 
     res.json({
-      success: true, // ✅ 'success' फ़्लैग जोड़ा गया
+      success: true,
       token,
       user: {
         id: user.id,
@@ -179,6 +195,7 @@ const adminSignup = async (req, res) => {
     });
 
     res.status(201).json({
+      success: true,
       message: '✅ Admin created successfully.',
       userId: admin.id,
       role: admin.role,
@@ -190,4 +207,3 @@ const adminSignup = async (req, res) => {
 };
 
 module.exports = { register, login, adminSignup };
-

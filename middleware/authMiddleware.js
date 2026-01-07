@@ -1,7 +1,6 @@
 const jwt = require('jsonwebtoken');
 
-// ✅ CORRECT IMPORT: We destructure { db } because your config exports { db, initialize }
-// This keeps the reference to the 'db' object, which gets filled later.
+// ✅ CORRECT IMPORT: Reference to the 'db' object which gets filled later.
 const { db } = require('../config/db'); 
 
 // ============================================================
@@ -22,8 +21,15 @@ const verifyTokenLogic = (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;                     
-        req.userId = decoded.id || decoded.userId;  
+        
+        // 👇 DEBUGGING: Check what's inside the token
+        // console.log("🔍 Decoded Token:", decoded);
+
+        req.user = decoded; 
+        
+        // Handle various payload structures (id, userId, _id)
+        req.userId = decoded.id || decoded.userId || decoded._id; 
+        
         next();
     } catch (error) {
         console.error("Auth Error:", error.message);
@@ -36,14 +42,22 @@ const verifyTokenLogic = (req, res, next) => {
 // ============================================================
 const isActiveUser = async (req, res, next) => {
     try {
-        const userId = req.userId || req.user?.id;
+        let userId = req.userId || req.user?.id;
 
-        if (!userId) {
-            return res.status(401).json({ success: false, message: 'User verification failed.' });
+        // 🛠️ FIX: Ensure ID is an Integer before querying DB
+        // If the token has "123" (string), we convert it to 123 (int)
+        if (userId) {
+            userId = parseInt(userId, 10);
         }
 
-        // ✅ FIX: Access db.User HERE, inside the request.
-        // By the time a user requests a page, the DB is definitely connected.
+        // 👇 DEBUGGING: See what ID we are searching for
+        // console.log(`🔎 Checking Active Status for User ID: ${userId}`);
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'User verification failed (Invalid ID).' });
+        }
+
+        // ✅ FIX: Access db.User inside the request
         const User = db.User;
 
         // Safety Check: If DB crashed or failed to load
@@ -52,14 +66,16 @@ const isActiveUser = async (req, res, next) => {
             return res.status(500).json({ success: false, message: 'System initializing, please try again.' });
         }
 
-        // Fetch fresh status
+        // Fetch fresh status from DB
         const user = await User.findByPk(userId);
 
         if (!user) {
+            console.log(`❌ User ID ${userId} not found in Database.`);
             return res.status(404).json({ success: false, message: 'User account not found.' });
         }
 
         // 🛑 CRITICAL CHECK
+        // If status is not explicitly 'active', treat as inactive (or pending)
         if (user.status !== 'active') {
             return res.status(403).json({ 
                 success: false, 
@@ -79,6 +95,7 @@ const isActiveUser = async (req, res, next) => {
 // 3. ADMIN CHECK
 // ============================================================
 const isAdmin = (req, res, next) => {
+    // Case-insensitive check for robustness
     if (req.user && (req.user.role === 'ADMIN' || req.user.role === 'admin')) {
         next();
     } else {
