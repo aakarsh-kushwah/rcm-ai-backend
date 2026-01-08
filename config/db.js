@@ -16,38 +16,36 @@ const db = {};
 // 2. SSL Configuration (TiDB Requires This)
 const tidbSSL = {
     require: true,
-    rejectUnauthorized: true, // TiDB Cloud certificates are trusted by default
+    rejectUnauthorized: true, 
     minVersion: 'TLSv1.2'
 };
 
 const dbConfig = {
-    // Priority: ENV -> Config.json -> Defaults
-    host: process.env.DB_HOST || fileConfig.database?.host || '127.0.0.1',
-    user: process.env.DB_USER || fileConfig.database?.user || 'root',
-    password: process.env.DB_PASSWORD || fileConfig.database?.password || '',
+    host: process.env.DB_HOST || fileConfig.database?.host,
+    user: process.env.DB_USER || fileConfig.database?.user,
+    password: process.env.DB_PASSWORD || fileConfig.database?.password,
     database: process.env.DB_NAME || fileConfig.database?.database || 'rcm_db',
-    port: process.env.DB_PORT || fileConfig.database?.port || 4000, // TiDB uses 4000
+    port: process.env.DB_PORT || fileConfig.database?.port || 4000,
     dialect: 'mysql',
     
-    // 🛡️ TiDB/Cloud Pool Settings
+    // 🔥 UPDATED: Connection Pool Optimized for 5000+ Users (Render Free Tier)
     pool: {
-        max: 5, // TiDB Serverless handles connections well, but keep it safe
-        min: 0,
-        acquire: 30000,
-        idle: 10000
+        max: 20,     // Max 20 connections (Safe for 512MB RAM)
+        min: 2,      // 2 always ready for speed
+        acquire: 60000, // 60s timeout prevents crash under load
+        idle: 10000  // Release unused connections quickly
     },
     
-    // ⚡ Dialect Options with SSL
     dialectOptions: {
         decimalNumbers: true, 
         supportBigNumbers: true,
         bigNumberStrings: true,
         connectTimeout: 60000,
         charset: 'utf8mb4',
-        // 👇 CRITICAL FIX FOR TiDB: ENABLE SSL
         ssl: tidbSSL
     },
     
+    timezone: '+05:30', // IST Timezone
     logging: false 
 };
 
@@ -57,7 +55,7 @@ const loadModel = (sequelize, filePath, modelName) => {
         const modelDef = require(filePath);
         db[modelName] = modelDef(sequelize, Sequelize);
     } catch (e) {
-        // console.warn(`⚠️ Note: Model ${modelName} skipped/missing.`);
+        console.warn(`⚠️ Note: Model ${modelName} skipped/missing.`);
     }
 };
 
@@ -65,8 +63,7 @@ async function initialize() {
     try {
         console.log(`📡 Connecting to Database Host: ${dbConfig.host}`);
 
-        // 1. Pre-flight Check (Raw Connection) WITH SSL
-        // TiDB requires SSL even for simple checks
+        // 1. Pre-flight Check
         try {
             const connection = await mysql.createConnection({
                 host: dbConfig.host, 
@@ -74,15 +71,11 @@ async function initialize() {
                 user: dbConfig.user, 
                 password: dbConfig.password,
                 connectTimeout: 20000,
-                ssl: tidbSSL // 👈 Added SSL here too
+                ssl: tidbSSL
             });
-
-            // TiDB Serverless creates DB automatically or restricts CREATE access.
-            // We just check if we can connect.
             await connection.end();
         } catch (preError) {
             console.warn("⚠️ Pre-flight check warning:", preError.message);
-            // Don't exit, let Sequelize try
         }
 
         // 2. Initialize Sequelize
@@ -92,13 +85,13 @@ async function initialize() {
             dialect: dbConfig.dialect,
             pool: dbConfig.pool, 
             dialectOptions: dbConfig.dialectOptions, 
+            timezone: dbConfig.timezone,
             define: {
                 charset: 'utf8mb4',
                 collate: 'utf8mb4_unicode_ci',
                 timestamps: true
             },
             logging: false, 
-            timezone: '+05:30' // IST Timezone
         });
 
         // 3. Authenticate
@@ -106,7 +99,6 @@ async function initialize() {
         console.log('🚀 TiDB Database Connection: ESTABLISHED');
 
         // --- MODEL REGISTRY ---
-        // Ensure paths are correct relative to config folder
         loadModel(sequelize, '../models/user.model', 'User');
         loadModel(sequelize, '../models/chatMessage.model', 'ChatMessage');
         loadModel(sequelize, '../models/VoiceResponse', 'VoiceResponse');
@@ -117,7 +109,7 @@ async function initialize() {
         loadModel(sequelize, '../models/subscriber.model', 'Subscriber'); 
         loadModel(sequelize, '../models/Payment', 'Payment');
 
-        // Associations (Relationships)
+        // Associations
         Object.keys(db).forEach(modelName => {
             if (db[modelName] && db[modelName].associate) {
                 db[modelName].associate(db);
@@ -138,19 +130,21 @@ async function initialize() {
         db.Sequelize = Sequelize;
         db.sequelize = sequelize;
 
-        // 🛡️ SYNC STRATEGY
+        // 🛡️ SYNC STRATEGY (Updated with Safety)
         console.log("⏳ Syncing Models...");
         try {
             await sequelize.sync({ alter: true });
             console.log(`✅ System Online & Models Synced.`);
         } catch (syncErr) {
-            console.warn("⚠️ Sync Warning: Could not alter table automatically.");
-            console.warn("   Reason:", syncErr.message);
+            console.warn("⚠️ TiDB 'Alter' Error (Ignored):", syncErr.message);
+            console.log("🔄 Trying Safe Sync (No Alter)...");
+            // Agar alter fail hua, to normal sync try karega (Data loss nahi hoga)
+            await sequelize.sync(); 
+            console.log(`✅ System Online (Safe Mode).`);
         }
 
     } catch (error) {
         console.error('🔥 FATAL DB ERROR:', error.original ? error.original.message : error.message);
-        // Important: Throw error so server.js knows db failed
         throw error;
     }
 }

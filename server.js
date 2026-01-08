@@ -1,8 +1,8 @@
 /**
  * @file server.js
- * @description RCM Backend Core - Production Grade.
+ * @description RCM Backend Core - Enterprise Production Grade.
  * @architecture Monolithic Express with Async Micro-services (WhatsApp/AI).
- * @author Senior Architect for RCM Abhiyan
+ * @optimization High Concurrency Support for Render Free Tier + TiDB.
  */
 
 require('dotenv').config();
@@ -12,51 +12,48 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const compression = require('compression'); 
-const path = require('path'); // 👈 IMPORTED: Path module for safe file serving
+const path = require('path'); 
 
-// ✅ IMPORTS (Engine Components)
+// ✅ INTERNAL ENGINE IMPORTS
 const { db, initialize } = require('./config/db');
 const { initializeWhatsAppBot } = require('./services/whatsAppBot');
 
+// ✅ INITIALIZE APP
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ============================================================
-// 🛡️ SECURITY & PERFORMANCE (The Google Standard)
+// 1. 🚀 PERFORMANCE & PROXY SETTINGS (Critical for Render)
 // ============================================================
 
-// 1. Trust Proxy (Crucial for Cloud Hosting like Render/AWS)
+// Render/AWS Load Balancers ke peeche real IP pane ke liye zaroori hai
 app.set('trust proxy', 1);
 
-// 2. Hide Tech Stack (Security Best Practice)
+// Gzip Compression: Response size ko 70% tak kam kar deta hai (Speed Booster)
+app.use(compression()); 
+
+// ============================================================
+// 2. 🛡️ SECURITY LAYER (Helmet & Headers)
+// ============================================================
+
+// Hide "Express" from hackers
 app.disable('x-powered-by'); 
 
-// 3. Compression (Gzip - Fast Speed)
-app.use(compression());
-
-// 4. Secure Headers
-// Note: We adjust Content-Security-Policy to allow Audio playback
+// Advanced Header Security
 app.use(helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" }
+    crossOriginResourcePolicy: { policy: "cross-origin" }, // Audio/Images load hone deta hai
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            mediaSrc: ["'self'", "https://res.cloudinary.com", "blob:", "data:"], // ✅ Audio Play Fix
+            imgSrc: ["'self'", "https://res.cloudinary.com", "data:", "blob:"],
+            scriptSrc: ["'self'", "'unsafe-inline'"], 
+        },
+    },
 }));
 
-// 5. Smart Logging
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-
-// 6. Payload Limits (For Audio/Image Uploads)
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
 // ============================================================
-// 📂 STATIC ASSETS (🔥 CRITICAL FIX FOR AUDIO)
-// ============================================================
-// Iske bina Audio Frontend par play nahi hoga (404 Error aayega)
-// Hum 'content' folder ko internet par accessible bana rahe hain.
-app.use('/content', express.static(path.join(__dirname, 'content')));
-app.use('/public', express.static(path.join(__dirname, 'public')));
-
-// ============================================================
-// 🌐 CORS (Access Control)
+// 3. 🌐 CORS (Access Control Manager)
 // ============================================================
 const allowedOrigins = [
   'https://rcm-ai-admin-ui.vercel.app',
@@ -65,86 +62,108 @@ const allowedOrigins = [
   'https://www.rcmai.in',
   'http://localhost:3000',
   'http://localhost:3001',
-  'http://localhost:5173' // Vite Default
+  'http://localhost:5173'
 ];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow mobile apps / curl / postman
+    // Mobile Apps / Postman (No Origin) allowed
     if (!origin) return callback(null, true);
     
     if (allowedOrigins.includes(origin) || origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
       return callback(null, true);
     }
-    console.warn('⚠️ Blocked by CORS:', origin);
+    console.warn(`⚠️ CORS Blocked: ${origin}`);
     return callback(new Error('Not allowed by CORS'), false);
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']
 }));
 
 // ============================================================
-// 🚦 RATE LIMITING (DDoS Guard)
+// 4. 📦 PARSERS & LOGGING
+// ============================================================
+
+// Request Logging (Production me clean logs, Dev me detailed)
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+
+// Body Parsers (Audio/Image Uploads ke liye limit badhai hai)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ============================================================
+// 5. 📂 STATIC ASSETS SERVING (Audio Engine)
+// ============================================================
+// Iske bina Generated Audio frontend par play nahi hoga (404 Error aayega)
+app.use('/content', express.static(path.join(__dirname, 'content')));
+app.use('/public', express.static(path.join(__dirname, 'public')));
+
+// ============================================================
+// 6. 🚦 RATE LIMITING (DDoS Protection)
 // ============================================================
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 Minutes
-  max: 2000, // Generous limit for Chat/Voice usage
+  max: 3000, // Thoda badhaya hai taaki high traffic me legit user block na ho
+  message: { success: false, message: "Too many requests, please try again later." },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
 // ============================================================
-// 🚀 ROUTE REGISTRATION
+// 7. 🛣️ API ROUTES
 // ============================================================
 
-// 1. Health Check (Load Balancers ke liye)
+// 🟢 Uptime Robot / Health Check (Keep Server Alive)
 app.get('/', (req, res) => res.status(200).send('RCM Neural Engine Online 🟢'));
 app.use('/api/health', require('./routes/health'));
 
-// 2. Core API Routes
+// Core Business Routes
 app.use('/api/auth', apiLimiter, require('./routes/authRoutes'));
-app.use('/api/chat', apiLimiter, require('./routes/chatRoutes'));
-app.use('/api', apiLimiter, require('./routes/subscriberRoutes'));
+app.use('/api/chat', apiLimiter, require('./routes/chatRoutes')); // ✅ Updated Chat Logic Linked
 app.use('/api/users', apiLimiter, require('./routes/userRoutes'));
 app.use('/api/admin', apiLimiter, require('./routes/adminRoutes'));
 app.use('/api/notifications', apiLimiter, require('./routes/notificationRoutes'));
+app.use('/api/subscribers', apiLimiter, require('./routes/subscriberRoutes')); // Naming fixed
 
-// 3. Optional Routes (Safe Loading)
-try {
-    app.use('/api/reports', apiLimiter, require('./routes/dailyReportRoutes'));
-    app.use('/api/videos', apiLimiter, require('./routes/videoRoutes'));
-    app.use('/api/payment', apiLimiter, require('./routes/paymentRoutes'));
-} catch (e) { console.warn("ℹ️ Optional Module Skipped:", e.message); }
+// Optional Modules (Fail-safe Loading)
+const loadRoute = (path, routeFile) => {
+    try { app.use(path, apiLimiter, require(routeFile)); } 
+    catch (e) { console.warn(`ℹ️ Module skipped: ${path} (${e.message})`); }
+};
+
+loadRoute('/api/reports', './routes/dailyReportRoutes');
+loadRoute('/api/videos', './routes/videoRoutes');
+loadRoute('/api/payment', './routes/paymentRoutes');
 
 // ============================================================
-// ⚠️ ERROR HANDLING (Safety Net)
+// 8. ⚠️ GLOBAL ERROR HANDLING
 // ============================================================
 
-// 404 Handler
+// 404 - Not Found
 app.use((req, res) => {
   res.status(404).json({ success: false, message: `Endpoint Not Found: ${req.originalUrl}` });
 });
 
-// 500 Global Error Handler
+// 500 - Server Error
 app.use((err, req, res, next) => {
-  console.error('🔥 Server Error:', err.message);
-  const statusCode = err.status || 500;
-  res.status(statusCode).json({
+  console.error('🔥 Fatal Server Error:', err.message);
+  res.status(err.status || 500).json({
     success: false,
     message: err.message || 'Internal Server Error',
-    // Production mein stack trace hide karna zaroori hai
-    stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+    error: process.env.NODE_ENV === 'development' ? err.stack : undefined // Hide stack in prod
   });
 });
 
 // ============================================================
-// 🏁 IGNITION SEQUENCE
+// 9. 🏁 ENGINE IGNITION SEQUENCE
 // ============================================================
 async function ignite() {
   try {
-    // 1. Database Connection
-    console.log('⏳ Connecting to Database...');
-    await initialize();
-    console.log('✅ Database Synced & Ready.');
+    console.log('⏳ Initializing RCM Core Systems...');
+
+    // 1. Connect to TiDB Database
+    await initialize(); 
+    console.log('✅ Database Connection: STABLE');
 
     // 2. Start HTTP Server
     const server = app.listen(PORT, () => {
@@ -152,28 +171,28 @@ async function ignite() {
       ################################################
       🚀 RCM SERVER RUNNING ON PORT: ${PORT}
       🌍 Environment: ${process.env.NODE_ENV || 'development'}
+      ⚡ Compression: ENABLED
       🔊 Audio Serving: /content -> Public
       ################################################
       `);
     });
 
-    // 3. Start WhatsApp Bot (Non-Blocking)
-    // Delay ensures server is stable before launching Puppeteer
+    // 3. Start WhatsApp Bot (Non-Blocking / Async)
+    // 5 second delay taaki server pehle stable ho jaye
     setTimeout(() => {
         try {
-            console.log("🤖 Starting WhatsApp Service...");
+            console.log("🤖 Initializing WhatsApp Service...");
             initializeWhatsAppBot(); 
         } catch (botError) {
-            console.error("⚠️ WhatsApp Init Failed (Check Config):", botError.message);
+            console.error("⚠️ WhatsApp Bot Init Failed:", botError.message);
         }
-    }, 5000); 
+    }, 5000);
 
-    // 4. Graceful Shutdown (Signal Handling)
+    // 4. Graceful Shutdown (Data Integrity)
     const shutdown = () => {
-      console.log('🛑 Shutting down gracefully...');
+      console.log('\n🛑 Shutting down gracefully...');
       server.close(() => {
         console.log('🛑 HTTP server closed.');
-        // Force close DB
         if (db && db.sequelize) {
             db.sequelize.close().then(() => {
                 console.log('🛑 Database connection closed.');
@@ -194,21 +213,18 @@ async function ignite() {
   }
 }
 
-// 🔥 Start Engine
+// 🔥 Start the Engine
 ignite();
 
 // ============================================================
-// 🚑 CRASH GUARD
+// 🚑 CRASH GUARDS (Prevents Downtime)
 // ============================================================
 process.on('unhandledRejection', (err) => {
-    console.error('💀 UNHANDLED REJECTION! Shutting down...');
-    console.error(err);
-    // Don't exit immediately in production, log it.
-    if(process.env.NODE_ENV === 'development') process.exit(1);
+    console.error('💀 UNHANDLED REJECTION:', err.message);
+    // Keep running in production, log critical error
 });
 
 process.on('uncaughtException', (err) => {
-    console.error('💀 UNCAUGHT EXCEPTION! Shutting down...');
-    console.error(err);
-    process.exit(1);
+    console.error('💀 UNCAUGHT EXCEPTION:', err.message);
+    process.exit(1); // Force restart for clean state
 });

@@ -1,162 +1,256 @@
 /**
- * @file src/controllers/chatController.js
- * @description Logic: DB Audio Priority -> AI Generation -> No DB Save -> Admin Alert.
+ * @file chatController.js
+ * @description DB Audio Priority → AI → No DB Pollution → Admin Alert
  */
 
-const { getAIChatResponse } = require('../services/aiService'); 
+const asyncHandler = require('express-async-handler');
+const stringSimilarity = require('string-similarity');
+
+const { getAIChatResponse } = require('../services/aiService');
 const { generateEdgeAudio } = require('../services/edgeTtsService');
 const { uploadAudioToCloudinary } = require('../services/cloudinaryService');
 const { db } = require('../config/db');
-const asyncHandler = require('express-async-handler');
-const stringSimilarity = require("string-similarity");
 
 let { SYSTEM_PROMPT } = require('../utils/prompts');
 
-// ✅ Admin Alert Wrapper (Isse mene change nahi kiya, ye zaroori he)
+// ============================================================
+// 🟡 ADMIN ALERT (UNCHANGED – REQUIRED)
+// ============================================================
 let sendAdminAlert = async () => {};
 try {
     const bot = require('../services/whatsAppBot');
-    if(bot.sendAdminAlert) sendAdminAlert = bot.sendAdminAlert;
-} catch(e) {}
+    if (bot.sendAdminAlert) sendAdminAlert = bot.sendAdminAlert;
+} catch (_) {}
 
-function sanitizeInput(text) {
-    if (!text) return "";
-    return text.substring(0, 500).trim().replace(/[<>{}]/g, ""); 
-}
+// ============================================================
+// 🧼 HELPERS
+// ============================================================
+const sanitizeInput = (text = "") =>
+    text.substring(0, 500).trim().replace(/[<>{}]/g, "");
 
-// 🚀 MAIN USER CHAT
+// ============================================================
+// 🚀 USER → AI CHAT
+// ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
-    const { message, userId } = req.body; 
+    const { message, userId } = req.body;
 
-    if (!message) return res.status(400).json({ success: false, reply: "Message missing." });
-    
-    const cleanMsg = sanitizeInput(message);
-    const userMsgForMatching = cleanMsg.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, ''); 
-
-    let replyContent = "";
-    let audioUrl = ""; 
-    let source = "AI_LIVE"; 
-
-    // ============================================================
-    // 1. 🔍 DB CHECK (Priority: Check FAQ Table First)
-    // ============================================================
-    try {
-        const approvedFaqs = await db.FAQ.findAll({
-            where: { status: 'APPROVED' }, 
-            attributes: ['question', 'answer', 'audioUrl', 'voiceType']
-        });
-        
-        if (approvedFaqs.length > 0) {
-            const questions = approvedFaqs.map(f => f.question.toLowerCase());
-            const match = stringSimilarity.findBestMatch(userMsgForMatching, questions);
-            
-            // Agar 75% se zyada match hua to DB se jawaab denge
-            if (match.bestMatch.rating > 0.75) {
-                const bestFaq = approvedFaqs[match.bestMatchIndex];
-                replyContent = bestFaq.answer;
-                
-                // 🔥 CRITICAL: Agar Audio DB mein hai, wahi use karo
-                if (bestFaq.audioUrl && bestFaq.audioUrl.length > 5) {
-                    audioUrl = bestFaq.audioUrl;
-                    source = "DB_AUDIO_HIT";
-                } else {
-                    source = "DB_TEXT_ONLY";
-                }
-            }
-        }
-    } catch (e) {
-        console.error("DB Check Error:", e.message);
+    if (!message) {
+        return res.status(400).json({ success: false, message: "Message missing" });
     }
 
-    // ============================================================
-    // 2. 🧠 AI GENERATION (Agar DB me nahi mila)
-    // ============================================================
+    const cleanMsg = sanitizeInput(message);
+    const matchText = cleanMsg
+        .toLowerCase()
+        .replace(/[^\w\s\u0900-\u097F]/gi, '');
+
+    let replyContent = "";
+    let audioUrl = "";
+    let source = "AI_LIVE";
+
+    // ========================================================
+    // 1️⃣ DB FAQ MATCH (HIGHEST PRIORITY)
+    // ========================================================
+    try {
+        const faqs = await db.FAQ.findAll({
+            where: { status: 'APPROVED' },
+            attributes: ['question', 'answer', 'audioUrl']
+        });
+
+        if (faqs.length) {
+            const questions = faqs.map(f => f.question.toLowerCase());
+            const match = stringSimilarity.findBestMatch(matchText, questions);
+
+            if (match.bestMatch.rating > 0.75) {
+                const faq = faqs[match.bestMatchIndex];
+                replyContent = faq.answer;
+                audioUrl = faq.audioUrl || "";
+                source = faq.audioUrl ? "DB_AUDIO_HIT" : "DB_TEXT_ONLY";
+            }
+        }
+    } catch (err) {
+        console.error("FAQ Match Error:", err.message);
+    }
+
+    // ========================================================
+    // 2️⃣ AI FALLBACK
+    // ========================================================
     if (!replyContent) {
         try {
             replyContent = await getAIChatResponse([
                 { role: "system", content: SYSTEM_PROMPT },
                 { role: "user", content: cleanMsg }
             ]);
-        } catch (e) { replyContent = "Network issue."; }
+        } catch {
+            replyContent = "Temporary network issue.";
+        }
 
-        // 3. 🔊 AUDIO GENERATION (Only for New AI Responses)
-        if (!audioUrl && replyContent) {
-            try {
-                // AI se audio banega par DB me save nahi hoga
-                audioUrl = await generateEdgeAudio(replyContent);
-            } catch (e) { audioUrl = ""; }
+        try {
+            audioUrl = await generateEdgeAudio(replyContent);
+        } catch {
+            audioUrl = "";
         }
     }
 
-    // 4. 📤 SEND RESPONSE
-    res.status(200).json({ 
-        success: true, 
-        reply: replyContent,       
-        message: replyContent,     
-        audioUrl: audioUrl || "", 
-        source: source,
+    // ========================================================
+    // 3️⃣ RESPONSE
+    // ========================================================
+    res.status(200).json({
+        success: true,
+        message: replyContent,
+        reply: replyContent,
+        audioUrl,
+        source,
         latency: `${Date.now() - start}ms`
     });
 
-    // ============================================================
-    // 5. 📦 LOGGING & ALERTS (Modified as per request)
-    // ============================================================
+    // ========================================================
+    // 4️⃣ ASYNC LOGGING + ADMIN ALERT
+    // ========================================================
     setImmediate(async () => {
         try {
-            // 1. User ki Chat History me save karo (Ye user ko apni history dekhne ke liye chahiye)
             if (userId) {
-                await db.ChatMessage.create({ 
-                    userId, 
-                    sender: "USER", 
-                    message: cleanMsg, 
-                    response: replyContent, 
-                    audioUrl: audioUrl || "" 
+                await db.ChatMessage.create({
+                    userId,
+                    sender: "USER",
+                    message: cleanMsg,
+                    response: replyContent,
+                    audioUrl
                 });
             }
 
-            // 2. Alert Logic (Updated)
-            if (source === "AI_LIVE" && userMsgForMatching.length > 5) {
-                
-                // ❌ REMOVED: await db.FAQ.create(...) 
-                // Ab ye DB me save nahi hoga taaki kachra na bhare.
-
-                // ✅ KEPT: Admin Alert
-                // Admin ko WhatsApp par pata chal jayega ki koi naya sawal aya hai
-                sendAdminAlert(cleanMsg, replyContent).catch(err => console.log("Alert Error:", err.message));
+            if (source === "AI_LIVE" && matchText.length > 5) {
+                sendAdminAlert(cleanMsg, replyContent)
+                    .catch(() => {});
             }
-        } catch (e) {
-            console.error("Logging Error:", e.message);
+        } catch (err) {
+            console.error("Chat Log Error:", err.message);
         }
     });
 });
 
 // ============================================================
-// 🛡️ ADMIN CONTROLLERS (Ye wese hi rahenge)
+// 🧑‍💼 ADMIN → CHAT USERS LIST
+// ============================================================
+const getAllChatUsers = asyncHandler(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+
+    const rows = await db.ChatMessage.findAll({
+        attributes: ['userId'],
+        group: ['userId'],
+        include: [{
+            model: db.User,
+            attributes: ['id', 'fullName', 'email']
+        }],
+        order: [['createdAt', 'DESC']]
+    });
+
+    const users = rows.map(r => r.User).filter(Boolean);
+    res.json({ success: true, data: users });
+});
+
+// ============================================================
+// 🧑‍💼 ADMIN → CHAT HISTORY (PAGINATED)
+// ============================================================
+const getChatHistoryByUser = asyncHandler(async (req, res) => {
+    const { userId } = req.params;
+    const page = Number(req.query.page || 1);
+    const limit = 30;
+    const offset = (page - 1) * limit;
+
+    // 🚫 STOP 304 CACHE
+    res.set({
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    });
+
+    const messages = await db.ChatMessage.findAll({
+        where: { userId },
+        order: [['createdAt', 'ASC']],
+        limit,
+        offset
+    });
+
+    res.status(200).json({
+        success: true,
+        page,
+        data: messages
+    });
+});
+
+// ============================================================
+// 🛡️ ADMIN → ADD SMART RESPONSE
 // ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
     const { question, answer } = req.body;
-    const audioUrl = req.file ? await uploadAudioToCloudinary(req.file.buffer, `admin_${Date.now()}`) : await generateEdgeAudio(answer);
-    
-    // Sirf Admin hi DB me data daal sakta hai
-    await db.FAQ.create({ question, answer, audioUrl, status: 'APPROVED', isUserSubmitted: false });
-    res.json({ success: true, message: "Saved" });
+
+    if (!question || !answer) {
+        return res.status(400).json({ success: false, message: "Missing data" });
+    }
+
+    const audioUrl = req.file
+        ? await uploadAudioToCloudinary(req.file.buffer, `faq_${Date.now()}`)
+        : await generateEdgeAudio(answer);
+
+    await db.FAQ.create({
+        question,
+        answer,
+        audioUrl,
+        status: 'APPROVED',
+        isUserSubmitted: false
+    });
+
+    res.json({ success: true, message: "Smart response saved" });
 });
 
+// ============================================================
+// 🛡️ ADMIN → UPGRADE FAQ
+// ============================================================
 const upgradeToPremium = asyncHandler(async (req, res) => {
     const { faqId, answer } = req.body;
+
     const faq = await db.FAQ.findByPk(faqId);
-    if (!faq) return res.status(404).json({ message: "Not found" });
+    if (!faq) {
+        return res.status(404).json({ success: false, message: "FAQ not found" });
+    }
+
     const updateData = { status: 'APPROVED' };
     if (answer) updateData.answer = answer;
-    if (req.file) updateData.audioUrl = await uploadAudioToCloudinary(req.file.buffer, `upg_${faqId}`);
+    if (req.file) {
+        updateData.audioUrl = await uploadAudioToCloudinary(
+            req.file.buffer,
+            `upgrade_${faqId}`
+        );
+    }
+
     await faq.update(updateData);
-    res.json({ success: true, message: "Updated" });
+    res.json({ success: true, message: "FAQ upgraded" });
 });
 
+// ============================================================
+// 🔊 DIRECT TTS
+// ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
-    const url = await generateEdgeAudio(req.body.text);
-    res.json({ success: true, audioUrl: url });
+    const { text } = req.body;
+    if (!text) {
+        return res.status(400).json({ success: false, message: "Text missing" });
+    }
+
+    const audioUrl = await generateEdgeAudio(text);
+    res.json({ success: true, audioUrl });
 });
 
-module.exports = { handleChat, addSmartResponse, upgradeToPremium, handleSpeak };
+// ============================================================
+// 📦 EXPORTS
+// ============================================================
+module.exports = {
+    handleChat,
+    handleSpeak,
+    addSmartResponse,
+    upgradeToPremium,
+
+    // 🔥 ADMIN CHAT VIEW
+    getAllChatUsers,
+    getChatHistoryByUser
+};
