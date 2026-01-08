@@ -16,23 +16,21 @@ const {
     upgradeToPremium 
 } = require('../controllers/chatController');
 
-// ✅ Middleware: Added 'isActiveUser'
+// ✅ Middleware
 const { isAuthenticated, isAdmin, isActiveUser } = require('../middleware/authMiddleware'); 
 
 // ============================================================
-// 💬 CHAT ROUTES
+// 💬 USER ROUTES
 // ============================================================
 
 // 1. User Chat (Text + Hybrid Audio)
-// ✅ FIX: Added isActiveUser (Blocks pending/expired users)
 router.post('/', isAuthenticated, isActiveUser, handleChat);
 
 // 2. Direct TTS (Explicit Request)
-// ✅ FIX: Added isActiveUser
 router.post('/speak', isAuthenticated, isActiveUser, handleSpeak);
 
 // ============================================================
-// 🛡️ ADMIN ROUTES (Admin role implies access, usually skips active check)
+// 🛡️ ADMIN ROUTES (Only Admin can Insert Data)
 // ============================================================
 
 // 3. Admin: Add NEW Q&A Manually
@@ -44,7 +42,7 @@ router.post(
     addSmartResponse
 );
 
-// 4. Admin: Upgrade Existing/Pending Q&A
+// 4. Admin: Upgrade Existing Q&A
 router.post(
     '/admin/upgrade', 
     isAuthenticated, 
