@@ -12,7 +12,7 @@ const stringSimilarity = require("string-similarity");
 
 let { SYSTEM_PROMPT } = require('../utils/prompts');
 
-// ✅ Admin Alert Wrapper (Isse mene change nahi kiya, ye zaroori he)
+// ✅ Admin Alert Wrapper
 let sendAdminAlert = async () => {};
 try {
     const bot = require('../services/whatsAppBot');
@@ -27,7 +27,15 @@ function sanitizeInput(text) {
 // 🚀 MAIN USER CHAT
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
-    const { message, userId } = req.body; 
+    
+    // ✅ FIX: UserId ko Securely Token (req.user) se nikalein, fallback body par rakhein
+    // isAuthenticated middleware req.user set karta hai.
+    let userId = req.user ? req.user.id : req.body.userId;
+    
+    // Ensure userId integer format me ho
+    userId = userId ? parseInt(userId, 10) : null;
+
+    const { message } = req.body; 
 
     if (!message) return res.status(400).json({ success: false, reply: "Message missing." });
     
@@ -100,45 +108,41 @@ const handleChat = asyncHandler(async (req, res) => {
     });
 
     // ============================================================
-    // 5. 📦 LOGGING & ALERTS (Modified as per request)
+    // 5. 📦 LOGGING & ALERTS (Fix applied here)
     // ============================================================
     setImmediate(async () => {
         try {
-            // 1. User ki Chat History me save karo (Ye user ko apni history dekhne ke liye chahiye)
-            if (userId) {
+            // ✅ FIX: Ab userId req.user se aa raha hai, to ye undefined nahi hoga
+            if (userId && !isNaN(userId)) {
                 await db.ChatMessage.create({ 
-                    userId, 
+                    userId: userId, 
                     sender: "USER", 
                     message: cleanMsg, 
                     response: replyContent, 
                     audioUrl: audioUrl || "" 
                 });
+                // console.log("✅ Chat Saved to DB for User:", userId);
+            } else {
+                console.warn(`⚠️ Chat NOT Saved: Invalid userId. (Req User: ${req.user ? 'Present' : 'Missing'}, Body ID: ${req.body.userId})`);
             }
 
-            // 2. Alert Logic (Updated)
+            // 2. Alert Logic
             if (source === "AI_LIVE" && userMsgForMatching.length > 5) {
-                
-                // ❌ REMOVED: await db.FAQ.create(...) 
-                // Ab ye DB me save nahi hoga taaki kachra na bhare.
-
-                // ✅ KEPT: Admin Alert
-                // Admin ko WhatsApp par pata chal jayega ki koi naya sawal aya hai
                 sendAdminAlert(cleanMsg, replyContent).catch(err => console.log("Alert Error:", err.message));
             }
         } catch (e) {
-            console.error("Logging Error:", e.message);
+            console.error("❌ Chat Logging Error:", e.message);
         }
     });
 });
 
 // ============================================================
-// 🛡️ ADMIN CONTROLLERS (Ye wese hi rahenge)
+// 🛡️ ADMIN CONTROLLERS
 // ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
     const { question, answer } = req.body;
     const audioUrl = req.file ? await uploadAudioToCloudinary(req.file.buffer, `admin_${Date.now()}`) : await generateEdgeAudio(answer);
     
-    // Sirf Admin hi DB me data daal sakta hai
     await db.FAQ.create({ question, answer, audioUrl, status: 'APPROVED', isUserSubmitted: false });
     res.json({ success: true, message: "Saved" });
 });

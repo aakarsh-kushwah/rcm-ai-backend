@@ -17,6 +17,16 @@ module.exports = (sequelize) => {
         type: DataTypes.TEXT,
         allowNull: false,
       },
+      // ✅ Added Response Field (Controller me use ho raha tha par yaha missing tha)
+      response: {
+        type: DataTypes.TEXT,
+        allowNull: true, 
+      },
+      // ✅ Added AudioUrl Field (Controller me use ho raha tha)
+      audioUrl: {
+        type: DataTypes.STRING(500),
+        allowNull: true
+      },
       userId: {
         type: DataTypes.INTEGER,
         allowNull: false,
@@ -24,9 +34,9 @@ module.exports = (sequelize) => {
     },
     {
       tableName: 'chat_messages',
-      timestamps: true,
+      timestamps: true, // ✅ True rakhein taaki createdAt aur updatedAt dono manage ho
       createdAt: 'createdAt',
-      updatedAt: false,
+      updatedAt: 'updatedAt', // ✅ Isse explicit kar dein
     }
   );
 
