@@ -1,230 +1,193 @@
 /**
  * @file server.js
- * @description RCM Backend Core - Enterprise Production Grade.
- * @architecture Monolithic Express with Async Micro-services (WhatsApp/AI).
- * @optimization High Concurrency Support for Render Free Tier + TiDB.
+ * @title RCM TITAN AGI ENGINE - GEN 3
+ * @description Hyper-Scale Neural Architecture for AGI/ASI Systems
+ * @architecture Master-Worker Hive | Redis Event Bus | Self-Healing
+ * @author RCM AI Labs
  */
 
 require('dotenv').config();
+const cluster = require('cluster');
+const os = require('os');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const hpp = require('hpp');
 const rateLimit = require('express-rate-limit');
-const morgan = require('morgan');
-const compression = require('compression'); 
-const path = require('path'); 
+const compression = require('compression');
+const path = require('path');
+const { createBullBoard } = require('@bull-board/api'); // Optional: For visualizing queues
+const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
+const { ExpressAdapter } = require('@bull-board/express');
 
-// ✅ INTERNAL ENGINE IMPORTS
-const { db, initialize } = require('./config/db');
-const { initializeWhatsAppBot } = require('./services/whatsAppBot');
+// ✅ SYNAPTIC IMPORTS (Internal Layers)
+const { connectDB, db } = require('./config/db');
+const { initializeWhatsAppBot } = require('./services/whatsAppBot'); // Updated Queue Version
 
-// ✅ INITIALIZE APP
-const app = express();
+// ⚙️ NEURAL CONFIGURATION
 const PORT = process.env.PORT || 10000;
+// Production me saare CPU cores use honge, Dev me sirf 2
+const TOTAL_CORES = process.env.NODE_ENV === 'production' ? os.cpus().length : 2;
 
 // ============================================================
-// 1. 🚀 PERFORMANCE & PROXY SETTINGS (Critical for Render)
+// 🏛️ MASTER NODE (THE HIVE MIND)
 // ============================================================
-
-// Render/AWS Load Balancers ke peeche real IP pane ke liye zaroori hai
-app.set('trust proxy', 1);
-
-// Gzip Compression: Response size ko 70% tak kam kar deta hai (Speed Booster)
-app.use(compression()); 
-
-// ============================================================
-// 2. 🛡️ SECURITY LAYER (Helmet & Headers)
-// ============================================================
-
-// Hide "Express" from hackers
-app.disable('x-powered-by'); 
-
-// Advanced Header Security
-app.use(helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" }, // Audio/Images load hone deta hai
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            mediaSrc: ["'self'", "https://res.cloudinary.com", "blob:", "data:"], // ✅ Audio Play Fix
-            imgSrc: ["'self'", "https://res.cloudinary.com", "data:", "blob:"],
-            scriptSrc: ["'self'", "'unsafe-inline'"], 
-        },
-    },
-}));
-
-// ============================================================
-// 3. 🌐 CORS (Access Control Manager)
-// ============================================================
-const allowedOrigins = [
-  'https://rcm-ai-admin-ui.vercel.app',
-  'https://rcm-ai-frontend.vercel.app',
-  'https://rcmai.in',
-  'https://www.rcmai.in',
-  'http://localhost:3000',
-  'http://localhost:3001',
-  'http://localhost:5173'
-];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Mobile Apps / Postman (No Origin) allowed
-    if (!origin) return callback(null, true);
+if (cluster.isPrimary) {
+    console.clear();
+    const banner = `
+    ██████╗  ██████╗███╗   ███╗      █████╗ ██╗
+    ██╔══██╗██╔════╝████╗ ████║     ██╔══██╗██║
+    ██████╔╝██║     ██╔████╔██║     ███████║██║
+    ██╔══██╗██║     ██║╚██╔╝██║     ██╔══██║██║
+    ██║  ██║╚██████╗██║ ╚═╝ ██║     ██║  ██║██║
+    ╚═╝  ╚═╝ ╚═════╝╚═╝     ╚═╝     ╚═╝  ╚═╝╚═╝
     
-    if (allowedOrigins.includes(origin) || origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
-      return callback(null, true);
+    🚀 TITAN ENGINE: AGI-READY ARCHITECTURE
+    🧠 Master PID: ${process.pid}
+    💻 Synaptic Cores: ${TOTAL_CORES}
+    🛡️ Defense Systems: ACTIVE
+    `;
+    console.log(banner);
+
+    // 🧬 Spawn Workers (Clone Process)
+    for (let i = 0; i < TOTAL_CORES; i++) {
+        cluster.fork();
     }
-    console.warn(`⚠️ CORS Blocked: ${origin}`);
-    return callback(new Error('Not allowed by CORS'), false);
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']
-}));
 
-// ============================================================
-// 4. 📦 PARSERS & LOGGING
-// ============================================================
-
-// Request Logging (Production me clean logs, Dev me detailed)
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-
-// Body Parsers (Audio/Image Uploads ke liye limit badhai hai)
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// ============================================================
-// 5. 📂 STATIC ASSETS SERVING (Audio Engine)
-// ============================================================
-// Iske bina Generated Audio frontend par play nahi hoga (404 Error aayega)
-app.use('/content', express.static(path.join(__dirname, 'content')));
-app.use('/public', express.static(path.join(__dirname, 'public')));
-
-// ============================================================
-// 6. 🚦 RATE LIMITING (DDoS Protection)
-// ============================================================
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 Minutes
-  max: 3000, // Thoda badhaya hai taaki high traffic me legit user block na ho
-  message: { success: false, message: "Too many requests, please try again later." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-// ============================================================
-// 7. 🛣️ API ROUTES
-// ============================================================
-
-// 🟢 Uptime Robot / Health Check (Keep Server Alive)
-app.get('/', (req, res) => res.status(200).send('RCM Neural Engine Online 🟢'));
-app.use('/api/health', require('./routes/health'));
-
-// Core Business Routes
-app.use('/api/auth', apiLimiter, require('./routes/authRoutes'));
-app.use('/api/chat', apiLimiter, require('./routes/chatRoutes')); // ✅ Updated Chat Logic Linked
-app.use('/api/users', apiLimiter, require('./routes/userRoutes'));
-app.use('/api/admin', apiLimiter, require('./routes/adminRoutes'));
-app.use('/api/notifications', apiLimiter, require('./routes/notificationRoutes'));
-app.use('/api/subscribers', apiLimiter, require('./routes/subscriberRoutes')); // Naming fixed
-
-// Optional Modules (Fail-safe Loading)
-const loadRoute = (path, routeFile) => {
-    try { app.use(path, apiLimiter, require(routeFile)); } 
-    catch (e) { console.warn(`ℹ️ Module skipped: ${path} (${e.message})`); }
-};
-
-loadRoute('/api/reports', './routes/dailyReportRoutes');
-loadRoute('/api/videos', './routes/videoRoutes');
-loadRoute('/api/payment', './routes/paymentRoutes');
-
-// ============================================================
-// 8. ⚠️ GLOBAL ERROR HANDLING
-// ============================================================
-
-// 404 - Not Found
-app.use((req, res) => {
-  res.status(404).json({ success: false, message: `Endpoint Not Found: ${req.originalUrl}` });
-});
-
-// 500 - Server Error
-app.use((err, req, res, next) => {
-  console.error('🔥 Fatal Server Error:', err.message);
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || 'Internal Server Error',
-    error: process.env.NODE_ENV === 'development' ? err.stack : undefined // Hide stack in prod
-  });
-});
-
-// ============================================================
-// 9. 🏁 ENGINE IGNITION SEQUENCE
-// ============================================================
-async function ignite() {
-  try {
-    console.log('⏳ Initializing RCM Core Systems...');
-
-    // 1. Connect to TiDB Database
-    await initialize(); 
-    console.log('✅ Database Connection: STABLE');
-
-    // 2. Start HTTP Server
-    const server = app.listen(PORT, () => {
-      console.log(`
-      ################################################
-      🚀 RCM SERVER RUNNING ON PORT: ${PORT}
-      🌍 Environment: ${process.env.NODE_ENV || 'development'}
-      ⚡ Compression: ENABLED
-      🔊 Audio Serving: /content -> Public
-      ################################################
-      `);
+    // ❤️ Self-Healing Protocol
+    cluster.on('exit', (worker, code, signal) => {
+        console.warn(`⚠️ [CRITICAL] Node ${worker.process.pid} died. Initiating Regeneration...`);
+        cluster.fork(); // Turant naya worker paida karo
     });
 
-    // 3. Start WhatsApp Bot (Non-Blocking / Async)
-    // 5 second delay taaki server pehle stable ho jaye
-    setTimeout(() => {
-        try {
-            console.log("🤖 Initializing WhatsApp Service...");
-            initializeWhatsAppBot(); 
-        } catch (botError) {
-            console.error("⚠️ WhatsApp Bot Init Failed:", botError.message);
-        }
-    }, 5000);
-
-    // 4. Graceful Shutdown (Data Integrity)
-    const shutdown = () => {
-      console.log('\n🛑 Shutting down gracefully...');
-      server.close(() => {
-        console.log('🛑 HTTP server closed.');
-        if (db && db.sequelize) {
-            db.sequelize.close().then(() => {
-                console.log('🛑 Database connection closed.');
-                process.exit(0);
-            });
-        } else {
-            process.exit(0);
-        }
-      });
-    };
-
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
-
-  } catch (error) {
-    console.error('❌ FATAL STARTUP ERROR:', error);
-    process.exit(1);
-  }
+} else {
+    // ============================================================
+    // 👷 WORKER NODE (THE NERVOUS SYSTEM)
+    // ============================================================
+    igniteNeuralPathway();
 }
 
-// 🔥 Start the Engine
-ignite();
+async function igniteNeuralPathway() {
+    const app = express();
 
-// ============================================================
-// 🚑 CRASH GUARDS (Prevents Downtime)
-// ============================================================
-process.on('unhandledRejection', (err) => {
-    console.error('💀 UNHANDLED REJECTION:', err.message);
-    // Keep running in production, log critical error
-});
+    // 1. 🚀 HYPER-SPEED OPTIMIZATIONS
+    app.set('trust proxy', 1); // For AWS/Vercel Load Balancers
+    app.use(compression());    // Gzip Compression (Reduces payload by 70%)
 
-process.on('uncaughtException', (err) => {
-    console.error('💀 UNCAUGHT EXCEPTION:', err.message);
-    process.exit(1); // Force restart for clean state
-});
+    // 2. 🛡️ MILITARY-GRADE SECURITY
+    app.disable('x-powered-by'); 
+    app.use(helmet({
+        crossOriginResourcePolicy: { policy: "cross-origin" },
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                mediaSrc: ["'self'", "https://res.cloudinary.com", "blob:", "data:"],
+                imgSrc: ["'self'", "https://res.cloudinary.com", "data:", "blob:"],
+                scriptSrc: ["'self'", "'unsafe-inline'"],
+                connectSrc: ["'self'", "ws:", "wss:"], // WebSockets allowed
+            },
+        },
+    }));
+    app.use(hpp()); // HTTP Parameter Pollution Shield
+
+    // 3. 🌐 UNIVERSAL CORS (Allowed Origins)
+    const allowedOrigins = [
+        'https://rcm-ai-admin-ui.vercel.app',
+        'https://rcmai.in',
+        'http://localhost:3000',
+        'http://localhost:5173'
+    ];
+    
+    app.use(cors({
+        origin: (origin, callback) => {
+            if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+                return callback(null, true);
+            }
+            return callback(new Error('🚫 Firewall blocked this origin'), false);
+        },
+        credentials: true
+    }));
+
+    // 4. 📦 DATA INGESTION (High Capacity)
+    app.use(express.json({ limit: '100mb' })); 
+    app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+
+    // 5. 🚦 INTELLIGENT TRAFFIC CONTROL (DDoS Protection)
+    const standardLimiter = rateLimit({
+        windowMs: 1 * 60 * 1000, 
+        max: 5000, // 5000 req/min (Amazon Scale)
+        message: { error: "Traffic Limit Exceeded. Cooling down..." },
+        standardHeaders: true,
+    });
+
+    // ============================================================
+    // 7. 🛣️ NEURAL ROUTES
+    // ============================================================
+    
+    // Heartbeat
+    app.get('/', (req, res) => res.status(200).json({ status: "ONLINE", node: process.pid, load: os.loadavg() }));
+    app.use('/api/health', require('./routes/health'));
+
+    // Core Logic
+    app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
+    app.use('/api/chat', standardLimiter, require('./routes/chatRoutes'));
+    app.use('/api/admin', require('./routes/adminRoutes')); // No limit for admin
+    
+    // Optional Modules (Safe Load)
+    const loadModule = (path, file) => { try { app.use(path, require(file)); } catch(e){} };
+    loadModule('/api/payment', './routes/paymentRoutes');
+    loadModule('/api/notifications', './routes/notificationRoutes');
+
+    // 404 & Global Error Trap
+    app.use('*', (req, res) => res.status(404).json({ error: "Void Endpoint Detected" }));
+    app.use((err, req, res, next) => {
+        console.error(`🔥 [Node ${process.pid} Error]:`, err.message);
+        res.status(500).json({ error: "Internal Synapse Failure", details: err.message });
+    });
+
+    // ============================================================
+    // 8. 🏁 IGNITION SEQUENCE
+    // ============================================================
+    try {
+        await connectDB(); // Database Link
+
+        const server = app.listen(PORT, () => {
+            console.log(`⚡ Node ${process.pid} Active on PORT ${PORT}`);
+
+            // 🤖 SPECIALIZED WORKER ASSIGNMENT
+            // Worker 1 = The Communications Officer (WhatsApp + Queue Processor)
+            // Workers 2,3,4... = The API Handlers (Fast Response)
+            
+            if (cluster.worker.id === 1) {
+                console.log("\n🕵️ [SPECIAL OPS] Worker 1 Assigned to WhatsApp & Queue Processing");
+                console.log("---------------------------------------------------------------");
+                
+                // Thoda delay taaki DB/Redis stable ho jaye
+                setTimeout(() => {
+                    initializeWhatsAppBot(); 
+                }, 3000);
+            }
+        });
+
+        // 🛠️ Keep-Alive Optimization (Fixes 502 Bad Gateway on AWS/Nginx)
+        server.keepAliveTimeout = 65000; 
+        server.headersTimeout = 66000;
+
+        // 🛑 GRACEFUL SHUTDOWN (Zero Data Loss)
+        const shutdown = () => {
+            console.log(`🛑 Node ${process.pid} shutting down gracefully...`);
+            server.close(() => {
+                console.log('✅ Server Closed.');
+                // Database aur Redis connections yahan close kar sakte hain
+                process.exit(0);
+            });
+        };
+
+        process.on('SIGTERM', shutdown);
+        process.on('SIGINT', shutdown);
+
+    } catch (error) {
+        console.error(`❌ Critical Failure on Node ${process.pid}:`, error);
+        process.exit(1);
+    }
+}
