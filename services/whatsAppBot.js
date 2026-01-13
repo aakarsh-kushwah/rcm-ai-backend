@@ -1,32 +1,53 @@
 /**
  * @file src/services/whatsAppBot.js
- * @description RCM Titan Engine - Anti-Ban WhatsApp Bot
- * @architecture Redis Queue | Human Simulation | Stealth Mode
- * @capacity 5000+ Messages/Day safely
+ * @description RCM Titan Engine - "Next Gen" Omni-Channel Bot
+ * @features Cloud Redis (Upstash) | Rishika Persona | Multimedia Support | Anti-Ban
  */
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const stringSimilarity = require("string-similarity");
 const { Queue, Worker } = require('bullmq');
 const IORedis = require('ioredis');
+const path = require('path');
+const fs = require('fs');
 
 // Services
 const { getAIChatResponse } = require('./aiService'); 
 const { db } = require('../config/db');
-let { SYSTEM_PROMPT } = require('../utils/prompts');
+
+// 👇 IMPORTANT: Hum specifically 'WHATSAPP' wala prompt use karenge (Rishika)
+const { WHATSAPP_SYSTEM_PROMPT } = require('../utils/prompts');
 
 // ==============================================================================
-// ⚙️ CONFIGURATION & STEALTH
+// ⚙️ INTELLIGENT CONFIGURATION (Cloud + Local Support)
 // ==============================================================================
 const ADMIN_NUMBER = '919343743114@c.us'; 
-const REDIS_CONFIG = {
-    host: process.env.REDIS_HOST || '127.0.0.1',
-    port: process.env.REDIS_PORT || 6379,
-    maxRetriesPerRequest: null
-};
 
-// 🕵️ Browser ko chupaane ke settings
+// 🔌 Redis Connection Logic (The "Render Fix")
+// Agar Render par hain (REDIS_URL hai), to Cloud use karo.
+// Agar apne PC par hain, to Localhost use karo.
+let connection;
+
+if (process.env.REDIS_URL) {
+    // ☁️ CLOUD MODE (Render / Upstash)
+    console.log("🔗 Connecting to Cloud Redis (Upstash)...");
+    connection = new IORedis(process.env.REDIS_URL, {
+        maxRetriesPerRequest: null,
+        // TLS option zaroori hai secure connection ke liye
+        tls: { rejectUnauthorized: false } 
+    });
+} else {
+    // 🏠 LOCAL MODE (Apna PC)
+    console.log("🔗 Connecting to Local Redis...");
+    connection = new IORedis({
+        host: '127.0.0.1',
+        port: 6379,
+        maxRetriesPerRequest: null
+    });
+}
+
+// 🕵️ Stealth Browser Settings (Anti-Ban)
 const STEALTH_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -35,7 +56,7 @@ const STEALTH_ARGS = [
     '--no-first-run',
     '--no-zygote',
     '--disable-gpu',
-    '--disable-blink-features=AutomationControlled', // 👈 Sabse Important: Robot detection band
+    '--disable-blink-features=AutomationControlled',
     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 ];
 
@@ -43,53 +64,63 @@ let client;
 let isReady = false;
 
 // ==============================================================================
-// 🚦 TRAFFIC CONTROLLER (REDIS QUEUE)
+// 🚦 TRAFFIC CONTROLLER (Queue System)
 // ==============================================================================
-// Is queue me hum replies daalenge, jo dhire-dhire jayenge
-const connection = new IORedis(REDIS_CONFIG);
 const replyQueue = new Queue('whatsapp-human-replies', { connection });
 
-// 🧠 QUEUE WORKER (Ye background me act karega)
+// 🧠 WORKER (The Actor)
 const replyWorker = new Worker('whatsapp-human-replies', async (job) => {
-    const { chatId, text, isAiGenerated } = job.data;
+    const { chatId, text, mediaPath, isAiGenerated } = job.data;
     
     if (!client || !isReady) return;
 
     try {
         const chat = await client.getChatById(chatId);
         
-        // 🎭 ACTING PHASE 1: Thoda ruko (Thinking time)
-        const thinkDelay = Math.floor(Math.random() * 2000) + 1000; // 1-3 sec
+        // 🎭 ACTING PHASE 1: Human Delay (Thinking time)
+        // 1.5 se 3.5 second ka random delay
+        const thinkDelay = Math.floor(Math.random() * 2000) + 1500; 
         await new Promise(r => setTimeout(r, thinkDelay));
 
-        // 🎭 ACTING PHASE 2: Blue Tick (Mark as Read)
+        // 🎭 ACTING PHASE 2: Mark as Read (Blue Tick)
         await chat.sendSeen();
 
-        // 🎭 ACTING PHASE 3: Typing Simulation
-        // Jitna bada message, utni der typing dikhao
-        const typingDuration = Math.min((text.length * 50), 4000) + 1000; // Min 1s, Max 5s
-        await chat.sendStateTyping();
-        
-        await new Promise(r => setTimeout(r, typingDuration));
+        // 🎭 ACTING PHASE 3: Action (Photo or Text)
+        if (mediaPath && fs.existsSync(mediaPath)) {
+            // 📸 Agar Photo bhejni hai
+            console.log(`🖼️ Uploading Media to ${chatId}...`);
+            const media = MessageMedia.fromFilePath(mediaPath);
+            
+            // Photo upload hone ka time simulate karo
+            await chat.sendStateRecording(); 
+            await new Promise(r => setTimeout(r, 1000));
+            await chat.clearState();
 
-        // 🚀 FINAL: Message Bhejo
-        await client.sendMessage(chatId, text);
-        
-        // Typing band karo
-        await chat.clearState();
+            // Caption ke saath bhejo
+            await client.sendMessage(chatId, media, { caption: text });
 
-        console.log(`✅ Sent to ${chatId} (Human Delay: ${typingDuration}ms)`);
+        } else {
+            // 📝 Agar sirf Text bhejna hai
+            // Jitna lamba message, utni der typing dikhao (Human behavior)
+            const typingDuration = Math.min((text.length * 40), 5000) + 1000; 
+            
+            await chat.sendStateTyping();
+            await new Promise(r => setTimeout(r, typingDuration));
+            await chat.clearState();
+            
+            await client.sendMessage(chatId, text);
+        }
+
+        console.log(`✅ Sent to ${chatId}`);
 
     } catch (error) {
         console.error(`❌ Queue Error for ${chatId}:`, error.message);
     }
+
 }, { 
-    connection, 
-    concurrency: 1, // ⚠️ STRICTLY 1: Ek baar me 1 hi message bhejenge taaki ban na ho
-    limiter: {
-        max: 10,      // Max 10 messages
-        duration: 10000 // per 10 seconds (Rate Limiting)
-    } 
+    connection, // Cloud/Local connection automatically use hoga
+    concurrency: 1, // Ek baar mein 1 message (Safety ke liye)
+    limiter: { max: 10, duration: 10000 } // Rate limit: 10 msg per 10 sec
 });
 
 // ==============================================================================
@@ -102,7 +133,7 @@ function cleanInput(text) {
 }
 
 const initializeWhatsAppBot = () => {
-    console.log("🔄 Initializing Neural WhatsApp Engine...");
+    console.log("🔄 Initializing Neural WhatsApp Engine (Persona: Rishika)...");
 
     client = new Client({
         authStrategy: new LocalAuth({ dataPath: './auth_session' }),
@@ -113,79 +144,98 @@ const initializeWhatsAppBot = () => {
     });
 
     client.on('qr', (qr) => {
-        console.log('📱 QR RECEIVED:');
+        console.log('📱 QR RECEIVED (Scan karein):');
         qrcode.generate(qr, { small: true });
     });
 
     client.on('ready', () => {
-        console.log('✅ WhatsApp Neural Link Connected!');
+        console.log('✅ WhatsApp Connected! Rishika is Online.');
         isReady = true;
     });
 
     client.on('message', async (msg) => {
-        // 🛡️ Filter bad messages
+        // 🔍 Debugging Log (Ye dekhne ke liye ki message aa raha hai ya nahi)
+        console.log(`📩 MSG: ${msg.body} | FROM: ${msg.from}`);
+
+        // Ignore Status & Groups
         if (msg.body === 'status@broadcast' || msg.from.includes('@g.us')) return;
 
-        // Queue me daalne se server free ho jata hai
+        // Process Message
         handleIncomingMessage(msg);
     });
 
     client.initialize();
 };
 
-// 🧠 MESSAGE PROCESSOR (The Brain)
-// Ye function fast chalega, reply queue me dalega
+// 🧠 BRAIN (Decision Maker)
 async function handleIncomingMessage(msg) {
     try {
         const userMsgClean = cleanInput(msg.body);
         if (userMsgClean.length < 2) return; 
 
         let replyContent = "";
-        let isAiGenerated = false;
+        let mediaToSend = null;
 
-        // 1. 🔍 DATABASE CACHE (Fastest)
-        try {
-            const approvedFaqs = await db.FAQ.findAll({ where: { status: 'APPROVED' } });
-            if (approvedFaqs.length > 0) {
-                const questions = approvedFaqs.map(f => cleanInput(f.question));
-                const match = stringSimilarity.findBestMatch(userMsgClean, questions);
-                
-                if (match.bestMatch.rating > 0.75) {
-                    replyContent = approvedFaqs[match.bestMatchIndex].answer;
-                    isAiGenerated = false;
-                }
-            }
-        } catch (e) { console.warn("DB Read Error:", e.message); }
+        // ======================================================================
+        // 1. 🛒 PRODUCT IMAGE LOGIC (Example)
+        // ======================================================================
+        if (userMsgClean.includes('soap') || userMsgClean.includes('sabun')) {
+            mediaToSend = path.join(__dirname, '../public/images/soap.jpg');
+            replyContent = "Ye raha RCM ka best sabun! Neem aur Tulsi ke guno ke saath. 🌿";
+        }
+        else if (userMsgClean.includes('oil') || userMsgClean.includes('tel')) {
+            mediaToSend = path.join(__dirname, '../public/images/oil.jpg');
+            replyContent = "Health Guard Oil: Aapke dil ka rakshak. ❤️";
+        }
 
-        // 2. 🧠 AI GENERATION (Groq)
+        // ======================================================================
+        // 2. 🔍 DATABASE CACHE (Fast Answers)
+        // ======================================================================
         if (!replyContent) {
-            isAiGenerated = true;
             try {
-                // User ko turant reply mat karo, pehle soch lo
+                const approvedFaqs = await db.FAQ.findAll({ where: { status: 'APPROVED' } });
+                if (approvedFaqs.length > 0) {
+                    const questions = approvedFaqs.map(f => cleanInput(f.question));
+                    const match = stringSimilarity.findBestMatch(userMsgClean, questions);
+                    
+                    if (match.bestMatch.rating > 0.80) { // High confidence only
+                        replyContent = approvedFaqs[match.bestMatchIndex].answer;
+                    }
+                }
+            } catch (e) { console.warn("DB Cache Skip:", e.message); }
+        }
+
+        // ======================================================================
+        // 3. 🧠 AI GENERATION (Persona: Rishika)
+        // ======================================================================
+        if (!replyContent) {
+            try {
                 replyContent = await getAIChatResponse([
-                    { role: "system", content: SYSTEM_PROMPT },
+                    { role: "system", content: WHATSAPP_SYSTEM_PROMPT }, // Rishika Prompt
                     { role: "user", content: msg.body }
                 ]);
             } catch (e) { 
-                replyContent = "Abhi network busy hai, thodi der me puchiye.";
+                console.error("AI Error:", e.message);
+                replyContent = "Network issue hai sir, thodi der baad batati hoon! 🙏";
             }
         }
 
-        // 3. 🚦 ADD TO QUEUE (Direct Send Mat Karo!)
+        // ======================================================================
+        // 4. 🚦 SEND TO QUEUE
+        // ======================================================================
         if (replyContent) {
-            // Hum yahan reply nahi kar rahe, hum bas Queue Manager ko bol rahe hain
-            // ki "Jab free ho tab ye message bhej dena with acting"
             await replyQueue.add('send-reply', {
                 chatId: msg.from,
                 text: replyContent,
-                isAiGenerated
-            }, {
+                mediaPath: mediaToSend,
+                isAiGenerated: !mediaToSend
+            }, { 
                 removeOnComplete: true,
                 attempts: 3
             });
 
-            // Log for Admin
-            if (isAiGenerated && userMsgClean.length > 5) {
+            // Admin Log (Optional - Database me entry)
+            if (!mediaToSend && isAiGenerated) {
                 db.FAQ.create({
                     question: msg.body,
                     answer: replyContent,
@@ -200,7 +250,7 @@ async function handleIncomingMessage(msg) {
     }
 }
 
-// 🔔 ADMIN ALERT (Queued)
+// 🔔 ADMIN ALERT SYSTEM
 const sendAdminAlert = async (text, aiReply) => {
     await replyQueue.add('admin-alert', {
         chatId: ADMIN_NUMBER,
