@@ -1,54 +1,82 @@
 /**
  * @file server.js
- * @title RCM TITAN AGI ENGINE - GEN 3 (Optimized)
- * @description Hyper-Scale Neural Architecture for Render/Cloud Environments
+ * @title RCM TITAN AGI ENGINE - GEN 3
+ * @description Hyper-Scale Neural Architecture (TiDB & Redis Optimized)
  * @author RCM AI Labs
  */
 
 require('dotenv').config();
+const cluster = require('cluster');
+const os = require('os');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const hpp = require('hpp');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
-const { Queue } = require('bullmq');
 
 // ✅ SYNAPTIC IMPORTS
-const { connectDB } = require('./config/db');
-const connection = require('./config/redis'); // Central Redis
+const { connectDB } = require('./config/db'); // Ab ye TiDB (MySQL2) use karega
 const { initializeWhatsAppBot } = require('./services/whatsAppBot');
 
 // ⚙️ NEURAL CONFIGURATION
 const PORT = process.env.PORT || 10000;
+const TOTAL_CORES = process.env.NODE_ENV === 'production' ? os.cpus().length : 2;
 
 // ============================================================
-// 🏛️ CORE ENGINE INITIALIZATION
+// 🏛️ MASTER NODE: THE HIVE MIND
 // ============================================================
+if (cluster.isPrimary) {
+    console.clear();
+    const banner = `
+    ██████╗  ██████╗███╗   ███╗      █████╗ ██╗
+    ██╔══██╗██╔════╝████╗ ████║     ██╔══██╗██║
+    ██████╔╝██║     ██╔████╔██║     ███████║██║
+    ██╔══██╗██║     ██║╚██╔╝██║     ██╔══██║██║
+    ██║  ██║╚██████╗██║ ╚═╝ ██║     ██║  ██║██║
+    ╚═╝  ╚═╝ ╚═════╝╚═╝     ╚═╝     ╚═╝  ╚═╝╚═╝
+    
+    🚀 TITAN ENGINE: AGI-READY ONLINE
+    🧠 Master PID: ${process.pid}
+    💻 Synaptic Cores: ${TOTAL_CORES}
+    🗄️ Database: TiDB Cloud (MySQL)
+    ⚡ Cache: Cloud Redis Active
+    `;
+    console.log(banner);
+
+    // 🧬 Spawn Workers
+    for (let i = 0; i < TOTAL_CORES; i++) {
+        cluster.fork();
+    }
+
+    // ❤️ Self-Healing
+    cluster.on('exit', (worker) => {
+        console.warn(`⚠️ [CRITICAL] Node ${worker.process.pid} collapsed. Regenerating...`);
+        cluster.fork();
+    });
+
+} else {
+    // ============================================================
+    // 👷 WORKER NODE: THE NERVOUS SYSTEM
+    // ============================================================
+    igniteNeuralPathway();
+}
+
 async function igniteNeuralPathway() {
     const app = express();
 
-    // 1. 🚀 HYPER-SPEED OPTIMIZATIONS
-    app.set('trust proxy', 1); 
-    app.use(compression());    
+    // 1. 🚀 PERFORMANCE LAYERS
+    app.set('trust proxy', 1);
+    app.use(compression()); // 70% smaller payloads
 
-    // 2. 🛡️ MILITARY-GRADE SECURITY
-    app.disable('x-powered-by'); 
+    // 2. 🛡️ DEFENSE SYSTEMS (Security)
+    app.disable('x-powered-by');
     app.use(helmet({
-        crossOriginResourcePolicy: { policy: "cross-origin" },
-        contentSecurityPolicy: {
-            directives: {
-                defaultSrc: ["'self'"],
-                mediaSrc: ["'self'", "https://res.cloudinary.com", "blob:", "data:"],
-                imgSrc: ["'self'", "https://res.cloudinary.com", "data:", "blob:"],
-                scriptSrc: ["'self'", "'unsafe-inline'"],
-                connectSrc: ["'self'", "ws:", "wss:"],
-            },
-        },
+        contentSecurityPolicy: false, // UI access ke liye flexible rakha hai
     }));
-    app.use(hpp()); 
+    app.use(hpp());
 
-    // 3. 🌐 UNIVERSAL CORS (Professional Handling)
+    // 3. 🌐 CROSS-ORIGIN POLICY
     const allowedOrigins = [
         'https://rcm-ai-admin-ui.vercel.app',
         'https://rcmai.in',
@@ -61,80 +89,81 @@ async function igniteNeuralPathway() {
             if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
                 return callback(null, true);
             }
-            return callback(new Error('🚫 Firewall blocked this origin'), false);
+            return callback(new Error('🚫 Firewall: Origin Blocked'), false);
         },
         credentials: true
     }));
 
-    // 4. 📦 DATA INGESTION
-    app.use(express.json({ limit: '50mb' })); 
+    // 4. 📦 PAYLOAD HANDLERS
+    app.use(express.json({ limit: '50mb' }));
     app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-    // 5. 🚦 TRAFFIC CONTROL (DDoS Protection)
+    // 5. 🚦 TRAFFIC CONTROL (Anti-DDoS)
     const standardLimiter = rateLimit({
         windowMs: 1 * 60 * 1000, 
-        max: 1000, 
-        message: { error: "Traffic Limit Exceeded." },
+        max: 5000, 
+        message: { error: "Neural Overload. Please wait." },
         standardHeaders: true,
     });
 
     // ============================================================
-    // 🏛️ NEURAL ROUTES
+    // 6. 🛣️ NEURAL ROUTES
     // ============================================================
-    const banner = `
-    ██████╗  ██████╗███╗   ███╗      █████╗ ██╗
-    ██╔══██╗██╔════╝████╗ ████║     ██╔══██╗██║
-    ██████╔╝██║     ██╔████╔██║     ███████║██║
-    ██╔══██╗██║     ██║╚██╔╝██║     ██╔══██║██║
-    ██║  ██║╚██████╗██║ ╚═╝ ██║     ██║  ██║██║
-    ╚═╝  ╚═╝ ╚═════╝╚═╝     ╚═╝     ╚═╝  ╚═╝╚═╝
-    🚀 TITAN ENGINE: AGI-READY ONLINE
-    `;
-    console.log(banner);
-
-    // Heartbeat
-    app.get('/', (req, res) => res.status(200).json({ status: "ONLINE", engine: "Titan Gen-3" }));
     
-    // API Mapping
-    app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
-    app.use('/api/admin', require('./routes/adminRoutes'));
+    // Heartbeat Check
+    app.get('/', (req, res) => res.status(200).json({ 
+        status: "ACTIVE", 
+        engine: "TITAN Gen 3", 
+        db: "TiDB", 
+        node: process.pid 
+    }));
 
-    // 404 & Error Trap
+    // Authentication & Core
+    app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
+    app.use('/api/chat', standardLimiter, require('./routes/chatRoutes'));
+    app.use('/api/admin', require('./routes/adminRoutes'));
+    
+    // Payment & Features
+    const loadModule = (path, file) => { 
+        try { app.use(path, require(file)); } catch(e){ console.error(`Module ${file} not found`); } 
+    };
+    loadModule('/api/payment', './routes/paymentRoutes');
+    loadModule('/api/notifications', './routes/notificationRoutes');
+
+    // Error Traps
     app.use('*', (req, res) => res.status(404).json({ error: "Void Endpoint" }));
     app.use((err, req, res, next) => {
-        console.error(`🔥 [System Error]:`, err.message);
-        res.status(500).json({ error: "Internal Failure", details: err.message });
+        console.error(`🔥 Node ${process.pid} Error:`, err.message);
+        res.status(500).json({ error: "Internal Synapse Failure" });
     });
 
     // ============================================================
-    // 🚀 IGNITION
+    // 7. 🏁 IGNITION SEQUENCE
     // ============================================================
     try {
-        // A. Connect Database
-        await connectDB();
-        console.log('✅ MySQL Connectivity: Established');
+        // 🔥 TiDB Connection Check
+        await connectDB(); 
 
-        // B. Connect Redis
-        connection.on('ready', () => console.log('✅ Redis Event Bus: Online'));
+        const server = app.listen(PORT, () => {
+            console.log(`⚡ Node ${process.pid} Synced on Port ${PORT}`);
 
-        // C. Initialize WhatsApp (Baileys Engine)
-        // Memory optimize karne ke liye hum ise yahan se call karte hain
-        initializeWhatsAppBot();
-
-        // D. Start Server
-        const server = app.listen(PORT, '0.0.0.0', () => {
-            console.log(`⚡ Titan Engine listening on Port ${PORT}`);
+            // 🤖 WORKER 1: THE COMMANDER (Bot & Queue)
+            if (cluster.worker.id === 1) {
+                console.log("🕵️ Special Ops: Worker 1 assigned to WhatsApp/Queues");
+                setTimeout(() => {
+                    if (initializeWhatsAppBot) initializeWhatsAppBot(); 
+                }, 5000);
+            }
         });
 
-        // E. Keep-Alive Fix
-        server.keepAliveTimeout = 65000;
+        // Amazon-Scale Keep-Alive
+        server.keepAliveTimeout = 65000; 
         server.headersTimeout = 66000;
 
-        // F. Graceful Shutdown
+        // 🛑 GRACEFUL EXIT
         const shutdown = () => {
-            console.log('🛑 Initiating Graceful Shutdown...');
             server.close(() => {
-                console.log('✅ All connections closed. System Offline.');
+                console.log(`✅ Node ${process.pid} Terminated Safely.`);
                 process.exit(0);
             });
         };
@@ -143,9 +172,7 @@ async function igniteNeuralPathway() {
         process.on('SIGINT', shutdown);
 
     } catch (error) {
-        console.error(`❌ Critical System Failure:`, error);
+        console.error(`❌ Critical Synapse Failure:`, error.message);
         process.exit(1);
     }
 }
-
-igniteNeuralPathway();
