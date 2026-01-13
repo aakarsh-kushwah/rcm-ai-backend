@@ -1,6 +1,6 @@
 /**
  * @file src/services/whatsAppBot.js
- * @description RCM Titan Engine - Omni-Channel Bot (Fixed for Render Cloud)
+ * @description RCM Titan Engine - Omni-Channel Bot (Windows Safe Mode)
  */
 
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
@@ -10,7 +10,7 @@ const { Queue, Worker } = require('bullmq');
 const path = require('path');
 const fs = require('fs');
 
-// 👇 THE MAGIC FIX: Hum ab Central Config use kar rahe hain
+// 👇 Central Redis Config
 const connection = require('../config/redis'); 
 
 // Services
@@ -20,18 +20,49 @@ const { WHATSAPP_SYSTEM_PROMPT } = require('../utils/prompts');
 
 const ADMIN_NUMBER = '919343743114@c.us'; 
 
-// 🕵️ Stealth Browser Settings (Anti-Ban & Render Compatible)
-const STEALTH_ARGS = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--disable-gpu',
-    '--disable-blink-features=AutomationControlled',
-    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-];
+// ==============================================================================
+// 🕵️ SMART BROWSER CONFIGURATION (OS Detection Fix)
+// ==============================================================================
+
+// Logic: Lite Mode sirf tab on karo jab hum Render par hon, ya Linux par hon.
+// Agar Windows hai, to kabhi bhi Lite Mode mat lagao (kyunki wo crash karta hai).
+const isRenderCloud = process.env.RENDER || (process.platform === 'linux' && process.env.NODE_ENV === 'production');
+
+console.log(`🖥️ System Detected: ${process.platform}`);
+console.log(`🚀 Mode: ${isRenderCloud ? '☁️ CLOUD (Super Lite)' : '🏠 WINDOWS/LOCAL (Safe Mode)'}`);
+
+const STEALTH_ARGS = isRenderCloud 
+    ? [ 
+        // ☁️ CLOUD/LINUX SETTINGS (Aggressive RAM Saving)
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process', // ⚠️ SIRF LINUX KE LIYE
+        '--disable-gpu',
+        '--disable-gl-drawing-for-tests',
+        '--disable-software-rasterizer',
+        '--mute-audio',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-blink-features=AutomationControlled',
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      ]
+    : [
+        // 🏠 WINDOWS LOCAL SETTINGS (Crash Proof)
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        // Note: '--single-process' removed to prevent Windows crash
+      ];
 
 let client;
 let isReady = false;
@@ -41,7 +72,6 @@ let isReady = false;
 // ==============================================================================
 const replyQueue = new Queue('whatsapp-human-replies', { connection });
 
-// 🧠 WORKER (The Actor)
 const replyWorker = new Worker('whatsapp-human-replies', async (job) => {
     const { chatId, text, mediaPath, isAiGenerated } = job.data;
     
@@ -50,36 +80,25 @@ const replyWorker = new Worker('whatsapp-human-replies', async (job) => {
     try {
         const chat = await client.getChatById(chatId);
         
-        // 🎭 ACTING PHASE 1: Human Delay (Sochne ka natak)
+        // 🎭 ACTING PHASE
         const thinkDelay = Math.floor(Math.random() * 2000) + 1500; 
         await new Promise(r => setTimeout(r, thinkDelay));
-
-        // 🎭 ACTING PHASE 2: Mark as Read (Blue Tick)
         await chat.sendSeen();
 
-        // 🎭 ACTING PHASE 3: Action (Photo or Text)
         if (mediaPath && fs.existsSync(mediaPath)) {
-            // 📸 Photo Bhejo
             console.log(`🖼️ Uploading Media to ${chatId}...`);
             const media = MessageMedia.fromFilePath(mediaPath);
-            
-            await chat.sendStateRecording(); // Recording... dikhao
+            await chat.sendStateRecording(); 
             await new Promise(r => setTimeout(r, 1000));
             await chat.clearState();
-
             await client.sendMessage(chatId, media, { caption: text });
-
         } else {
-            // 📝 Text Bhejo
             const typingDuration = Math.min((text.length * 40), 5000) + 1000; 
-            
-            await chat.sendStateTyping(); // Typing... dikhao
+            await chat.sendStateTyping();
             await new Promise(r => setTimeout(r, typingDuration));
             await chat.clearState();
-            
             await client.sendMessage(chatId, text);
         }
-
         console.log(`✅ Sent to ${chatId}`);
 
     } catch (error) {
@@ -87,7 +106,7 @@ const replyWorker = new Worker('whatsapp-human-replies', async (job) => {
     }
 
 }, { 
-    connection, // 👈 Ye ab Central Config se aa raha hai
+    connection, 
     concurrency: 1, 
     limiter: { max: 10, duration: 10000 } 
 });
@@ -108,7 +127,7 @@ const initializeWhatsAppBot = () => {
         authStrategy: new LocalAuth({ dataPath: './auth_session' }),
         puppeteer: { 
             headless: true, 
-            args: STEALTH_ARGS
+            args: STEALTH_ARGS,
         }
     });
 
@@ -123,7 +142,6 @@ const initializeWhatsAppBot = () => {
     });
 
     client.on('message', async (msg) => {
-        // Ignore Status & Groups
         if (msg.body === 'status@broadcast' || msg.from.includes('@g.us')) return;
         handleIncomingMessage(msg);
     });
@@ -131,7 +149,6 @@ const initializeWhatsAppBot = () => {
     client.initialize();
 };
 
-// 🧠 BRAIN (Decision Maker)
 async function handleIncomingMessage(msg) {
     try {
         const userMsgClean = cleanInput(msg.body);
@@ -140,7 +157,7 @@ async function handleIncomingMessage(msg) {
         let replyContent = "";
         let mediaToSend = null;
 
-        // 1. 🛒 Product Images (Example)
+        // 1. Product Logic
         if (userMsgClean.includes('soap') || userMsgClean.includes('sabun')) {
             mediaToSend = path.join(__dirname, '../public/images/soap.jpg');
             replyContent = "Ye raha RCM ka best sabun! Neem aur Tulsi ke guno ke saath. 🌿";
@@ -150,14 +167,13 @@ async function handleIncomingMessage(msg) {
             replyContent = "Health Guard Oil: Aapke dil ka rakshak. ❤️";
         }
 
-        // 2. 🔍 Database Cache
+        // 2. DB Cache
         if (!replyContent) {
             try {
                 const approvedFaqs = await db.FAQ.findAll({ where: { status: 'APPROVED' } });
                 if (approvedFaqs.length > 0) {
                     const questions = approvedFaqs.map(f => cleanInput(f.question));
                     const match = stringSimilarity.findBestMatch(userMsgClean, questions);
-                    
                     if (match.bestMatch.rating > 0.80) {
                         replyContent = approvedFaqs[match.bestMatchIndex].answer;
                     }
@@ -165,7 +181,7 @@ async function handleIncomingMessage(msg) {
             } catch (e) { console.warn("DB Cache Skip:", e.message); }
         }
 
-        // 3. 🧠 AI Generation (Rishika)
+        // 3. AI Generation
         if (!replyContent) {
             try {
                 replyContent = await getAIChatResponse([
@@ -178,19 +194,15 @@ async function handleIncomingMessage(msg) {
             }
         }
 
-        // 4. 🚦 Send to Queue
+        // 4. Send to Queue
         if (replyContent) {
             await replyQueue.add('send-reply', {
                 chatId: msg.from,
                 text: replyContent,
                 mediaPath: mediaToSend,
                 isAiGenerated: !mediaToSend
-            }, { 
-                removeOnComplete: true,
-                attempts: 3
-            });
+            }, { removeOnComplete: true, attempts: 3 });
 
-            // Save to DB for review
             if (!mediaToSend && replyContent.length > 10) {
                 db.FAQ.create({
                     question: msg.body,
@@ -206,7 +218,6 @@ async function handleIncomingMessage(msg) {
     }
 }
 
-// 🔔 Admin Alert
 const sendAdminAlert = async (text, aiReply) => {
     await replyQueue.add('admin-alert', {
         chatId: ADMIN_NUMBER,
