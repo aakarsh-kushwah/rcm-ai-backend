@@ -1,78 +1,36 @@
 /**
  * @file server.js
- * @title RCM TITAN AGI ENGINE - GEN 3
- * @description Hyper-Scale Neural Architecture for AGI/ASI Systems
- * @architecture Master-Worker Hive | Redis Event Bus | Self-Healing
+ * @title RCM TITAN AGI ENGINE - GEN 3 (Optimized)
+ * @description Hyper-Scale Neural Architecture for Render/Cloud Environments
  * @author RCM AI Labs
  */
 
 require('dotenv').config();
-const cluster = require('cluster');
-const os = require('os');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const hpp = require('hpp');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
-const path = require('path');
-const { createBullBoard } = require('@bull-board/api'); // Optional: For visualizing queues
-const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
-const { ExpressAdapter } = require('@bull-board/express');
+const { Queue } = require('bullmq');
 
-// ✅ SYNAPTIC IMPORTS (Internal Layers)
-const { connectDB, db } = require('./config/db');
-const { initializeWhatsAppBot } = require('./services/whatsAppBot'); // Updated Queue Version
+// ✅ SYNAPTIC IMPORTS
+const { connectDB } = require('./config/db');
+const connection = require('./config/redis'); // Central Redis
+const { initializeWhatsAppBot } = require('./services/whatsAppBot');
 
 // ⚙️ NEURAL CONFIGURATION
 const PORT = process.env.PORT || 10000;
-// Production me saare CPU cores use honge, Dev me sirf 2
-const TOTAL_CORES = process.env.NODE_ENV === 'production' ? os.cpus().length : 2;
 
 // ============================================================
-// 🏛️ MASTER NODE (THE HIVE MIND)
+// 🏛️ CORE ENGINE INITIALIZATION
 // ============================================================
-if (cluster.isPrimary) {
-    console.clear();
-    const banner = `
-    ██████╗  ██████╗███╗   ███╗      █████╗ ██╗
-    ██╔══██╗██╔════╝████╗ ████║     ██╔══██╗██║
-    ██████╔╝██║     ██╔████╔██║     ███████║██║
-    ██╔══██╗██║     ██║╚██╔╝██║     ██╔══██║██║
-    ██║  ██║╚██████╗██║ ╚═╝ ██║     ██║  ██║██║
-    ╚═╝  ╚═╝ ╚═════╝╚═╝     ╚═╝     ╚═╝  ╚═╝╚═╝
-    
-    🚀 TITAN ENGINE: AGI-READY ARCHITECTURE
-    🧠 Master PID: ${process.pid}
-    💻 Synaptic Cores: ${TOTAL_CORES}
-    🛡️ Defense Systems: ACTIVE
-    `;
-    console.log(banner);
-
-    // 🧬 Spawn Workers (Clone Process)
-    for (let i = 0; i < TOTAL_CORES; i++) {
-        cluster.fork();
-    }
-
-    // ❤️ Self-Healing Protocol
-    cluster.on('exit', (worker, code, signal) => {
-        console.warn(`⚠️ [CRITICAL] Node ${worker.process.pid} died. Initiating Regeneration...`);
-        cluster.fork(); // Turant naya worker paida karo
-    });
-
-} else {
-    // ============================================================
-    // 👷 WORKER NODE (THE NERVOUS SYSTEM)
-    // ============================================================
-    igniteNeuralPathway();
-}
-
 async function igniteNeuralPathway() {
     const app = express();
 
     // 1. 🚀 HYPER-SPEED OPTIMIZATIONS
-    app.set('trust proxy', 1); // For AWS/Vercel Load Balancers
-    app.use(compression());    // Gzip Compression (Reduces payload by 70%)
+    app.set('trust proxy', 1); 
+    app.use(compression());    
 
     // 2. 🛡️ MILITARY-GRADE SECURITY
     app.disable('x-powered-by'); 
@@ -84,13 +42,13 @@ async function igniteNeuralPathway() {
                 mediaSrc: ["'self'", "https://res.cloudinary.com", "blob:", "data:"],
                 imgSrc: ["'self'", "https://res.cloudinary.com", "data:", "blob:"],
                 scriptSrc: ["'self'", "'unsafe-inline'"],
-                connectSrc: ["'self'", "ws:", "wss:"], // WebSockets allowed
+                connectSrc: ["'self'", "ws:", "wss:"],
             },
         },
     }));
-    app.use(hpp()); // HTTP Parameter Pollution Shield
+    app.use(hpp()); 
 
-    // 3. 🌐 UNIVERSAL CORS (Allowed Origins)
+    // 3. 🌐 UNIVERSAL CORS (Professional Handling)
     const allowedOrigins = [
         'https://rcm-ai-admin-ui.vercel.app',
         'https://rcmai.in',
@@ -108,77 +66,75 @@ async function igniteNeuralPathway() {
         credentials: true
     }));
 
-    // 4. 📦 DATA INGESTION (High Capacity)
-    app.use(express.json({ limit: '100mb' })); 
-    app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+    // 4. 📦 DATA INGESTION
+    app.use(express.json({ limit: '50mb' })); 
+    app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-    // 5. 🚦 INTELLIGENT TRAFFIC CONTROL (DDoS Protection)
+    // 5. 🚦 TRAFFIC CONTROL (DDoS Protection)
     const standardLimiter = rateLimit({
         windowMs: 1 * 60 * 1000, 
-        max: 5000, // 5000 req/min (Amazon Scale)
-        message: { error: "Traffic Limit Exceeded. Cooling down..." },
+        max: 1000, 
+        message: { error: "Traffic Limit Exceeded." },
         standardHeaders: true,
     });
 
     // ============================================================
-    // 7. 🛣️ NEURAL ROUTES
+    // 🏛️ NEURAL ROUTES
     // ============================================================
-    
+    const banner = `
+    ██████╗  ██████╗███╗   ███╗      █████╗ ██╗
+    ██╔══██╗██╔════╝████╗ ████║     ██╔══██╗██║
+    ██████╔╝██║     ██╔████╔██║     ███████║██║
+    ██╔══██╗██║     ██║╚██╔╝██║     ██╔══██║██║
+    ██║  ██║╚██████╗██║ ╚═╝ ██║     ██║  ██║██║
+    ╚═╝  ╚═╝ ╚═════╝╚═╝     ╚═╝     ╚═╝  ╚═╝╚═╝
+    🚀 TITAN ENGINE: AGI-READY ONLINE
+    `;
+    console.log(banner);
+
     // Heartbeat
-    app.get('/', (req, res) => res.status(200).json({ status: "ONLINE", node: process.pid, load: os.loadavg() }));
-    app.use('/api/health', require('./routes/health'));
-
-    // Core Logic
-    app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
-    app.use('/api/chat', standardLimiter, require('./routes/chatRoutes'));
-    app.use('/api/admin', require('./routes/adminRoutes')); // No limit for admin
+    app.get('/', (req, res) => res.status(200).json({ status: "ONLINE", engine: "Titan Gen-3" }));
     
-    // Optional Modules (Safe Load)
-    const loadModule = (path, file) => { try { app.use(path, require(file)); } catch(e){} };
-    loadModule('/api/payment', './routes/paymentRoutes');
-    loadModule('/api/notifications', './routes/notificationRoutes');
+    // API Mapping
+    app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
+    app.use('/api/admin', require('./routes/adminRoutes'));
 
-    // 404 & Global Error Trap
-    app.use('*', (req, res) => res.status(404).json({ error: "Void Endpoint Detected" }));
+    // 404 & Error Trap
+    app.use('*', (req, res) => res.status(404).json({ error: "Void Endpoint" }));
     app.use((err, req, res, next) => {
-        console.error(`🔥 [Node ${process.pid} Error]:`, err.message);
-        res.status(500).json({ error: "Internal Synapse Failure", details: err.message });
+        console.error(`🔥 [System Error]:`, err.message);
+        res.status(500).json({ error: "Internal Failure", details: err.message });
     });
 
     // ============================================================
-    // 8. 🏁 IGNITION SEQUENCE
+    // 🚀 IGNITION
     // ============================================================
     try {
-        await connectDB(); // Database Link
+        // A. Connect Database
+        await connectDB();
+        console.log('✅ MySQL Connectivity: Established');
 
-        const server = app.listen(PORT, () => {
-            console.log(`⚡ Node ${process.pid} Active on PORT ${PORT}`);
+        // B. Connect Redis
+        connection.on('ready', () => console.log('✅ Redis Event Bus: Online'));
 
-            // 🤖 SPECIALIZED WORKER ASSIGNMENT
-            // Worker 1 = The Communications Officer (WhatsApp + Queue Processor)
-            // Workers 2,3,4... = The API Handlers (Fast Response)
-            
-            if (cluster.worker.id === 1) {
-                console.log("\n🕵️ [SPECIAL OPS] Worker 1 Assigned to WhatsApp & Queue Processing");
-                console.log("---------------------------------------------------------------");
-                
-                // Thoda delay taaki DB/Redis stable ho jaye
-                setTimeout(() => {
-                    initializeWhatsAppBot(); 
-                }, 3000);
-            }
+        // C. Initialize WhatsApp (Baileys Engine)
+        // Memory optimize karne ke liye hum ise yahan se call karte hain
+        initializeWhatsAppBot();
+
+        // D. Start Server
+        const server = app.listen(PORT, '0.0.0.0', () => {
+            console.log(`⚡ Titan Engine listening on Port ${PORT}`);
         });
 
-        // 🛠️ Keep-Alive Optimization (Fixes 502 Bad Gateway on AWS/Nginx)
-        server.keepAliveTimeout = 65000; 
+        // E. Keep-Alive Fix
+        server.keepAliveTimeout = 65000;
         server.headersTimeout = 66000;
 
-        // 🛑 GRACEFUL SHUTDOWN (Zero Data Loss)
+        // F. Graceful Shutdown
         const shutdown = () => {
-            console.log(`🛑 Node ${process.pid} shutting down gracefully...`);
+            console.log('🛑 Initiating Graceful Shutdown...');
             server.close(() => {
-                console.log('✅ Server Closed.');
-                // Database aur Redis connections yahan close kar sakte hain
+                console.log('✅ All connections closed. System Offline.');
                 process.exit(0);
             });
         };
@@ -187,7 +143,9 @@ async function igniteNeuralPathway() {
         process.on('SIGINT', shutdown);
 
     } catch (error) {
-        console.error(`❌ Critical Failure on Node ${process.pid}:`, error);
+        console.error(`❌ Critical System Failure:`, error);
         process.exit(1);
     }
 }
+
+igniteNeuralPathway();

@@ -16,3 +16,7 @@ auth_session/
 npm-debug.log
 logs/
 *.log
+
+# baileys for watsapp ai
+auth_baileys/
+auth_info_baileys/
