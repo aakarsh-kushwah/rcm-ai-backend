@@ -1,6 +1,7 @@
 /**
- * @file chatController.js
- * @description DB Audio Priority → AI → No DB Pollution → Admin Alert
+ * @file src/controllers/chatController.js
+ * @description Logic: DB Audio Priority -> AI Generation -> No DB Save -> Admin Alert.
+ * @status Production Ready (Fixed Associations)
  */
 
 const asyncHandler = require('express-async-handler');
@@ -14,7 +15,7 @@ const { db } = require('../config/db');
 let { SYSTEM_PROMPT } = require('../utils/prompts');
 
 // ============================================================
-// 🟡 ADMIN ALERT (UNCHANGED – REQUIRED)
+// 🟡 ADMIN ALERT WRAPPER (Safe Mode)
 // ============================================================
 let sendAdminAlert = async () => {};
 try {
@@ -29,28 +30,25 @@ const sanitizeInput = (text = "") =>
     text.substring(0, 500).trim().replace(/[<>{}]/g, "");
 
 // ============================================================
-// 🚀 USER → AI CHAT
+// 🚀 USER → AI CHAT (CORE LOGIC)
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
-    
-    // ✅ FIX: UserId ko Securely Token (req.user) se nikalein, fallback body par rakhein
-    // isAuthenticated middleware req.user set karta hai.
+
+    // ✅ CRITICAL: Get userId from Token (req.user) FIRST
     let userId = req.user ? req.user.id : req.body.userId;
     
-    // Ensure userId integer format me ho
+    // Ensure userId is a valid integer
     userId = userId ? parseInt(userId, 10) : null;
 
-    const { message } = req.body; 
+    const { message } = req.body;
 
     if (!message) {
         return res.status(400).json({ success: false, message: "Message missing" });
     }
 
     const cleanMsg = sanitizeInput(message);
-    const matchText = cleanMsg
-        .toLowerCase()
-        .replace(/[^\w\s\u0900-\u097F]/gi, '');
+    const matchText = cleanMsg.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, '');
 
     let replyContent = "";
     let audioUrl = "";
@@ -72,8 +70,14 @@ const handleChat = asyncHandler(async (req, res) => {
             if (match.bestMatch.rating > 0.75) {
                 const faq = faqs[match.bestMatchIndex];
                 replyContent = faq.answer;
-                audioUrl = faq.audioUrl || "";
-                source = faq.audioUrl ? "DB_AUDIO_HIT" : "DB_TEXT_ONLY";
+                
+                // Use DB audio only if valid
+                if (faq.audioUrl && faq.audioUrl.length > 5) {
+                    audioUrl = faq.audioUrl;
+                    source = "DB_AUDIO_HIT";
+                } else {
+                    source = "DB_TEXT_ONLY";
+                }
             }
         }
     } catch (err) {
@@ -81,7 +85,7 @@ const handleChat = asyncHandler(async (req, res) => {
     }
 
     // ========================================================
-    // 2️⃣ AI FALLBACK
+    // 2️⃣ AI FALLBACK (If DB match failed)
     // ========================================================
     if (!replyContent) {
         try {
@@ -90,79 +94,101 @@ const handleChat = asyncHandler(async (req, res) => {
                 { role: "user", content: cleanMsg }
             ]);
         } catch {
-            replyContent = "Temporary network issue.";
+            replyContent = "Temporary network issue. Please try again.";
         }
 
-        try {
-            audioUrl = await generateEdgeAudio(replyContent);
-        } catch {
-            audioUrl = "";
+        // Generate Audio for AI response
+        if (replyContent) {
+            try {
+                audioUrl = await generateEdgeAudio(replyContent);
+            } catch {
+                audioUrl = "";
+            }
         }
     }
 
     // ========================================================
-    // 3️⃣ RESPONSE
+    // 3️⃣ SEND RESPONSE TO USER
     // ========================================================
     res.status(200).json({
         success: true,
         message: replyContent,
         reply: replyContent,
-        audioUrl,
+        audioUrl: audioUrl || "",
         source,
         latency: `${Date.now() - start}ms`
     });
 
-    // ============================================================
-    // 5. 📦 LOGGING & ALERTS (Fix applied here)
-    // ============================================================
+    // ========================================================
+    // 4️⃣ ASYNC LOGGING (DB SAVE)
+    // ========================================================
     setImmediate(async () => {
         try {
-            // ✅ FIX: Ab userId req.user se aa raha hai, to ye undefined nahi hoga
+            // Only save if we have a valid User ID
             if (userId && !isNaN(userId)) {
-                await db.ChatMessage.create({ 
-                    userId: userId, 
-                    sender: "USER", 
-                    message: cleanMsg, 
-                    response: replyContent, 
-                    audioUrl: audioUrl || "" 
+                await db.ChatMessage.create({
+                    userId: userId,
+                    sender: "USER",
+                    message: cleanMsg,
+                    response: replyContent,
+                    audioUrl: audioUrl || ""
                 });
-                // console.log("✅ Chat Saved to DB for User:", userId);
             } else {
-                console.warn(`⚠️ Chat NOT Saved: Invalid userId. (Req User: ${req.user ? 'Present' : 'Missing'}, Body ID: ${req.body.userId})`);
+                console.warn(`⚠️ Chat NOT Saved: userId missing. (Token: ${req.user ? 'OK' : 'Missing'})`);
             }
 
-            // 2. Alert Logic
-            if (source === "AI_LIVE" && userMsgForMatching.length > 5) {
-                sendAdminAlert(cleanMsg, replyContent).catch(err => console.log("Alert Error:", err.message));
+            // Admin Alert for new AI queries
+            if (source === "AI_LIVE" && matchText.length > 5) {
+                sendAdminAlert(cleanMsg, replyContent).catch(() => {});
             }
-        } catch (e) {
-            console.error("❌ Chat Logging Error:", e.message);
+        } catch (err) {
+            console.error("Chat Log Error:", err.message);
         }
     });
 });
 
 // ============================================================
-// 🧑‍💼 ADMIN → CHAT USERS LIST
+// 🧑‍💼 ADMIN DASHBOARD: GET CHAT USERS
 // ============================================================
 const getAllChatUsers = asyncHandler(async (req, res) => {
+    // Prevent caching for real-time admin view
     res.set("Cache-Control", "no-store");
 
-    const rows = await db.ChatMessage.findAll({
-        attributes: ['userId'],
-        group: ['userId'],
-        include: [{
-            model: db.User,
-            attributes: ['id', 'fullName', 'email']
-        }],
-        order: [['createdAt', 'DESC']]
-    });
+    try {
+        const rows = await db.ChatMessage.findAll({
+            attributes: [
+                'userId',
+                // ✅ FIX: Get the LATEST message time for sorting
+                [db.sequelize.fn('MAX', db.sequelize.col('ChatMessage.createdAt')), 'lastMessageAt']
+            ],
+            group: ['userId'], // Group by User
+            include: [{
+                model: db.User,
+                as: 'User', 
+                attributes: ['id', 'fullName', 'email']
+            }],
+            // ✅ FIX: Order by the calculated 'lastMessageAt'
+            order: [[db.sequelize.literal('lastMessageAt'), 'DESC']]
+        });
 
-    const users = rows.map(r => r.User).filter(Boolean);
-    res.json({ success: true, data: users });
+        // Filter valid users
+        const users = rows.map(r => {
+            if (!r.User) return null;
+            // Optional: Attach last message time to user object for frontend
+            const userJson = r.User.toJSON();
+            userJson.lastMessageAt = r.getDataValue('lastMessageAt');
+            return userJson;
+        }).filter(Boolean);
+
+        res.json({ success: true, data: users });
+    } catch (error) {
+        console.error("Get Users Error:", error.message);
+        res.status(500).json({ success: false, message: "Failed to fetch users" });
+    }
 });
 
 // ============================================================
-// 🧑‍💼 ADMIN → CHAT HISTORY (PAGINATED)
+// 🧑‍💼 ADMIN DASHBOARD: GET USER HISTORY
 // ============================================================
 const getChatHistoryByUser = asyncHandler(async (req, res) => {
     const { userId } = req.params;
@@ -170,29 +196,29 @@ const getChatHistoryByUser = asyncHandler(async (req, res) => {
     const limit = 30;
     const offset = (page - 1) * limit;
 
-    // 🚫 STOP 304 CACHE
-    res.set({
-        "Cache-Control": "no-store, no-cache, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0"
-    });
+    res.set({ "Cache-Control": "no-store" });
 
-    const messages = await db.ChatMessage.findAll({
-        where: { userId },
-        order: [['createdAt', 'ASC']],
-        limit,
-        offset
-    });
+    try {
+        const messages = await db.ChatMessage.findAll({
+            where: { userId },
+            order: [['createdAt', 'ASC']],
+            limit,
+            offset
+        });
 
-    res.status(200).json({
-        success: true,
-        page,
-        data: messages
-    });
+        res.status(200).json({
+            success: true,
+            page,
+            data: messages
+        });
+    } catch (error) {
+        console.error("History Error:", error.message);
+        res.status(500).json({ success: false, message: "Failed to fetch history" });
+    }
 });
 
 // ============================================================
-// 🛡️ ADMIN → ADD SMART RESPONSE
+// 🛡️ ADMIN: ADD SMART RESPONSE
 // ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
     const { question, answer } = req.body;
@@ -217,7 +243,7 @@ const addSmartResponse = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🛡️ ADMIN → UPGRADE FAQ
+// 🛡️ ADMIN: UPGRADE FAQ
 // ============================================================
 const upgradeToPremium = asyncHandler(async (req, res) => {
     const { faqId, answer } = req.body;
@@ -229,6 +255,7 @@ const upgradeToPremium = asyncHandler(async (req, res) => {
 
     const updateData = { status: 'APPROVED' };
     if (answer) updateData.answer = answer;
+    
     if (req.file) {
         updateData.audioUrl = await uploadAudioToCloudinary(
             req.file.buffer,
@@ -241,7 +268,7 @@ const upgradeToPremium = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🔊 DIRECT TTS
+// 🔊 DIRECT TTS (Text to Speech)
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
@@ -261,8 +288,6 @@ module.exports = {
     handleSpeak,
     addSmartResponse,
     upgradeToPremium,
-
-    // 🔥 ADMIN CHAT VIEW
     getAllChatUsers,
     getChatHistoryByUser
 };
