@@ -1,152 +1,134 @@
+/**
+ * @file db.js
+ * @description Hyper-Scale Database Engine (TiDB Optimized)
+ * @target Capacity: High Throughput / Low Latency
+ */
+
 require('dotenv').config();
-const mysql = require('mysql2/promise');
 const { Sequelize } = require('sequelize');
+const fs = require('fs');
 const path = require('path');
+const os = require('os'); // CPU cores count karne ke liye
 
-// 1. Config.json Load Logic
+// 1. 🛡️ Config Loader
 let fileConfig = {};
-try { 
-    fileConfig = require('./config.json'); 
-} catch (e) { 
-    console.warn("⚠️ config.json not found, falling back to ENV variables.");
-}
+try { fileConfig = require('../config.json'); } catch (e) { }
 
-const db = {};
-
-// 2. SSL Configuration (TiDB Requires This)
+// 2. 🔐 TiDB & SSL Configuration
 const tidbSSL = {
     require: true,
-    rejectUnauthorized: true, 
+    rejectUnauthorized: true,
     minVersion: 'TLSv1.2'
 };
 
+const DB_HOST = process.env.DB_HOST || fileConfig.database?.host;
+const DB_USER = process.env.DB_USER || fileConfig.database?.user;
+const DB_PASS = process.env.DB_PASSWORD || fileConfig.database?.password;
+const DB_NAME = process.env.DB_NAME || 'rcm_db';
+const DB_PORT = process.env.DB_PORT || 4000;
+
+// 🧠 SMART POOL CALCULATION
+// Node.js single threaded hai. Agar aapke server par 4 vCPU hain, 
+// to bahut zyada connections open karne se performance gir jayegi.
+// Rule: (CPU Cores * 2) + Systematic buffer
+const CPU_CORES = os.cpus().length;
+const POOL_MAX = process.env.DB_POOL_MAX ? parseInt(process.env.DB_POOL_MAX) : (CPU_CORES * 5) + 10; 
+
+// 🚀 REPLICATION (Read/Write Splitting)
+const REPLICATION_CONFIG = {
+    read: [
+        { host: process.env.DB_READ_HOST_1 || DB_HOST, username: DB_USER, password: DB_PASS },
+        // TiDB automatically load balance karta hai, lekin agar aapke paas
+        // specific read-only nodes hain, unhe yahan list karein.
+    ],
+    write: { host: DB_HOST, username: DB_USER, password: DB_PASS }
+};
+
 const dbConfig = {
-    host: process.env.DB_HOST || fileConfig.database?.host,
-    user: process.env.DB_USER || fileConfig.database?.user,
-    password: process.env.DB_PASSWORD || fileConfig.database?.password,
-    database: process.env.DB_NAME || fileConfig.database?.database || 'rcm_db',
-    port: process.env.DB_PORT || fileConfig.database?.port || 4000,
-    dialect: 'mysql',
+    dialect: 'mysql', // TiDB is MySQL compatible
+    port: DB_PORT,
     
-    // 🔥 UPDATED: Connection Pool Optimized for 5000+ Users (Render Free Tier)
+    // 🌊 TITAN POOLING (Optimized for Stability under Load)
     pool: {
-        max: 20,     // Max 20 connections (Safe for 512MB RAM)
-        min: 2,      // 2 always ready for speed
-        acquire: 60000, // 60s timeout prevents crash under load
-        idle: 10000  // Release unused connections quickly
+        max: POOL_MAX, 
+        min: 10,       // Hamesha 10 connection ready rakho (Warm pool)
+        acquire: 15000, // Agar 15s me connection na mile, to error do (Queue mat banne do)
+        idle: 10000,    // 10s free rahe to connection kaat do
+        evict: 5000     
     },
-    
+
     dialectOptions: {
-        decimalNumbers: true, 
-        supportBigNumbers: true,
-        bigNumberStrings: true,
-        connectTimeout: 60000,
+        decimalNumbers: true,
+        connectTimeout: 10000, // Fast fail
         charset: 'utf8mb4',
-        ssl: tidbSSL
-    },
-    
-    timezone: '+05:30', // IST Timezone
-    logging: false 
-};
-
-// Helper to safely load models
-const loadModel = (sequelize, filePath, modelName) => {
-    try {
-        const modelDef = require(filePath);
-        db[modelName] = modelDef(sequelize, Sequelize);
-    } catch (e) {
-        console.warn(`⚠️ Note: Model ${modelName} skipped/missing.`);
-    }
-};
-
-async function initialize() {
-    try {
-        console.log(`📡 Connecting to Database Host: ${dbConfig.host}`);
-
-        // 1. Pre-flight Check
-        try {
-            const connection = await mysql.createConnection({
-                host: dbConfig.host, 
-                port: dbConfig.port, 
-                user: dbConfig.user, 
-                password: dbConfig.password,
-                connectTimeout: 20000,
-                ssl: tidbSSL
-            });
-            await connection.end();
-        } catch (preError) {
-            console.warn("⚠️ Pre-flight check warning:", preError.message);
-        }
-
-        // 2. Initialize Sequelize
-        const sequelize = new Sequelize(dbConfig.database, dbConfig.user, dbConfig.password, {
-            host: dbConfig.host, 
-            port: dbConfig.port, 
-            dialect: dbConfig.dialect,
-            pool: dbConfig.pool, 
-            dialectOptions: dbConfig.dialectOptions, 
-            timezone: dbConfig.timezone,
-            define: {
-                charset: 'utf8mb4',
-                collate: 'utf8mb4_unicode_ci',
-                timestamps: true
-            },
-            logging: false, 
-        });
-
-        // 3. Authenticate
-        await sequelize.authenticate();
-        console.log('🚀 TiDB Database Connection: ESTABLISHED');
-
-        // --- MODEL REGISTRY ---
-        loadModel(sequelize, '../models/user.model', 'User');
-        loadModel(sequelize, '../models/chatMessage.model', 'ChatMessage');
-        loadModel(sequelize, '../models/VoiceResponse', 'VoiceResponse');
-        loadModel(sequelize, '../models/FAQ', 'FAQ');
-        loadModel(sequelize, '../models/DailyReport.model', 'DailyReport');
-        loadModel(sequelize, '../models/leaderVideo.model', 'LeaderVideo');
-        loadModel(sequelize, '../models/productVideo.model', 'ProductVideo');
-        loadModel(sequelize, '../models/subscriber.model', 'Subscriber'); 
-        loadModel(sequelize, '../models/Payment', 'Payment');
-
-        // Associations
-        Object.keys(db).forEach(modelName => {
-            if (db[modelName] && db[modelName].associate) {
-                db[modelName].associate(db);
-            }
-        });
+        ssl: tidbSSL,
         
-        // Manual Associations (Fallback)
-        if (db.User && db.ChatMessage) {
-            db.User.hasMany(db.ChatMessage, { foreignKey: 'userId', as: 'chatMessages' });
-            db.ChatMessage.belongsTo(db.User, { foreignKey: 'userId', as: 'User' });
-        }
+        // ⚡ CRITICAL PERFORMANCE FLAGS FOR TiDB
+        compress: true,       // Network latency kam karega
+        dateStrings: true,    
+        typeCast: true,
+        flags: '-FOUND_ROWS', 
+        multipleStatements: false // Security & Speed ke liye false rakhein
+    },
 
-        if(db.DailyReport && db.User) {
-             db.User.hasMany(db.DailyReport, { foreignKey: 'user_id' });
-             db.DailyReport.belongsTo(db.User, { foreignKey: 'user_id' });
-        }
+    timezone: '+05:30',
+    benchmark: false, // Production me Benchmark band rakhein (CPU bachane ke liye)
+    logging: false    // ⚠️ ABSOLUTELY ZERO LOGGING for Maximum Speed
+};
 
-        db.Sequelize = Sequelize;
-        db.sequelize = sequelize;
+const db = {};
+let sequelize;
 
-        // 🛡️ SYNC STRATEGY (Updated with Safety)
-        console.log("⏳ Syncing Models...");
-        try {
-            await sequelize.sync({ alter: true });
-            console.log(`✅ System Online & Models Synced.`);
-        } catch (syncErr) {
-            console.warn("⚠️ TiDB 'Alter' Error (Ignored):", syncErr.message);
-            console.log("🔄 Trying Safe Sync (No Alter)...");
-            // Agar alter fail hua, to normal sync try karega (Data loss nahi hoga)
-            await sequelize.sync(); 
-            console.log(`✅ System Online (Safe Mode).`);
-        }
-
-    } catch (error) {
-        console.error('🔥 FATAL DB ERROR:', error.original ? error.original.message : error.message);
-        throw error;
+// 4. 🧠 Initialize Sequelize
+sequelize = new Sequelize(DB_NAME, null, null, {
+    replication: REPLICATION_CONFIG,
+    dialect: dbConfig.dialect,
+    pool: dbConfig.pool,
+    dialectOptions: dbConfig.dialectOptions,
+    timezone: dbConfig.timezone,
+    logging: dbConfig.logging,
+    
+    // Query Parsing Optimization
+    query: { raw: true }, // 🚀 Raw queries are faster (Sequelize models wrap data, which is slow)
+    
+    define: {
+        charset: 'utf8mb4',
+        collate: 'utf8mb4_unicode_ci',
+        timestamps: true,
+        underscored: false
     }
+});
+
+// 5. 🔄 Auto-Discovery (Standard)
+const modelsPath = path.join(__dirname, '../models');
+if (fs.existsSync(modelsPath)) {
+    fs.readdirSync(modelsPath)
+        .filter(file => file.endsWith('.js') && file.indexOf('.test.js') === -1)
+        .forEach(file => {
+            try {
+                const modelDef = require(path.join(modelsPath, file));
+                const model = typeof modelDef === 'function' ? modelDef(sequelize, Sequelize.DataTypes) : modelDef;
+                if (model?.name) db[model.name] = model;
+            } catch (err) { console.error(`❌ Model Error: ${file}`, err.message); }
+        });
 }
 
-module.exports = { db, initialize };
+Object.keys(db).forEach(modelName => {
+    if (db[modelName].associate) db[modelName].associate(db);
+});
+
+db.sequelize = sequelize;
+db.Sequelize = Sequelize;
+
+// 🛡️ CONNECTION HANDLER
+const connectDB = async () => {
+    try {
+        await sequelize.authenticate();
+        console.log(`✅ Database Connected. Pool Size: ${POOL_MAX}`);
+    } catch (err) {
+        console.error("🔥 DB Connection Failed:", err.message);
+        process.exit(1); // Kubernetes/Docker will restart it
+    }
+};
+
+module.exports = { db, connectDB };
