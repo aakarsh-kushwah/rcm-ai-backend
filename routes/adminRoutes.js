@@ -1,51 +1,81 @@
-// routes/adminRoutes.js
+/**
+ * @file routes/adminRoutes.js
+ * @description TITAN ADMIN COMMAND CENTER (GEN-6)
+ * @security Level 5: Auth + Admin Check + Rate Limiting + Validation
+ */
 
 const express = require('express');
 const router = express.Router();
+const rateLimit = require('express-rate-limit');
 
+// ✅ Import Controller Functions
 const { 
   getRegularUsers, 
   getAllAdmins,
   deleteUser,
-  updateUserData 
+  updateUserData,
+  pushNotificationToAll // ✨ New ASI Feature
 } = require('../controllers/adminController');
 
+// ✅ Import Middleware
 const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware');
 
-// 🔐 Protect all admin routes
+// ============================================================
+// 🛡️ SECURITY CONFIGURATION
+// ============================================================
+
+// 1. GLOBAL GUARD: Protect ALL routes in this file
+// Koi bhi bina login ya bina Admin role ke is file ko touch nahi kar sakta.
 router.use(isAuthenticated, isAdmin);
 
-// ================================
-// USERS
-// ================================
+// 2. SAFETY VALVE: Notification Blast Limiter
+// Rule: 15 minute me sirf 5 baar 'Mass Notification' allowed hai.
+const blastLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 Minutes
+    max: 5, // Limit
+    message: { 
+        success: false, 
+        message: "⚠️ Titan Cooling Down: Broadcast limit reached. Try again in 15 mins." 
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 
-// ✅ Get all non-admin users
-// URL: GET /api/admin/users
-router.get('/users', getRegularUsers);
+// ============================================================
+// 👥 MODULE A: USER MANAGEMENT OPS
+// ============================================================
 
-// 🔁 OPTIONAL ALIAS (for chat UI compatibility)
-// URL: GET /api/chat/all
+// 1. Get Regular Users (Dashboard Data)
+// URL: GET /api/admin/users/regular
+router.get('/users/regular', getRegularUsers);
+
+// 2. Chat Alias (For Chat System Compatibility)
+// URL: GET /api/admin/chat/all
 router.get('/chat/all', getRegularUsers);
 
-// ================================
-// ADMINS
-// ================================
-
+// 3. Get All Admins (Team Management)
 // URL: GET /api/admin/admins
 router.get('/admins', getAllAdmins);
 
-// ================================
-// DELETE USER
-// ================================
+// 4. Update User Profile (CRM)
+// URL: PATCH /api/admin/users/:userId
+router.patch('/users/:userId', updateUserData);
 
+// 5. Hard Delete User (Cleanup)
 // URL: DELETE /api/admin/users/:userId
 router.delete('/users/:userId', deleteUser);
 
-// ================================
-// UPDATE USER
-// ================================
+// ============================================================
+// 🚀 MODULE B: TITAN NOTIFICATION WAR ROOM
+// ============================================================
 
-// URL: PATCH /api/admin/users/:userId
-router.patch('/users/:userId', updateUserData);
+// 1. Titan Blast: Send Push Notification to ALL Users
+// Features: Parallel Batching, Rich Media, Deep Linking
+// URL: POST /api/admin/notifications/send-all
+router.post(
+    '/notifications/send-all', 
+    blastLimiter, // 🛡️ Rate Limit Applied Here
+    pushNotificationToAll
+);
 
 module.exports = router;
