@@ -1,18 +1,16 @@
 /**
  * @file src/controllers/chatController.js
- * @description Logic: DB Audio Priority -> AI Generation -> No DB Save -> Admin Alert.
- * @status Production Ready (Fixed Associations)
+ * @description Optimized Flow: FAQ Cache -> Titan ASI Engine (Text/Vision) -> Response
  */
 
 const asyncHandler = require('express-async-handler');
 const stringSimilarity = require('string-similarity');
 
-const { getAIChatResponse } = require('../services/aiService');
+// UPDATED IMPORTS FOR ASI & VISION
+const { generateTitanResponse, analyzeImageWithAI } = require('../services/aiService');
 const { generateEdgeAudio } = require('../services/edgeTtsService');
 const { uploadAudioToCloudinary } = require('../services/cloudinaryService');
 const { db } = require('../config/db');
-
-let { SYSTEM_PROMPT } = require('../utils/prompts');
 
 // ============================================================
 // 🟡 ADMIN ALERT WRAPPER (Safe Mode)
@@ -30,89 +28,92 @@ const sanitizeInput = (text = "") =>
     text.substring(0, 500).trim().replace(/[<>{}]/g, "");
 
 // ============================================================
-// 🚀 USER → AI CHAT (CORE LOGIC)
+// 🚀 USER → AI CHAT (UPDATED FOR ASI & VISION)
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
-
-    // ✅ CRITICAL: Get userId from Token (req.user) FIRST
-    let userId = req.user ? req.user.id : req.body.userId;
     
-    // Ensure userId is a valid integer
-    userId = userId ? parseInt(userId, 10) : null;
+    // IMAGE HANDLING: Ab 'image' parameter bhi accept hoga
+    const { message, userId, image } = req.body; 
 
-    const { message } = req.body;
-
-    if (!message) {
-        return res.status(400).json({ success: false, message: "Message missing" });
+    // Validation: Message ya Image me se koi ek hona chahiye
+    if (!message && !image) {
+        return res.status(400).json({ success: false, message: "Input missing (Text or Image required)" });
     }
 
-    const cleanMsg = sanitizeInput(message);
+    // Input Sanitization
+    const cleanMsg = message ? sanitizeInput(message) : "Image Analysis Request";
     const matchText = cleanMsg.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, '');
 
     let replyContent = "";
     let audioUrl = "";
-    let source = "AI_LIVE";
+    let source = "TITAN_ASI"; // Default Source
 
     // ========================================================
-    // 1️⃣ DB FAQ MATCH (HIGHEST PRIORITY)
+    // 1️⃣ DB FAQ MATCH (HIGHEST PRIORITY - TEXT ONLY)
     // ========================================================
-    try {
-        const faqs = await db.FAQ.findAll({
-            where: { status: 'APPROVED' },
-            attributes: ['question', 'answer', 'audioUrl']
-        });
+    // Vision request ke liye FAQ check nahi karenge
+    if (!image) { 
+        try {
+            const faqs = await db.FAQ.findAll({
+                where: { status: 'APPROVED' },
+                attributes: ['question', 'answer', 'audioUrl']
+            });
 
-        if (faqs.length) {
-            const questions = faqs.map(f => f.question.toLowerCase());
-            const match = stringSimilarity.findBestMatch(matchText, questions);
+            if (faqs.length) {
+                const questions = faqs.map(f => f.question.toLowerCase());
+                const match = stringSimilarity.findBestMatch(matchText, questions);
 
-            if (match.bestMatch.rating > 0.75) {
-                const faq = faqs[match.bestMatchIndex];
-                replyContent = faq.answer;
-                
-                // Use DB audio only if valid
-                if (faq.audioUrl && faq.audioUrl.length > 5) {
-                    audioUrl = faq.audioUrl;
-                    source = "DB_AUDIO_HIT";
-                } else {
-                    source = "DB_TEXT_ONLY";
+                if (match.bestMatch.rating > 0.80) { // Accuracy increased to 80%
+                    const faq = faqs[match.bestMatchIndex];
+                    replyContent = faq.answer;
+                    audioUrl = faq.audioUrl || "";
+                    source = faq.audioUrl ? "DB_AUDIO_HIT" : "DB_TEXT_ONLY";
                 }
             }
+        } catch (err) {
+            console.error("FAQ Match Error:", err.message);
         }
-    } catch (err) {
-        console.error("FAQ Match Error:", err.message);
     }
 
     // ========================================================
-    // 2️⃣ AI FALLBACK (If DB match failed)
+    // 2️⃣ TITAN ASI ENGINE (RAG + VISION)
     // ========================================================
     if (!replyContent) {
         try {
-            replyContent = await getAIChatResponse([
-                { role: "system", content: SYSTEM_PROMPT },
-                { role: "user", content: cleanMsg }
-            ]);
-        } catch {
-            replyContent = "Temporary network issue. Please try again.";
+            if (image) {
+                // 👁️ VISION MODE
+                replyContent = await analyzeImageWithAI(image);
+                source = "TITAN_VISION";
+            } else {
+                // 🧠 ASI TEXT MODE (Database Connected)
+                // req.user pass kar rahe hain taaki Personalization mile (Pin Level etc.)
+                const currentUser = req.user || { fullName: "Leader", pinLevel: "Associate" };
+                replyContent = await generateTitanResponse(currentUser, cleanMsg);
+            }
+        } catch (error) {
+            console.error("AI Generation Error:", error.message);
+            replyContent = "Network issue. Kripya thodi der baad try karein. Jai RCM.";
         }
 
-        // Generate Audio for AI response
-        if (replyContent) {
-            try {
+        // 🔊 GENERATE AUDIO (Only if not from DB Cache)
+        try {
+            // Limit audio generation for very long texts to save resources
+            if (replyContent.length < 600) {
                 audioUrl = await generateEdgeAudio(replyContent);
-            } catch {
-                audioUrl = "";
             }
+        } catch (e) {
+            console.error("Audio Gen Failed:", e.message);
+            audioUrl = ""; // Fail silently, text will still go
         }
     }
 
     // ========================================================
-    // 3️⃣ SEND RESPONSE TO USER
+    // 3️⃣ RESPONSE SENDING
     // ========================================================
     res.status(200).json({
         success: true,
-        message: replyContent,
+        message: replyContent, // Legacy support ke liye
         reply: replyContent,
         audioUrl: audioUrl || "",
         source,
@@ -120,26 +121,26 @@ const handleChat = asyncHandler(async (req, res) => {
     });
 
     // ========================================================
-    // 4️⃣ ASYNC LOGGING (DB SAVE)
+    // 4️⃣ ASYNC LOGGING + ADMIN ALERT (BACKGROUND)
     // ========================================================
     setImmediate(async () => {
         try {
-            // Only save if we have a valid User ID
-            if (userId && !isNaN(userId)) {
+            if (userId || req.user?.id) {
                 await db.ChatMessage.create({
-                    userId: userId,
+                    userId: userId || req.user?.id,
                     sender: "USER",
-                    message: cleanMsg,
+                    message: cleanMsg, // Image ho to "Image Analysis Request" save hoga
                     response: replyContent,
-                    audioUrl: audioUrl || ""
+                    audioUrl,
+                    source: source // Log source clearly
                 });
             } else {
                 console.warn(`⚠️ Chat NOT Saved: userId missing. (Token: ${req.user ? 'OK' : 'Missing'})`);
             }
 
-            // Admin Alert for new AI queries
-            if (source === "AI_LIVE" && matchText.length > 5) {
-                sendAdminAlert(cleanMsg, replyContent).catch(() => {});
+            // Alert Admin only for LIVE AI (Not cached answers)
+            if ((source === "TITAN_ASI" || source === "TITAN_VISION") && matchText.length > 5) {
+                sendAdminAlert(`[${source}] ${cleanMsg}`, replyContent).catch(() => {});
             }
         } catch (err) {
             console.error("Chat Log Error:", err.message);
@@ -148,7 +149,7 @@ const handleChat = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🧑‍💼 ADMIN DASHBOARD: GET CHAT USERS
+// 🧑‍💼 ADMIN → CHAT USERS LIST (UNCHANGED)
 // ============================================================
 const getAllChatUsers = asyncHandler(async (req, res) => {
     // Prevent caching for real-time admin view
@@ -188,7 +189,7 @@ const getAllChatUsers = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🧑‍💼 ADMIN DASHBOARD: GET USER HISTORY
+// 🧑‍💼 ADMIN → CHAT HISTORY (UNCHANGED)
 // ============================================================
 const getChatHistoryByUser = asyncHandler(async (req, res) => {
     const { userId } = req.params;
@@ -196,7 +197,11 @@ const getChatHistoryByUser = asyncHandler(async (req, res) => {
     const limit = 30;
     const offset = (page - 1) * limit;
 
-    res.set({ "Cache-Control": "no-store" });
+    res.set({
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    });
 
     try {
         const messages = await db.ChatMessage.findAll({
@@ -218,7 +223,7 @@ const getChatHistoryByUser = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🛡️ ADMIN: ADD SMART RESPONSE
+// 🛡️ ADMIN → ADD SMART RESPONSE (UNCHANGED)
 // ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
     const { question, answer } = req.body;
@@ -243,7 +248,7 @@ const addSmartResponse = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🛡️ ADMIN: UPGRADE FAQ
+// 🛡️ ADMIN → UPGRADE FAQ (UNCHANGED)
 // ============================================================
 const upgradeToPremium = asyncHandler(async (req, res) => {
     const { faqId, answer } = req.body;
@@ -268,7 +273,7 @@ const upgradeToPremium = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🔊 DIRECT TTS (Text to Speech)
+// 🔊 DIRECT TTS (UNCHANGED)
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;

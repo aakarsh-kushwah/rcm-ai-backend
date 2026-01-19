@@ -1,27 +1,33 @@
+/**
+ * @file src/routes/chatRoutes.js
+ * @description RCM Titan ASI Engine - Routing Layer
+ * Handles Text, Voice, and Vision traffic efficiently.
+ */
+
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 
 // ============================================================
-// 📦 MULTER CONFIG (Memory Storage – Audio Upload)
+// 📦 MULTER CONFIG (Memory Storage)
+// Used for Admin Audio Uploads (Smart Response)
 // ============================================================
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB Limit (Audio/Image)
 });
 
 // ============================================================
-// 🎯 CONTROLLERS
+// 🎯 CONTROLLER IMPORTS
+// We are importing from the UPDATED ASI Controller
 // ============================================================
 const {
-    handleChat,
-    handleSpeak,
-    addSmartResponse,
-    upgradeToPremium,
-
-    // 🔥 ADMIN CHAT VIEW
-    getAllChatUsers,
-    getChatHistoryByUser
+    handleChat,            // The Main ASI Brain (Text/Image -> Logic -> Response)
+    handleSpeak,           // Direct TTS (Text -> Audio)
+    addSmartResponse,      // Admin: Add FAQ
+    upgradeToPremium,      // Admin: Upgrade FAQ
+    getAllChatUsers,       // Admin: User List
+    getChatHistoryByUser   // Admin: Spy Mode (Monitoring)
 } = require('../controllers/chatController');
 
 // ============================================================
@@ -34,18 +40,30 @@ const {
 } = require('../middleware/authMiddleware');
 
 // ============================================================
-// 💬 USER CHAT ROUTES
+// 💬 USER AI INTERACTION ROUTES (The ASI Interface)
 // ============================================================
 
-// 1️⃣ User → AI Chat (Text / Hybrid Audio)
+/**
+ * @route   POST /api/chat/
+ * @desc    Main Titan Interface. Handles:
+ * 1. Text Queries (RAG + Groq)
+ * 2. Image Analysis (Vision)
+ * @access  Private (Active Users Only)
+ * @body    { message: "string", image: "base64_string" (optional) }
+ */
 router.post(
     '/',
     isAuthenticated,
     isActiveUser,
-    handleChat
+    handleChat // <-- Yeh ASI Controller function ko call karega
 );
 
-// 2️⃣ User → Direct TTS Request
+/**
+ * @route   POST /api/chat/speak
+ * @desc    Direct Text-to-Speech (Edge TTS)
+ * Used when user clicks "Play" on a message manually.
+ * @access  Private
+ */
 router.post(
     '/speak',
     isAuthenticated,
@@ -54,10 +72,15 @@ router.post(
 );
 
 // ============================================================
-// 🧑‍💼 ADMIN CHAT VIEW ROUTES (READ ONLY)
+// 🧑‍💼 ADMIN INTELLIGENCE & MONITORING
+// (Control Room for Titan ASI)
 // ============================================================
 
-// 3️⃣ Admin → Get All Users Who Chatted (Sidebar List)
+/**
+ * @route   GET /api/chat/all
+ * @desc    Fetch list of users interacting with AI
+ * @access  Private (Admin)
+ */
 router.get(
     '/all',
     isAuthenticated,
@@ -65,7 +88,11 @@ router.get(
     getAllChatUsers
 );
 
-// 4️⃣ Admin → Get Chat History of a User
+/**
+ * @route   GET /api/chat/history/:userId
+ * @desc    View full conversation log (Debugging/Monitoring)
+ * @access  Private (Admin)
+ */
 router.get(
     '/history/:userId',
     isAuthenticated,
@@ -73,20 +100,25 @@ router.get(
     getChatHistoryByUser
 );
 
-// ============================================================
-// 🛡️ ADMIN SMART RESPONSE MANAGEMENT
-// ============================================================
-
-// 5️⃣ Admin → Add New Smart Q&A (Optional Audio)
+/**
+ * @route   POST /api/chat/admin/smart-response
+ * @desc    Add specific answers manually (Overriding AI)
+ * Useful for Fixed Company Info.
+ * @access  Private (Admin)
+ */
 router.post(
     '/admin/smart-response',
     isAuthenticated,
     isAdmin,
-    upload.single('audioFile'),
+    upload.single('audioFile'), // Admin can upload custom voice note
     addSmartResponse
 );
 
-// 6️⃣ Admin → Upgrade Existing Q&A to Premium
+/**
+ * @route   POST /api/chat/admin/upgrade
+ * @desc    Edit/Upgrade an existing AI response
+ * @access  Private (Admin)
+ */
 router.post(
     '/admin/upgrade',
     isAuthenticated,

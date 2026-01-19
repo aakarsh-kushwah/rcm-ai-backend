@@ -1,53 +1,44 @@
-const { db } = require('../config/db');
-const { Op } = require('sequelize'); 
+/**
+ * @file controllers/adminController.js
+ * @description TITAN ADMIN BRAIN (Gen-6)
+ * @capabilities Transactional Deletion, Mass Notification Batching, High-Speed Queries
+ */
 
-// ❌ OLD (WRONG): This runs too early, before DB connects
-// const { User, ChatMessage, sequelize } = db; 
+const { db } = require('../config/db'); // For Sequelize Transactions
+const { Op } = require('sequelize');
+const admin = require('../config/firebase'); // Firebase Admin SDK
 
-// User selection fields
+// ✅ CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
+const { User, ChatMessage, NotificationToken } = require('../models'); 
+
+// 📊 Optimized Selection: Sirf wahi data mangaayein jo dashboard par dikhana hai
 const userSelectFields = [
     'id', 'fullName', 'rcmId', 'email', 'phone', 'role', 'status', 'autoPayStatus', 'createdAt'
 ];
 
 // =======================================================
-// 1️⃣ GET ALL REGULAR USERS
+// 1️⃣ GET REGULAR USERS (Optimized for Dashboard)
 // =======================================================
 const getRegularUsers = async (req, res) => {
     try {
-        // ✅ FIX: Access Model HERE (Inside the function)
-        // Jab request aayegi, tab tak DB connect ho chuka hoga.
-        const User = db.User; 
-
-        if (!User) {
-            console.error("❌ DB Error: User model missing in db object.");
-            return res.status(500).json({ success: false, message: 'Server error: User model is not available.' });
-        }
-
         const users = await User.findAll({
-            where: { 
-                role: { [Op.ne]: 'ADMIN' } 
-            }, 
+            where: { role: { [Op.ne]: 'ADMIN' } }, // 'ne' means Not Equal
             attributes: userSelectFields,
             order: [['createdAt', 'DESC']],
         });
-        res.status(200).json({ success: true, data: users });
+        
+        res.status(200).json({ success: true, count: users.length, data: users });
     } catch (error) {
-        console.error('❌ Error fetching regular users:', error.message);
-        res.status(500).json({ success: false, message: 'Failed to fetch users.', error: error.message });
+        console.error('❌ Fetch Users Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to retrieve user registry.' });
     }
 };
 
 // =======================================================
-// 2️⃣ GET ALL ADMINS
+// 2️⃣ GET ALL ADMINS (Team View)
 // =======================================================
 const getAllAdmins = async (req, res) => {
     try {
-        const User = db.User; // ✅ Access inside function
-
-        if (!User) {
-            return res.status(500).json({ success: false, message: 'Server error: User model is not available.' });
-        }
-
         const admins = await User.findAll({
             where: { role: 'ADMIN' },
             attributes: userSelectFields,
@@ -55,79 +46,66 @@ const getAllAdmins = async (req, res) => {
         });
         res.status(200).json({ success: true, data: admins });
     } catch (error) {
-        console.error('❌ Error fetching admins:', error.message);
-        res.status(500).json({ success: false, message: 'Failed to fetch admins.', error: error.message });
+        console.error('❌ Fetch Admins Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to retrieve admin registry.' });
     }
 };
 
-// ============================================================
-// 3️⃣ DELETE USER
-// ============================================================
+// =======================================================
+// 3️⃣ DELETE USER (Atomic Transaction - ASI Level) 🛡️
+// =======================================================
 const deleteUser = async (req, res) => {
     const { userId } = req.params;
-
-    // ✅ Access Models & Sequelize instance inside function
-    const User = db.User;
-    const ChatMessage = db.ChatMessage;
-    const sequelize = db.sequelize;
-
-    if (!User || !ChatMessage || !sequelize) {
-        return res.status(500).json({ success: false, message: 'Server models not fully ready for operation.' });
-    }
-
-    if (req.user && req.user.id === parseInt(userId, 10)) {
-        return res.status(403).json({
-            success: false,
-            message: "You cannot delete your own admin account.",
-        });
-    }
-
-    const transaction = await sequelize.transaction();
+    
+    // 🚦 Start Transaction: Sab kuch delete hoga, ya kuch bhi nahi.
+    const t = await db.sequelize.transaction();
 
     try {
-        await ChatMessage.destroy({
-            where: { userId: parseInt(userId, 10) },
-            transaction,
-        });
-
-        const deletedUserCount = await User.destroy({
-            where: { id: parseInt(userId, 10) },
-            transaction,
-        });
-
-        await transaction.commit();
-
-        if (deletedUserCount === 0) {
-            return res.status(404).json({ success: false, message: "User not found or already deleted." });
+        // Self-Destruct Prevention
+        if (req.user.id === parseInt(userId)) {
+            await t.rollback();
+            return res.status(403).json({ success: false, message: "Security Alert: Cannot delete yourself." });
         }
 
-        res.status(200).json({
-            success: true,
-            message: "User and all associated data deleted successfully.",
-        });
+        console.log(`🗑️ [DELETE] Initiating wipe for User ID: ${userId}`);
+
+        // Step 1: Delete Chat History
+        await ChatMessage.destroy({ where: { userId }, transaction: t });
+        
+        // Step 2: Remove Notification Linkages (Clean dead tokens)
+        if (NotificationToken) {
+            await NotificationToken.destroy({ where: { userId }, transaction: t });
+        }
+
+        // Step 3: Delete the User Account
+        const deletedCount = await User.destroy({ where: { id: userId }, transaction: t });
+
+        // ✅ Commit Changes
+        await t.commit();
+
+        if (deletedCount === 0) {
+            return res.status(404).json({ success: false, message: "User not found." });
+        }
+
+        console.log(`✅ [DELETE] User ${userId} wiped successfully.`);
+        res.status(200).json({ success: true, message: "User and all associated data wiped." });
+
     } catch (error) {
-        await transaction.rollback();
-        console.error("❌ User deletion failed:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to delete user due to a server error.",
-        });
+        // ↩️ Rollback: Undo everything if error occurs
+        await t.rollback();
+        console.error("❌ User Wipe Error:", error);
+        res.status(500).json({ success: false, message: "Deletion failed due to system lock." });
     }
 };
 
-// ============================================================
-// 4️⃣ UPDATE USER DATA
-// ============================================================
+// =======================================================
+// 4️⃣ UPDATE USER DATA (CRM Operations)
+// =======================================================
 const updateUserData = async (req, res) => {
     const { userId } = req.params;
     const { fullName, email, rcmId, status, role, autoPayStatus, nextBillingDate } = req.body;
-    
-    const User = db.User; // ✅ Access inside function
 
-    if (!User) {
-        return res.status(500).json({ success: false, message: 'User model is not initialized.' });
-    }
-
+    // Filter valid fields (Security: Prevent pollution)
     const fieldsToUpdate = {};
     if (fullName !== undefined) fieldsToUpdate.fullName = fullName;
     if (email !== undefined) fieldsToUpdate.email = email;
@@ -136,46 +114,119 @@ const updateUserData = async (req, res) => {
     if (role !== undefined) fieldsToUpdate.role = role;
     if (autoPayStatus !== undefined) fieldsToUpdate.autoPayStatus = autoPayStatus;
     
-    if (nextBillingDate === null) {
-        fieldsToUpdate.nextBillingDate = null;
-    } else if (nextBillingDate) {
-        fieldsToUpdate.nextBillingDate = new Date(nextBillingDate);
-    }
-    
-    if (Object.keys(fieldsToUpdate).length === 0) {
-        return res.status(400).json({ success: false, message: "No valid fields provided for update." });
-    }
+    // Handle Date Object
+    if (nextBillingDate === null) fieldsToUpdate.nextBillingDate = null;
+    else if (nextBillingDate) fieldsToUpdate.nextBillingDate = new Date(nextBillingDate);
 
     try {
-        const [updatedRowsCount] = await User.update(
-            fieldsToUpdate,
-            {
-                where: { id: parseInt(userId, 10) },
-            }
-        );
+        if (Object.keys(fieldsToUpdate).length === 0) {
+            return res.status(400).json({ success: false, message: "No changes detected." });
+        }
 
-        if (updatedRowsCount === 0) {
-            return res.status(404).json({ success: false, message: "User not found or no changes made." });
+        const [updated] = await User.update(fieldsToUpdate, { where: { id: userId } });
+
+        if (!updated) {
+            return res.status(404).json({ success: false, message: "User not found or data identical." });
         }
         
-        const updatedUser = await User.findByPk(userId, {
-            attributes: { exclude: ['password'] }
+        // Return fresh data
+        const updatedUser = await User.findByPk(userId, { attributes: userSelectFields });
+        
+        res.status(200).json({ 
+            success: true, 
+            message: "User profile updated.", 
+            data: updatedUser 
         });
 
-        res.status(200).json({
-            success: true,
-            message: "User data updated successfully.",
-            data: updatedUser,
-        });
     } catch (error) {
-        console.error("❌ User update failed:", error);
-        res.status(500).json({ success: false, message: "Failed to update user data due to a server error." });
+        console.error("❌ Update Error:", error);
+        res.status(500).json({ success: false, message: "Update failed." });
     }
 };
 
+// =======================================================
+// 5️⃣ ✨ TITAN NOTIFICATION BLAST (The Broadcast Engine) 🚀
+// =======================================================
+const pushNotificationToAll = async (req, res) => {
+    try {
+        const { title, body, imageUrl, link } = req.body;
+
+        if (!title || !body) {
+            return res.status(400).json({ success: false, message: "Payload missing (Title/Body)." });
+        }
+
+        // 1. Fetch ALL Active Tokens (Raw Query for Speed)
+        // 'raw: true' use karne se query 10x fast ho jati hai
+        const activeDevices = await NotificationToken.findAll({
+            where: { status: 'ACTIVE' },
+            attributes: ['token'],
+            raw: true
+        });
+
+        const tokens = activeDevices.map(d => d.token);
+        
+        if (tokens.length === 0) {
+            return res.status(404).json({ success: false, message: "No active devices found in Titan Grid." });
+        }
+
+        console.log(`📣 [TITAN BLAST] Targeting ${tokens.length} devices...`);
+
+        // 2. SMART BATCHING (500 per chunk - Firebase Limit)
+        const chunks = [];
+        const BATCH_SIZE = 500;
+
+        for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
+            const chunk = tokens.slice(i, i + BATCH_SIZE);
+            
+            const message = {
+                notification: { title, body },
+                data: { 
+                    title, 
+                    body, 
+                    image: imageUrl || "", 
+                    url: link || "/",
+                    click_action: "FLUTTER_NOTIFICATION_CLICK"
+                },
+                tokens: chunk
+            };
+
+            // Non-blocking Push
+            chunks.push(admin.messaging().sendEachForMulticast(message));
+        }
+
+        // 3. Parallel Execution (Wait for all batches to fly)
+        const results = await Promise.all(chunks);
+
+        // 4. Analytics Calculation
+        let successCount = 0;
+        let failureCount = 0;
+        
+        results.forEach(r => {
+            successCount += r.successCount;
+            failureCount += r.failureCount;
+        });
+
+        console.log(`✅ [BLAST COMPLETE] Success: ${successCount}, Failed: ${failureCount}`);
+
+        res.status(200).json({ 
+            success: true, 
+            message: `Transmission Complete.`,
+            stats: { sent: successCount, failed: failureCount, total: tokens.length }
+        });
+
+    } catch (error) {
+        console.error("🔥 Broadcast System Error:", error);
+        res.status(500).json({ success: false, message: "Broadcast interrupted." });
+    }
+};
+
+// =======================================================
+// ✅ MODULE EXPORTS
+// =======================================================
 module.exports = { 
     getRegularUsers,
     getAllAdmins,
     deleteUser, 
-    updateUserData
+    updateUserData,
+    pushNotificationToAll // This connects to your adminRoutes.js
 };

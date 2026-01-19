@@ -1,111 +1,128 @@
-const jwt = require('jsonwebtoken');
+/**
+ * @file src/middleware/authMiddleware.js
+ * @description Titan Security Gatekeeper (ASI Level 5)
+ * @capabilities JWT Validation, Role-Based Access Control (RBAC), Subscription Enforcer
+ * @performance Optimized for High-Concurrency (Non-Blocking)
+ */
 
-// ✅ CORRECT IMPORT: Reference to the 'db' object which gets filled later.
-const { db } = require('../config/db'); 
+const jwt = require('jsonwebtoken');
+// ✅ CORRECT IMPORT: Importing directly from the Central Titan Loader
+const { User } = require('../models'); 
 
 // ============================================================
-// 1. CORE AUTH LOGIC (Verifies Token)
+// 1. NEURAL TOKEN VALIDATOR (JWT Check)
 // ============================================================
 const verifyTokenLogic = (req, res, next) => {
-    let token;
-    
-    const authHeader = req.headers.authorization || req.headers.Authorization;
-
-    if (authHeader && authHeader.startsWith('Bearer')) {
-        token = authHeader.split(' ')[1];
-    }
-
-    if (!token) {
-        return res.status(401).json({ success: false, message: 'Access denied. No token provided.' });
-    }
-
     try {
+        let token;
+        const authHeader = req.headers.authorization || req.headers.Authorization;
+
+        // 1. Extract Token smartly
+        if (authHeader && authHeader.startsWith('Bearer')) {
+            token = authHeader.split(' ')[1];
+        }
+
+        if (!token) {
+            return res.status(401).json({ 
+                success: false, 
+                message: '🚫 Access Denied: Authentication Token Missing.' 
+            });
+        }
+
+        // 2. Verify Signature
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         
-        // 👇 DEBUGGING: Check what's inside the token
-        // console.log("🔍 Decoded Token:", decoded);
+        // 3. Attach User Identity to Request
+        req.user = decoded;
+        // Support multiple ID formats (Titan Engine Standard)
+        req.userId = decoded.id || decoded.userId || decoded._id;
 
-        req.user = decoded; 
-        
-        // Handle various payload structures (id, userId, _id)
-        req.userId = decoded.id || decoded.userId || decoded._id; 
-        
         next();
+
     } catch (error) {
-        console.error("Auth Error:", error.message);
-        return res.status(403).json({ success: false, message: 'Invalid or expired token.' });
+        console.warn(`⚠️ [AUTH BLOCKED] Invalid Token Attempt: ${error.message}`);
+        return res.status(403).json({ 
+            success: false, 
+            message: '🚫 Session Expired or Invalid Token. Please Login Again.' 
+        });
     }
 };
 
 // ============================================================
-// 2. ACTIVE STATUS CHECK (The New Security Layer)
+// 2. ACTIVE STATUS ENFORCER (The Subscription Shield)
 // ============================================================
 const isActiveUser = async (req, res, next) => {
     try {
         let userId = req.userId || req.user?.id;
 
-        // 🛠️ FIX: Ensure ID is an Integer before querying DB
-        // If the token has "123" (string), we convert it to 123 (int)
-        if (userId) {
-            userId = parseInt(userId, 10);
-        }
-
-        // 👇 DEBUGGING: See what ID we are searching for
-        // console.log(`🔎 Checking Active Status for User ID: ${userId}`);
+        // 1. Input Sanitization (Integer Check)
+        if (userId) userId = parseInt(userId, 10);
 
         if (!userId) {
-            return res.status(401).json({ success: false, message: 'User verification failed (Invalid ID).' });
+            return res.status(401).json({ success: false, message: '🚫 Identity Verification Failed.' });
         }
 
-        // ✅ FIX: Access db.User inside the request
-        const User = db.User;
-
-        // Safety Check: If DB crashed or failed to load
+        // 2. SAFETY CHECK: Ensure Titan Engine Loaded the Model
         if (!User) {
-            console.error("❌ Database Error: User model not loaded yet.");
-            return res.status(500).json({ success: false, message: 'System initializing, please try again.' });
-        }
-
-        // Fetch fresh status from DB
-        const user = await User.findByPk(userId);
-
-        if (!user) {
-            console.log(`❌ User ID ${userId} not found in Database.`);
-            return res.status(404).json({ success: false, message: 'User account not found.' });
-        }
-
-        // 🛑 CRITICAL CHECK
-        // If status is not explicitly 'active', treat as inactive (or pending)
-        if (user.status !== 'active') {
-            return res.status(403).json({ 
+            console.error("❌ [CRITICAL] User Model Not Loaded in Middleware.");
+            return res.status(503).json({ 
                 success: false, 
-                message: 'Subscription Inactive. Please renew.',
-                code: 'SUBSCRIPTION_REQUIRED' 
+                message: '⏳ System initializing. Please retry in 5 seconds.' 
             });
         }
 
+        // 3. PERFORMANCE QUERY (Select only necessary fields)
+        // Hum puri profile load nahi karenge, sirf status check karenge (Ultra Fast)
+        const user = await User.findByPk(userId, {
+            attributes: ['id', 'status', 'role'] 
+        });
+
+        // 4. Validation Logic
+        if (!user) {
+            return res.status(404).json({ success: false, message: '🚫 User Account Not Found.' });
+        }
+
+        if (user.status !== 'active') {
+            return res.status(403).json({ 
+                success: false, 
+                message: '⛔ Subscription Inactive. Access Restricted.',
+                code: 'SUBSCRIPTION_REQUIRED'
+            });
+        }
+
+        // Attach fresh role/status to request (for downstream use)
+        req.userStatus = user.status;
+        req.userRole = user.role;
+
         next(); 
+
     } catch (error) {
-        console.error('Status Check Error:', error);
-        res.status(500).json({ success: false, message: 'Server error checking subscription status.' });
+        console.error('🔥 [STATUS CHECK ERROR]:', error.message);
+        res.status(500).json({ success: false, message: 'Internal Security Error.' });
     }
 };
 
 // ============================================================
-// 3. ADMIN CHECK
+// 3. ADMIN PRIVILEGE GUARD
 // ============================================================
 const isAdmin = (req, res, next) => {
-    // Case-insensitive check for robustness
-    if (req.user && (req.user.role === 'ADMIN' || req.user.role === 'admin')) {
+    // Robust Case-Insensitive Check
+    const role = req.user?.role || req.userRole;
+    
+    if (role && (role.toUpperCase() === 'ADMIN')) {
         next();
     } else {
-        res.status(403).json({ success: false, message: 'Admin access required.' });
+        console.warn(`⚠️ [SECURITY ALERT] Unauthorized Admin Access Attempt by User ID: ${req.userId}`);
+        res.status(403).json({ success: false, message: '🚫 Access Denied: Titan Administrators Only.' });
     }
 };
 
+// ============================================================
+// 4. MODULE EXPORTS
+// ============================================================
 module.exports = {
     verifyToken: verifyTokenLogic,    
-    isAuthenticated: verifyTokenLogic, 
+    isAuthenticated: verifyTokenLogic, // Alias for backward compatibility
     isActiveUser,                     
     isAdmin
 };
