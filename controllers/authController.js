@@ -61,6 +61,7 @@ exports.register = async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
         // 4. Atomic Creation
+        // 4. Atomic Creation
         const newUser = await User.create({
             fullName: fullName.trim(),
             rcmId: rcmId ? rcmId.toString().trim() : null,
@@ -68,7 +69,13 @@ exports.register = async (req, res) => {
             phone: phone || null,
             password: hashedPassword,
             role: role || 'USER',
-            status: 'active', // Direct active for easy onboarding (Change to 'pending' if email verify needed)
+            
+            // ✅ FIX: Default 'pending' rakho. 
+            // Jab payment success hoga (Webhook/Payment API se), tab ise 'active' karna.
+            status: 'pending', 
+            
+            autoPayStatus: false,
+            nextBillingDate: null // Koi free trial nahi
         });
 
         // 5. Token Generation

@@ -1,7 +1,7 @@
-const { db } = require('../config/db'); 
+const db = require('../models'); // ✅ Correct Import
 const { Op } = require('sequelize');
 const axios = require('axios');
-const asyncHandler = require('express-async-handler'); // Error handling ke liye
+const asyncHandler = require('express-async-handler');
 
 // ============================================================
 // 🔹 Helper 1: Extract YouTube Video ID
@@ -40,7 +40,6 @@ const removeEmojis = (str) => {
   return str.replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\DFFF]|\uD83D[\uDC00-\DFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '').trim();
 };
 
-
 // ============================================================
 // 🔹 3. URL Scraper
 // ============================================================
@@ -52,7 +51,6 @@ const fetchUrlDetails = async (videoUrl) => {
     }
     
     const oEmbedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${publicId}&format=json`;
-    
     const response = await axios.get(oEmbedUrl);
     
     const title = removeEmojis(response.data.title);
@@ -73,7 +71,7 @@ const fetchUrlDetails = async (videoUrl) => {
 };
 
 // ============================================================
-// 🔹 4. Batch Scrape & Import (Wrapped in asyncHandler)
+// 🔹 4. Batch Scrape & Import
 // ============================================================
 const batchScrapeImport = asyncHandler(async (req, res) => {
     const { urls, videoType, category } = req.body;
@@ -82,14 +80,16 @@ const batchScrapeImport = asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: 'No URLs provided.' });
     }
 
+    // ✅ FIX: Access models from 'db' object correctly
     const Model = videoType === 'leaders' ? db.LeaderVideo : db.ProductVideo;
+    
     if (!Model) {
-        return res.status(500).json({ success: false, message: 'Database model not ready.' });
+        console.error("🔥 Model Error: DB object is:", Object.keys(db)); // Debugging Log
+        return res.status(500).json({ success: false, message: 'Database model not ready or undefined.' });
     }
 
     const videoCategory = (videoType === 'products' && category) ? category.trim() : 'General';
 
-    // try/catch block yahan rakhein kyunki Promise.allSettled errors throw nahi karta
     try {
         const scrapePromises = urls.map(url => fetchUrlDetails(url));
         const results = await Promise.allSettled(scrapePromises);
@@ -99,7 +99,7 @@ const batchScrapeImport = asyncHandler(async (req, res) => {
             .map(res => res.value);
 
         if (successfulScrapes.length === 0) {
-             return res.status(400).json({ success: false, message: 'Failed to fetch details for all provided URLs. Are they valid YouTube links?' });
+             return res.status(400).json({ success: false, message: 'Failed to fetch details. Are URLs valid?' });
         }
 
         const existingPublicIds = (await Model.findAll({
@@ -116,48 +116,32 @@ const batchScrapeImport = asyncHandler(async (req, res) => {
                 category: videoType === 'products' ? videoCategory : undefined 
             }));
 
-
-        if (newVideosToSave.length === 0) {
-            return res.status(200).json({ 
-                success: true, 
-                message: `All ${successfulScrapes.length} valid videos are already in your database.`,
-                importedCount: 0 
-            });
+        if (newVideosToSave.length > 0) {
+            await Model.bulkCreate(newVideosToSave);
         }
-
-        await Model.bulkCreate(newVideosToSave);
 
         res.status(201).json({
             success: true,
-            message: `Import complete! Added ${newVideosToSave.length} new videos. (Skipped ${existingPublicIds.length} duplicates / ${results.length - successfulScrapes.length} failures).`,
+            message: `Import complete! Added ${newVideosToSave.length} videos.`,
             importedCount: newVideosToSave.length
         });
 
     } catch (error) {
         console.error('❌ BATCH SCRAPE FAILED:', error);
-        // asyncHandler is error ko pakad lega, lekin custom response behtar hai
-        res.status(500).json({
-            success: false,
-            message: error.message || 'An internal server error occurred during batch import.',
-        });
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-
 // ============================================================
-// 🔹 5. Get Videos (Internal helper function)
+// 🔹 5. Internal Helpers (Get/Update/Delete)
 // ============================================================
 const getVideos = async (Model, req, res) => {
-  if (!Model) {
-    return res.status(500).json({ success: false, message: 'Database model not ready.' });
-  }
+  if (!Model) return res.status(500).json({ success: false, message: 'Database model undefined.' });
   
-  // Is internal function mein try/catch zaroori hai kyunki yeh seedha asyncHandler se wrap nahi hai
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const offset = (page - 1) * limit;
-
     const { category } = req.query;
     
     const options = {
@@ -167,7 +151,7 @@ const getVideos = async (Model, req, res) => {
       where: {}
     };
 
-    if (category && category !== 'All' && Model === db.ProductVideo) {
+    if (category && category !== 'All' && Model.name === 'ProductVideo') {
       options.where.category = category;
     }
 
@@ -183,124 +167,73 @@ const getVideos = async (Model, req, res) => {
       },
     });
   } catch (error) {
-    console.error(`❌ Fetch Videos Failed (${Model.name}):`, error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch videos.',
-    });
+    console.error(`❌ Fetch Failed:`, error);
+    res.status(500).json({ success: false, message: 'Failed to fetch videos.' });
   }
 };
 
-// ============================================================
-// 🔹 6. Update Video (Internal helper function)
-// ============================================================
 const updateVideo = async (Model, req, res) => {
   const { id } = req.params;
   const { title, description, category } = req.body;
  
-  if (!Model) {
-    return res.status(500).json({ success: false, message: 'Database model not ready.' });
-  }
+  if (!Model) return res.status(500).json({ success: false, message: 'Model undefined.' });
 
   const cleanedTitle = removeEmojis(title);
   const cleanedDescription = removeEmojis(description);
 
-  if (!cleanedTitle) {
-    return res.status(400).json({ success: false, message: 'Title is required.' });
-  }
+  if (!cleanedTitle) return res.status(400).json({ success: false, message: 'Title is required.' });
  
-  const dataToUpdate = {
-    title: cleanedTitle,
-    description: cleanedDescription
-  };
+  const dataToUpdate = { title: cleanedTitle, description: cleanedDescription };
 
-  if (Model === db.ProductVideo && category) {
+  if (Model.name === 'ProductVideo' && category) {
     dataToUpdate.category = category.trim() || 'General';
   }
 
   try {
-    const [updatedCount] = await Model.update(
-      dataToUpdate,
-      { where: { id: parseInt(id) } }
-    );
-
-    if (updatedCount === 0) {
-      return res.status(404).json({ success: false, message: `Video ID ${id} not found.` });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: 'Video updated successfully!',
-    });
+    const [updatedCount] = await Model.update(dataToUpdate, { where: { id: parseInt(id) } });
+    if (updatedCount === 0) return res.status(404).json({ success: false, message: 'Video not found.' });
+    res.status(200).json({ success: true, message: 'Video updated successfully!' });
   } catch (error) {
-    console.error(`❌ Update Failed (${Model.name} ID: ${id}):`, error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update video.',
-    });
+    res.status(500).json({ success: false, message: 'Failed to update video.' });
   }
 };
 
-// ============================================================
-// 🔹 7. Delete Video (Internal helper function)
-// ============================================================
 const deleteVideo = async (Model, req, res) => {
   const { id } = req.params;
-  if (!Model) {
-    return res.status(500).json({ success: false, message: 'Database model not ready.' });
-  }
+  if (!Model) return res.status(500).json({ success: false, message: 'Model undefined.' });
 
   try {
     const deleted = await Model.destroy({ where: { id: parseInt(id) } });
-    if (!deleted) {
-      return res.status(404).json({ success: false, message: 'Video not found.' });
-    }
+    if (!deleted) return res.status(404).json({ success: false, message: 'Video not found.' });
     res.status(200).json({ success: true, message: 'Video deleted.' });
   } catch (error) {
-    console.error(`❌ Delete Failed (${Model.name} ID: ${id}):`, error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to delete video.',
-    });
+    res.status(500).json({ success: false, message: 'Failed to delete video.' });
   }
 };
 
-
-// ============================================================
-// 🔹 8. Get Product Categories (Optimized & Wrapped)
-// ============================================================
 const getProductCategories = asyncHandler(async (req, res) => {
-  
-  // Performance: 'DISTINCT' ki jagah 'GROUP BY' ka istemaal karein
   const categories = await db.ProductVideo.findAll({
-       attributes: ['category'], // Sirf category column chahiye
-       group: ['category'], // Isse distinct values milengi
-       where: {
-           category: { [Op.ne]: null, [Op.ne]: '' } // Empty ya null na ho
-       },
-       order: [['category', 'ASC']] // Alphabetical sort
+       attributes: ['category'],
+       group: ['category'],
+       where: { category: { [Op.ne]: null, [Op.ne]: '' } },
+       order: [['category', 'ASC']]
   });
-
   const categoryList = categories.map(item => item.category);
-  
   res.status(200).json({ success: true, data: categoryList });
-  
-  // try/catch ki zaroorat nahi, asyncHandler errors ko pakad lega
 });
 
-
 // ============================================================
-// 🔹 9. Exports (Sabhi ko asyncHandler se wrap kiya gaya)
+// 🔹 Exports
 // ============================================================
-exports.batchScrapeImport = batchScrapeImport; // Yeh pehle se hi wrapped hai
-exports.getProductCategories = getProductCategories; // Yeh bhi wrapped hai
+exports.batchScrapeImport = batchScrapeImport;
+exports.getProductCategories = getProductCategories;
 
-// Leader Videos
+// Leader Videos (Pass Model Correctly)
 exports.getLeaderVideos = asyncHandler((req, res) => getVideos(db.LeaderVideo, req, res));
 exports.updateLeaderVideo = asyncHandler((req, res) => updateVideo(db.LeaderVideo, req, res));
 exports.deleteLeaderVideo = asyncHandler((req, res) => deleteVideo(db.LeaderVideo, req, res));
 
-// Product Videos
+// Product Videos (Pass Model Correctly)
 exports.getProductVideos = asyncHandler((req, res) => getVideos(db.ProductVideo, req, res));
 exports.updateProductVideo = asyncHandler((req, res) => updateVideo(db.ProductVideo, req, res));
 exports.deleteProductVideo = asyncHandler((req, res) => deleteVideo(db.ProductVideo, req, res));
