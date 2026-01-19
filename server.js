@@ -79,9 +79,11 @@ async function igniteNeuralPathway() {
     app.use(hpp()); // Prevent HTTP Parameter Pollution attacks
 
     // 🌐 CORS (Strict Policy)
+    // 🌐 CORS (Strict Policy)
     const allowedOrigins = [
         'https://rcm-ai-admin-ui.vercel.app',
-        'https://rcmai.in',
+        'https://rcmai.in',         // बिना www के
+        'https://www.rcmai.in',     // ✅ नया जोड़ा (With www)
         'http://localhost:3000',
         'http://localhost:5173'
     ];
