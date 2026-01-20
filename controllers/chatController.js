@@ -10,8 +10,8 @@ const stringSimilarity = require('string-similarity');
 const { generateTitanResponse, analyzeImageWithAI } = require('../services/aiService');
 const { generateEdgeAudio } = require('../services/edgeTtsService');
 const { uploadAudioToCloudinary } = require('../services/cloudinaryService');
-const { db } = require('../config/db');
-
+const db = require('../models'); // ✅ यह सही है
+const { ChatMessage, FAQ, VoiceResponse, Product } = db; // Destructure here
 // ============================================================
 // 🟡 ADMIN ALERT WRAPPER (Safe Mode)
 // ============================================================

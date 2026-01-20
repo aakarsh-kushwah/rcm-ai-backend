@@ -1,23 +1,28 @@
 /**
- * @file src/services/aiService.js
- * @description Titan ASI Engine: Text (RAG), Vision & Voice Powerhouse.
+ * @file services/aiService.js
+ * @description Titan ASI Engine
  */
 
 const Groq = require("groq-sdk");
 const NodeCache = require("node-cache");
 const axios = require('axios');
 const { uploadAudioToCloudinary } = require('./cloudinaryService');
-const { db } = require('../config/db');
-const { GET_ASI_PROMPT } = require('../utils/prompts'); // ASI Prompt Import
+
+// 🛠️ FIX 1: Destructuring hatao ({ db } -> db)
+// Kyunki models/index.js seedha object export karta hai.
+const db = require('../models'); 
+
+const { GET_ASI_PROMPT } = require('../utils/prompts'); 
 const crypto = require('crypto');
 const path = require('path');
-const { Op } = require('sequelize'); // DB Search ke liye
+const { Op } = require('sequelize'); 
 
-// ✅ FIX: Load .env explicitly
-require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
+// 🛠️ FIX 2: Path adjust karo (Kyunki 'src' folder nahi hai)
+// Pehle '../../.env' tha, ab '../.env' hoga.
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
-// 🚀 Cache Setup
-const aiCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // 5 Min Cache
+// Cache Setup
+const aiCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); 
 
 // Initialize Groq Neural Engine
 let groqClient = null;
@@ -32,11 +37,10 @@ try {
     }
 } catch (err) { console.error("❌ AI Init Failed:", err.message); }
 
-// 🧠 Model Config
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
 const VISION_MODEL = 'llama-3.2-11b-vision-preview';
 
-// --- 🛠️ HELPER: Sentence Finisher ---
+// --- HELPER: Sentence Finisher ---
 function cleanIncompleteSentence(text) {
     if (!text) return "";
     let clean = text.trim();
@@ -47,34 +51,31 @@ function cleanIncompleteSentence(text) {
 }
 
 // ============================================================
-// 🔍 RAG SYSTEM: FETCH LIVE DATA (The "Magic" Part)
+// 🔍 RAG SYSTEM: FETCH LIVE DATA
 // ============================================================
 async function fetchLiveContext(query) {
     if (!query) return "";
     
     try {
-        // 1. Simple Keyword Extraction (Length > 3 characters)
         const keywords = query.split(' ').filter(w => w.length > 3);
         if (keywords.length === 0) return "";
 
-        // 2. DB Search (Check if Product table exists)
-        if (!db.Product) {
-            console.warn("⚠️ Product table not defined in DB config.");
+        // ✅ AB YE ERROR NAHI DEGA
+        if (!db || !db.Product) {
+            // console.warn("⚠️ Product table not loaded.");
             return "";
         }
 
-        // 3. Search Database for matching products
         const products = await db.Product.findAll({
             where: {
                 [Op.or]: keywords.map(k => ({ 
-                    name: { [Op.like]: `%${k}%` } // Matches partial names
+                    name: { [Op.like]: `%${k}%` } 
                 }))
             },
-            limit: 3, // Only fetch top 3 to save context window
+            limit: 3, 
             attributes: ['name', 'dp', 'pv', 'mrp', 'description']
         });
 
-        // 4. Format Data for AI
         if (products.length > 0) {
             return products.map(p => 
                 `PRODUCT MATCH: ${p.name} | MRP: ₹${p.mrp} | DP (Rate): ₹${p.dp} | PV: ${p.pv} | Desc: ${p.description}`
@@ -83,7 +84,6 @@ async function fetchLiveContext(query) {
         return "";
 
     } catch (error) {
-        // Silent fail taaki chat na ruke
         console.error("⚠️ DB Context Fetch Failed:", error.message);
         return "";
     }
@@ -96,17 +96,14 @@ async function generateTitanResponse(user, message) {
     if (!groqClient) return "System maintenance par hai. Jai RCM.";
     
     try {
-        // Step 1: Live Data Fetch (RAG)
         const liveData = await fetchLiveContext(message);
 
-        // Step 2: Prompt Construction (Injecting User Info & Live Data)
         const systemPrompt = GET_ASI_PROMPT({
             userName: user?.fullName || "Leader",
             userPin: user?.pinLevel || "Associate Buyer",
-            liveData: liveData // <-- Yeh hai asli magic
+            liveData: liveData 
         });
 
-        // Step 3: AI Call
         const completion = await groqClient.chat.completions.create({
             model: TEXT_MODEL,
             messages: [
@@ -168,15 +165,14 @@ async function getOrGenerateVoice(text) {
         const cleanText = text.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, '').trim();
         const textHash = crypto.createHash('sha256').update(cleanText).digest('hex');
 
-        // Check Cache (Database)
-        const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
-        if (cachedVoice) return cachedVoice.audioUrl;
+        // ✅ AB YE DB ERROR NAHI DEGA
+        if (db && db.VoiceResponse) {
+            const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
+            if (cachedVoice) return cachedVoice.audioUrl;
+        }
 
         const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-        if (!ELEVENLABS_API_KEY) {
-            console.warn("⚠️ ElevenLabs Key Missing.");
-            return null;
-        }
+        if (!ELEVENLABS_API_KEY) return null;
 
         const response = await axios({
             method: 'POST',
@@ -193,24 +189,21 @@ async function getOrGenerateVoice(text) {
         const cloudinaryUrl = await uploadAudioToCloudinary(response.data, textHash);
         
         // Async save to DB
-        db.VoiceResponse.create({ 
-            textHash, originalText: text, audioUrl: cloudinaryUrl, voiceId: "ELEVEN_LABS_AUTO" 
-        }).catch(err => console.error("DB Save Error:", err.message));
+        if (db && db.VoiceResponse) {
+            db.VoiceResponse.create({ 
+                textHash, originalText: text, audioUrl: cloudinaryUrl, voiceId: "ELEVEN_LABS_AUTO" 
+            }).catch(err => console.error("DB Save Error:", err.message));
+        }
         
         return cloudinaryUrl;
 
     } catch (error) {
-        if (error.response && [401, 402, 429].includes(error.response.status)) {
-            console.warn(`⚠️ ElevenLabs Issue (${error.response.status}).`);
-            return null;
-        }
-        console.error(`⚠️ Voice Gen Failed: ${error.message}`);
         return null;
     }
 }
 
 module.exports = { 
-    generateTitanResponse, // New RAG Function
-    analyzeImageWithAI,    // Vision
-    getOrGenerateVoice     // Voice
+    generateTitanResponse, 
+    analyzeImageWithAI,    
+    getOrGenerateVoice     
 };
