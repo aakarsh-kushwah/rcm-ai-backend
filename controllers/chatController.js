@@ -30,49 +30,91 @@ const sanitizeInput = (text = "") =>
 // ============================================================
 // 🚀 USER → AI CHAT (UPDATED FOR ASI & VISION)
 // ============================================================
+// ============================================================
+// 🚀 USER → AI CHAT (UPDATED: DEBUGGING & TAG SUPPORT)
+// ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
     
-    // IMAGE HANDLING: Ab 'image' parameter bhi accept hoga
+    // IMAGE HANDLING
     const { message, userId, image } = req.body; 
 
-    // Validation: Message ya Image me se koi ek hona chahiye
     if (!message && !image) {
-        return res.status(400).json({ success: false, message: "Input missing (Text or Image required)" });
+        return res.status(400).json({ success: false, message: "Input missing" });
     }
 
-    // Input Sanitization
     const cleanMsg = message ? sanitizeInput(message) : "Image Analysis Request";
-    const matchText = cleanMsg.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, '');
+    const matchText = cleanMsg.toLowerCase().trim(); // Special chars rehne dein matching ke liye
 
     let replyContent = "";
     let audioUrl = "";
-    let source = "TITAN_ASI"; // Default Source
+    let source = "TITAN_ASI"; 
 
     // ========================================================
-    // 1️⃣ DB FAQ MATCH (HIGHEST PRIORITY - TEXT ONLY)
+    // 1️⃣ DB FAQ MATCH (SMART TAG SEARCH)
     // ========================================================
-    // Vision request ke liye FAQ check nahi karenge
     if (!image) { 
         try {
+            console.log(`🔍 [FAQ CHECK] Searching for: "${matchText}"`);
+
             const faqs = await db.FAQ.findAll({
                 where: { status: 'APPROVED' },
-                attributes: ['question', 'answer', 'audioUrl']
+                attributes: ['id', 'question', 'answer', 'audioUrl', 'tags']
             });
 
-            if (faqs.length) {
-                const questions = faqs.map(f => f.question.toLowerCase());
-                const match = stringSimilarity.findBestMatch(matchText, questions);
+            console.log(`📊 [FAQ CHECK] Loaded ${faqs.length} FAQs from DB.`);
 
-                if (match.bestMatch.rating > 0.80) { // Accuracy increased to 80%
-                    const faq = faqs[match.bestMatchIndex];
-                    replyContent = faq.answer;
-                    audioUrl = faq.audioUrl || "";
-                    source = faq.audioUrl ? "DB_AUDIO_HIT" : "DB_TEXT_ONLY";
+            if (faqs.length) {
+                let bestMatch = { rating: 0, target: null };
+
+                // Har FAQ ko check karo
+                faqs.forEach(faq => {
+                    // 1. Main Question match karo
+                    const qScore = stringSimilarity.compareTwoStrings(matchText, faq.question.toLowerCase());
+                    
+                    // 2. Tags match karo (Agar tags array hai)
+                    let tScore = 0;
+                    let tagsArray = [];
+                    
+                    // Tags parsing logic (JSON or Array)
+                    if (typeof faq.tags === 'string') {
+                        try { tagsArray = JSON.parse(faq.tags); } catch(e) {}
+                    } else if (Array.isArray(faq.tags)) {
+                        tagsArray = faq.tags;
+                    }
+
+                    if (tagsArray.length > 0) {
+                        const tagMatch = stringSimilarity.findBestMatch(matchText, tagsArray);
+                        tScore = tagMatch.bestMatch.rating;
+                    }
+
+                    // Jo score bada ho, use lo
+                    const finalScore = Math.max(qScore, tScore);
+
+                    // Debug Log per FAQ (Optional: Sirf high score dikhayein)
+                    if (finalScore > 0.3) {
+                        console.log(`   👉 Match Attempt: ID ${faq.id} | Score: ${finalScore.toFixed(2)}`);
+                    }
+
+                    if (finalScore > bestMatch.rating) {
+                        bestMatch = { rating: finalScore, faq: faq };
+                    }
+                });
+
+                console.log(`🏆 [BEST MATCH] Score: ${bestMatch.rating.toFixed(2)}`);
+
+                // THRESHOLD: 0.4 (40% match is enough for search)
+                if (bestMatch.rating > 0.40) { 
+                    replyContent = bestMatch.faq.answer;
+                    audioUrl = bestMatch.faq.audioUrl || "";
+                    source = "DB_FAQ_HIT";
+                    console.log("✅ FAQ Found! Serving from Database.");
+                } else {
+                    console.log("❌ No strong match found. Switching to AI.");
                 }
             }
         } catch (err) {
-            console.error("FAQ Match Error:", err.message);
+            console.error("🔥 FAQ Search Failed:", err.message);
         }
     }
 
@@ -82,12 +124,9 @@ const handleChat = asyncHandler(async (req, res) => {
     if (!replyContent) {
         try {
             if (image) {
-                // 👁️ VISION MODE
                 replyContent = await analyzeImageWithAI(image);
                 source = "TITAN_VISION";
             } else {
-                // 🧠 ASI TEXT MODE (Database Connected)
-                // req.user pass kar rahe hain taaki Personalization mile (Pin Level etc.)
                 const currentUser = req.user || { fullName: "Leader", pinLevel: "Associate" };
                 replyContent = await generateTitanResponse(currentUser, cleanMsg);
             }
@@ -96,55 +135,42 @@ const handleChat = asyncHandler(async (req, res) => {
             replyContent = "Network issue. Kripya thodi der baad try karein. Jai RCM.";
         }
 
-        // 🔊 GENERATE AUDIO (Only if not from DB Cache)
+        // Generate Audio for AI response
         try {
-            // Limit audio generation for very long texts to save resources
             if (replyContent.length < 600) {
                 audioUrl = await generateEdgeAudio(replyContent);
             }
         } catch (e) {
             console.error("Audio Gen Failed:", e.message);
-            audioUrl = ""; // Fail silently, text will still go
         }
     }
 
     // ========================================================
-    // 3️⃣ RESPONSE SENDING
+    // 3️⃣ RESPONSE
     // ========================================================
     res.status(200).json({
         success: true,
-        message: replyContent, // Legacy support ke liye
+        message: replyContent,
         reply: replyContent,
         audioUrl: audioUrl || "",
         source,
         latency: `${Date.now() - start}ms`
     });
 
-    // ========================================================
-    // 4️⃣ ASYNC LOGGING + ADMIN ALERT (BACKGROUND)
-    // ========================================================
+    // Logging...
     setImmediate(async () => {
         try {
             if (userId || req.user?.id) {
                 await db.ChatMessage.create({
                     userId: userId || req.user?.id,
                     sender: "USER",
-                    message: cleanMsg, // Image ho to "Image Analysis Request" save hoga
+                    message: cleanMsg,
                     response: replyContent,
                     audioUrl,
-                    source: source // Log source clearly
+                    source: source
                 });
-            } else {
-                console.warn(`⚠️ Chat NOT Saved: userId missing. (Token: ${req.user ? 'OK' : 'Missing'})`);
             }
-
-            // Alert Admin only for LIVE AI (Not cached answers)
-            if ((source === "TITAN_ASI" || source === "TITAN_VISION") && matchText.length > 5) {
-                sendAdminAlert(`[${source}] ${cleanMsg}`, replyContent).catch(() => {});
-            }
-        } catch (err) {
-            console.error("Chat Log Error:", err.message);
-        }
+        } catch (err) { console.error("Log Error:", err.message); }
     });
 });
 

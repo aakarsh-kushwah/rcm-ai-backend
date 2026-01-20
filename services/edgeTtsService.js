@@ -1,29 +1,29 @@
 /**
- * @file src/services/edgeTtsService.js
+ * @file services/edgeTtsService.js
  * @description 🚀 RCM "SWARA" ENGINE (Female Professional Voice)
- * @tuning Voice: SwaraNeural | Tone: Polite, Soft & Confident
  */
 
-const { db } = require('../config/db'); 
+// ✅ FIX 1: Correct Import (Models se db laana hai)
+const db = require('../models'); 
+
 const crypto = require('crypto');
 const googleTTS = require('google-tts-api');
 const sdk = require("microsoft-cognitiveservices-speech-sdk");
 const { uploadAudioToCloudinary } = require('./cloudinaryService'); 
-require('dotenv').config();
+const path = require('path');
+
+// ✅ FIX 2: Correct .env path
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
 const AZURE_REGION = process.env.AZURE_SPEECH_REGION;
 
 // 🎛️ SWARA TUNING (Female Voice Settings)
 const TUNING = {
-    VOICE_NAME:    "hi-IN-SwaraNeural", // 👈 THE CHANGE
-    SILENCE_BUFFER:"300ms",             // Soft Start
-    
-    // Female voice natural speed par hi achi lagti hai
-    SPEED_FAST:    "+15%", // Josh
-    SPEED_NORMAL:  "+10%", // Normal
-    
-    // Pitch ko '0Hz' rakhenge (Natural), ya thoda badhayenge softness ke liye
+    VOICE_NAME:    "hi-IN-SwaraNeural", 
+    SILENCE_BUFFER:"300ms",            
+    SPEED_FAST:    "+15%", 
+    SPEED_NORMAL:  "+10%", 
     PITCH_NATURAL: "+0Hz", 
 };
 
@@ -42,33 +42,28 @@ function escapeXML(unsafe) {
     });
 }
 
-// 🧠 1. CONTEXT ENGINE (Swara ka Mood)
+// 🧠 1. CONTEXT ENGINE
 function analyzeSentiment(text) {
     if (!text) return { rate: TUNING.SPEED_NORMAL, pitch: "0Hz", style: "cheerful", degree: "1.0" };
     const lowerText = text.toLowerCase();
 
-    // 1. Josh / Welcome (Cheerful & Bright)
     if (lowerText.match(/(swagat|badhai|shandar|zabardast|target|jeet|profit|crore|jai rcm|mission|bada|toofan)/)) {
         return { rate: TUNING.SPEED_FAST, pitch: "+2Hz", style: "cheerful", degree: "1.5" };
     }
     
-    // 2. Empathy / Help (Very Soft & Polite)
     if (lowerText.match(/(maafi|sorry|samasya|dikkat|dukh|loss|haar|chinta|dhyan|samajh|galti|sochiye)/)) {
         return { rate: "+5%", pitch: "-2Hz", style: "empathetic", degree: "1.2" };
     }
 
-    // 3. Default Professional (Confident but Sweet)
-    // Swara ke liye "chat" style best nahi hai, "cheerful" kam degree par best hai
     return { rate: TUNING.SPEED_NORMAL, pitch: TUNING.PITCH_NATURAL, style: "cheerful", degree: "0.8" };
 }
 
-// 🗣️ 2. HINDI PHONETICS (Swara ke liye optimized)
+// 🗣️ 2. HINDI PHONETICS
 function optimizeTextForHumanSpeech(text) {
     if (!text) return "";
     
     let script = escapeXML(text);
 
-    // Filler Emotion (Swara ke 'Hmm' aur 'Achha' soft hone chahiye)
     script = script.replace(/हम्म/g, `<prosody pitch="-2Hz" rate="-10%" volume="-20%">हम्म...</prosody>`);
     script = script.replace(/Hmm/gi, `<prosody pitch="-2Hz" rate="-10%" volume="-20%">हम्म...</prosody>`);
     
@@ -78,7 +73,6 @@ function optimizeTextForHumanSpeech(text) {
     script = script.replace(/जी/g, `<prosody pitch="+2Hz" rate="-5%" volume="-10%">जी</prosody>`);
     script = script.replace(/Ji/gi, `<prosody pitch="+2Hz" rate="-5%" volume="-10%">जी</prosody>`);
 
-    // Dictionary (English words ko Hindi accent dena)
     const dictionary = {
         "RCM": "आर सी एम",
         "Business": "बिज़नेस",
@@ -103,7 +97,6 @@ function optimizeTextForHumanSpeech(text) {
         script = script.replace(regex, dictionary[key]);
     });
 
-    // Random Breathing (Natural Pauses)
     script = script.replace(/(\||\.)/g, () => {
         const pause = ["300ms", "400ms"][Math.floor(Math.random() * 2)];
         return `.<break time="${pause}"/>`;
@@ -120,7 +113,6 @@ function createCinematicSSML(text) {
 
     if (!mood || !mood.style) mood = { rate: "+10%", pitch: "0Hz", style: "cheerful", degree: "1.0" };
 
-    // Single Line Return (No Spaces)
     return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="hi-IN"><voice name="${TUNING.VOICE_NAME}"><break time="${TUNING.SILENCE_BUFFER}"/><mstts:express-as style="${mood.style}" styledegree="${mood.degree}"><prosody rate="${mood.rate}" pitch="${mood.pitch}">${actingScript}</prosody></mstts:express-as></voice></speak>`;
 }
 
@@ -131,7 +123,6 @@ const synthesizeWithAzureToBuffer = (text) => {
         const speechConfig = sdk.SpeechConfig.fromSubscription(AZURE_KEY, AZURE_REGION);
         speechConfig.speechSynthesisVoiceName = TUNING.VOICE_NAME; 
         
-        // 24kHz (Best Balance for Female Voice)
         speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Audio24Khz96KBitRateMonoMp3;
 
         const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null); 
@@ -161,9 +152,14 @@ const generateEdgeAudio = async (text) => {
     const textHash = generateTextHash(cleanText);
 
     try {
-        const cachedEntry = await db.VoiceResponse.findOne({ where: { textHash } });
-        if (cachedEntry && cachedEntry.audioUrl) return cachedEntry.audioUrl;
-    } catch (e) {}
+        // ✅ AB YE ERROR NAHI DEGA (Kyunki db sahi load ho raha hai)
+        if (db && db.VoiceResponse) {
+            const cachedEntry = await db.VoiceResponse.findOne({ where: { textHash } });
+            if (cachedEntry && cachedEntry.audioUrl) return cachedEntry.audioUrl;
+        }
+    } catch (e) {
+        console.error("Cache Check Error:", e.message);
+    }
 
     let audioBuffer = null;
     let voiceSource = 'AZURE_SWARA_FEMALE';
@@ -185,7 +181,14 @@ const generateEdgeAudio = async (text) => {
     if (audioBuffer) {
         const cloudUrl = await uploadAudioToCloudinary(audioBuffer, textHash);
         if (cloudUrl) {
-            await db.VoiceResponse.create({ textHash, originalText: cleanText, audioUrl: cloudUrl, voiceType: voiceSource }).catch(()=>{});
+            if (db && db.VoiceResponse) {
+                await db.VoiceResponse.create({ 
+                    textHash, 
+                    originalText: cleanText, 
+                    audioUrl: cloudUrl, 
+                    voiceType: voiceSource 
+                }).catch(err => console.error("DB Save Error:", err.message));
+            }
             return cloudUrl;
         }
     }
