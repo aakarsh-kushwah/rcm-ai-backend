@@ -1,27 +1,45 @@
-// src/config/redis.js
-require('dotenv').config(); // 👈 Ye sabse important line hai (Variables load karne ke liye)
+/**
+ * @file src/config/redis.js
+ * @description Titan Centralized Redis Core (Fixed for Startup Crash)
+ */
+require('dotenv').config();
 const IORedis = require('ioredis');
 
-// URL Debugging (Logs mein dikhega ki URL mila ya nahi)
 const redisUrl = process.env.REDIS_URL;
 
 if (!redisUrl) {
-    console.error("❌ CRITICAL ERROR: REDIS_URL environment variable is MISSING!");
-    console.log("⚠️ Falling back to 127.0.0.1 (Localhost) - This will FAIL on Cloud.");
+    console.log("⚠️ [TITAN-REDIS] Using Localhost (Dev Mode)");
 } else {
-    console.log("✅ Cloud Redis URL Detected:", redisUrl.substring(0, 20) + "..."); 
+    console.log("✅ [TITAN-REDIS] Cloud URL Detected");
 }
 
-// Universal Connection Config
 const connection = new IORedis(redisUrl || 'redis://127.0.0.1:6379', {
-    maxRetriesPerRequest: null, // BullMQ Requirement
+    maxRetriesPerRequest: null,
     enableReadyCheck: false,
-    // Agar 'rediss://' (Secure) hai to TLS enable karo
-    tls: redisUrl && redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined
+    
+    // ✅ CRITICAL FIX: Ise 'true' karein taaki startup par crash na ho
+    enableOfflineQueue: true, 
+
+    tls: redisUrl && redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+    retryStrategy: (times) => Math.min(times * 50, 2000)
 });
 
-connection.on('connect', () => console.log('🔌 Redis: Connecting...'));
-connection.on('ready', () => console.log('⚡ Redis: Connected & Ready!'));
-connection.on('error', (err) => console.error('🔥 Redis Error:', err.message));
+connection.on('connect', () => console.log('🔌 [TITAN-REDIS] Connecting...'));
+connection.on('ready', () => console.log('⚡ [TITAN-REDIS] Ready!'));
+connection.on('error', (err) => console.warn('⚠️ [TITAN-REDIS] Status:', err.message));
 
-module.exports = connection;
+// Smart Caching Functions
+const getSmartCache = async (key) => {
+    try {
+        const data = await connection.get(key);
+        return data ? JSON.parse(data) : null;
+    } catch (e) { return null; }
+};
+
+const setSmartCache = async (key, value, ttl = 3600) => {
+    try {
+        await connection.set(key, JSON.stringify(value), 'EX', ttl);
+    } catch (e) {}
+};
+
+module.exports = { connection, getSmartCache, setSmartCache };

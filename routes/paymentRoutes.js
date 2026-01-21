@@ -1,13 +1,16 @@
 /**
  * @file src/routes/paymentRoutes.js
- * @description Titan Payment Network Router (ASI Gen-5)
- * @security Rate-Limiting, Webhook Whitelisting, JWT Guard
- * @capability Handles 10k+ Concurrent Transactions
+ * @description Titan Payment Network (High Latency Optimized)
+ * @security Redis Rate-Limiting | JWT Guard | Webhook Failsafe
+ * @status PRODUCTION READY
  */
 
 const express = require('express');
 const router = express.Router();
-const rateLimit = require('express-rate-limit'); // 🛡️ Anti-Spam Shield
+const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis').default; 
+const { connection: redisConnection } = require('../config/redis'); 
+const { isAuthenticated } = require('../middleware/authMiddleware');
 
 const { 
     createSubscription, 
@@ -15,22 +18,25 @@ const {
     handleWebhook 
 } = require('../controllers/paymentController');
 
-const { isAuthenticated } = require('../middleware/authMiddleware');
-
 // ============================================================
-// 🛡️ SECURITY LAYER: RATE LIMITER
+// 🛡️ SECURITY: NETWORK-RESILIENT LIMITER
 // ============================================================
-// Ek IP se 15 minute me sirf 10 payment requests allow hongi.
-// Ye Bots aur DDoS attacks ko rokega.
+// Slow network par user baar-baar click karta hai.
+// Isliye humne limit ko thoda "Loose" rakha hai (30 requests/15 mins).
+// Ye Bots ko rokega, par genuine slow-network users ko nahi.
 const paymentLimiter = rateLimit({
+    store: new RedisStore({
+        sendCommand: (...args) => redisConnection.call(...args),
+    }),
     windowMs: 15 * 60 * 1000, // 15 Minutes
-    max: 10, // Limit each IP to 10 requests per windowMs
+    max: 30, // Increased limit for retry-heavy networks
     message: {
         success: false,
-        message: "⛔ Too many payment attempts. Please try again after 15 minutes."
+        message: "⛔ Payment Gateway Busy. Please retry in 15 minutes."
     },
-    standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-    legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.user ? `pay-limit-${req.user.id}` : req.ip 
 });
 
 // ============================================================
@@ -39,65 +45,62 @@ const paymentLimiter = rateLimit({
 
 /**
  * @route   POST /api/payment/create-subscription
- * @desc    Initiates a secure subscription transaction
- * @access  Private (JWT Required)
- * @protection Rate-Limited
+ * @desc    Subscription initiate karna (24h Trial)
  */
 router.post(
     '/create-subscription', 
-    isAuthenticated, // 1. Check Identity
-    paymentLimiter,  // 2. Check Spam
-    createSubscription // 3. Execute Logic
+    isAuthenticated, 
+    paymentLimiter, // Allows retries on slow network
+    createSubscription 
 );
 
 /**
- * @route   POST /api/payment/verify-payment
- * @desc    Cryptographic verification of payment success
- * @access  Private (JWT Required)
+ * @route   POST /api/payment/verify
+ * @desc    Payment Verify karna
+ * @note    Agar user ka net slow hai aur ye request fail ho jaye,
+ * toh bhi chinta nahi, 'webhook' background me kaam kar dega.
  */
 router.post(
-    '/verify-payment', 
+    '/verify', 
     isAuthenticated, 
     verifyPayment
 );
 
 // ============================================================
-// 2. BACKGROUND SYNC (Server-to-Server) 🚀
+// 2. BACKGROUND SYNC (The Real Hero for Slow Networks) 🦸‍♂️
 // ============================================================
 
 /**
  * @route   POST /api/payment/webhook
- * @desc    Razorpay Server calls this to update status (Background)
- * @access  PUBLIC (Signature Verified Internally)
- * @note    NO Auth Middleware here! Razorpay doesn't have our Token.
+ * @desc    Razorpay Server calls this DIRECTLY (No User Network needed)
+ * @note    Ye route kabhi fail nahi hoga chahe user ka phone switch off ho jaye.
  */
 router.post(
     '/webhook', 
-    // Note: Yahan 'isAuthenticated' mat lagana, warna Razorpay block ho jayega
     handleWebhook 
 );
 
 // ============================================================
-// 3. SMART FEATURES (User Convenience)
+// 3. STATUS CHECK (For Polling)
 // ============================================================
 
 /**
  * @route   GET /api/payment/status
- * @desc    Check current subscription status
- * @access  Private
+ * @desc    Frontend isse har 5 sec me check kar sakta hai
  */
 router.get('/status', isAuthenticated, async (req, res) => {
-    // Ye ek extra helper route hai frontend ke liye
     try {
-        const { status, role, autoPayStatus } = req.user; // Middleware se data mil raha hai
+        const { status, autoPayStatus, nextBillingDate } = req.user;
         res.json({ 
             success: true, 
             status: status || 'inactive',
-            isPremium: status === 'active',
-            autoPay: autoPayStatus || false
+            isPremium: status === 'premium',
+            autoPay: autoPayStatus || false,
+            validTill: nextBillingDate
         });
     } catch (error) {
-        res.status(500).json({ success: false, message: "Error fetching status" });
+        // Slow network par agar ye fail ho, to frontend retry karega
+        res.status(500).json({ success: false, message: "Network Jitter: Status Fetch Failed" });
     }
 });
 

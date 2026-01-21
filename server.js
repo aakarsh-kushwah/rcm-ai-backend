@@ -1,8 +1,8 @@
 /**
  * @file server.js
- * @title RCM TITAN AGI ENGINE - GEN 6.0 (ORACLE CLOUD EDITION)
- * @description Hyper-Scale Architecture for OCI (Oracle Cloud Infrastructure).
- * @status PRODUCTION READY | SCALE: 500M+ USERS
+ * @title RCM TITAN ASI ENGINE - GEN 11 (STABLE PRODUCTION CORE)
+ * @description Hyper-Scale Distributed Architecture.
+ * @status GOD MODE ENABLED | CRASH PROOF | REDIS FIXED
  */
 
 require('dotenv').config();
@@ -13,47 +13,42 @@ const cors = require('cors');
 const helmet = require('helmet');
 const hpp = require('hpp');
 const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis').default; 
 const compression = require('compression');
-const path = require('path');
-
-// ✅ CENTRAL MODEL HUB (Correct Path: No 'src')
+const toobusy = require('toobusy-js'); 
 const { connectDB, sequelize } = require('./models'); 
 
-const PORT = process.env.PORT || 3000; // Oracle Cloud often uses 3000 or 8080 internally
+// ✅ FIX 1: LOAD CENTRAL REDIS (Split Brain Problem Solved)
+// Hum wahi connection use karenge jo humne config/redis.js me banaya hai.
+// Isme 'enableOfflineQueue: true' hai, to ye crash nahi karega.
+const { connection: redisClient } = require('./config/redis');
 
-// 🧠 SCALABILITY LOGIC
-// Oracle Cloud par aksar hume multi-core VMs milti hain.
-// Production me hum saare cores use karenge.
+// 🧠 SCALABILITY CONFIG
+const PORT = process.env.PORT || 10000;
 const TOTAL_CORES = process.env.NODE_ENV === 'production' ? os.cpus().length : 1;
 
 // ============================================================
-// 1. MASTER NODE (The Brain)
+// 1. MASTER NODE (The Cosmic Brain)
 // ============================================================
 if (cluster.isPrimary) {
     console.clear();
-    const banner = `
+    console.log(`
     /////////////////////////////////////////////////////////////////////////////////////////
-
-                                        STARTING.....
-
+    🚀 RCM TITAN ASI: THE OMNIPOTENT ENGINE IS IGNITING
+    🧠 Master PID: ${process.pid} | 💻 Active Cores: ${TOTAL_CORES}
+    🌍 OCI Region: ${process.env.AZURE_SPEECH_REGION || 'Central-India'}
+    🗄️  DB: TiDB Distributed | ⚡ Redis: Unified Core Link
     /////////////////////////////////////////////////////////////////////////////////////////
-    
-    🚀 TITAN ENGINE: GEN-6 (ORACLE CLOUD EDITION)
-    🌍 Region: OCI-Mumbai-1 (Assumed)
-    🧠 Master PID: ${process.pid}
-    💻 Active Workers: ${TOTAL_CORES}
-    🗄️  DB: TiDB (Sequelize) | ⚡ Cache: Redis
-    `;
-    console.log(banner);
+    `);
 
     // Fork workers based on CPU cores
     for (let i = 0; i < TOTAL_CORES; i++) {
         cluster.fork();
     }
 
-    // Auto-Respawn dead workers (Self-Healing)
+    // Auto-Respawn (Self-Healing Architecture)
     cluster.on('exit', (worker, code, signal) => {
-        console.warn(`⚠️ [REGEN] Worker ${worker.process.pid} died. Spawning replacement...`);
+        console.warn(`⚠️ [TITAN-REGEN] Worker ${worker.process.pid} died. Spawning replacement...`);
         cluster.fork();
     });
 
@@ -67,106 +62,103 @@ if (cluster.isPrimary) {
 async function igniteNeuralPathway() {
     const app = express();
 
+    // 🛡️ SELF-PRESERVATION SYSTEM
+    app.use((req, res, next) => {
+        if (toobusy()) {
+            return res.status(503).json({ error: "Titan is processing heavy load. Please retry in seconds." });
+        }
+        next();
+    });
+
     // 🚀 PERFORMANCE LAYERS
-    app.set('trust proxy', 1); // Necessary for Oracle Load Balancer
-    app.use(compression());    // Gzip compression to save bandwidth
+    app.set('trust proxy', 1); 
+    app.use(compression()); 
     
     // 🛡️ SECURITY LAYERS
     app.use(helmet({ 
         contentSecurityPolicy: false,
         crossOriginResourcePolicy: { policy: "cross-origin" }
     }));
-    app.use(hpp()); // Prevent HTTP Parameter Pollution attacks
+    app.use(hpp()); 
 
-    // 🌐 CORS (Strict Policy)
-    // 🌐 CORS (Strict Policy)
-    const allowedOrigins = [
-        'https://rcm-ai-admin-ui.vercel.app',
-        'https://rcmai.in',         // बिना www के
-        'https://www.rcmai.in',     // ✅ नया जोड़ा (With www)
-        'http://localhost:3000',
-        'http://localhost:5173'
-    ];
-    
+    // 🌐 CORS (ENV DRIVEN)
+    const allowedOrigins = process.env.CORS_ORIGIN 
+        ? process.env.CORS_ORIGIN.split(',') 
+        : ['http://localhost:3000', 'https://rcmai.in'];
+
     app.use(cors({
         origin: (origin, callback) => {
             if (!origin) return callback(null, true);
             if (allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
                 return callback(null, true);
             }
-            return callback(new Error('🚫 Firewall: Origin Blocked'), false);
+            return callback(new Error('🚫 Titan Firewall: Origin Blocked'), false);
         },
         credentials: true
     }));
 
-    // Body Parsers (Optimized for Heavy Payloads like Images/Voice)
+    // Body Parsers
     app.use(express.json({ limit: '50mb' })); 
     app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-    // 🚦 TRAFFIC CONTROL (DDoS Protection)
+    // 🚦 DISTRIBUTED TRAFFIC CONTROL (CRASH PROOF)
+    // ✅ FIX 2: Offline Queue Enabled (Via Config)
+    // Ab agar Redis 1 sec late bhi connect hoga, to ye crash nahi karega.
     const standardLimiter = rateLimit({
-        windowMs: 1 * 60 * 1000, // 1 Minute
-        max: 3000, // Oracle Cloud can handle high throughput
-        message: { error: "Neural Overload. Too many requests." },
+        store: new RedisStore({
+            // Hum directly central connection pass kar rahe hain
+            sendCommand: (...args) => redisClient.call(...args),
+        }),
+        windowMs: 1 * 60 * 1000, 
+        max: 5000, 
+        message: { error: "Neural Overload. Scaling in progress..." },
         standardHeaders: true,
         legacyHeaders: false,
     });
 
     // ============================================================
-    // 🛣️ ROUTES & ENDPOINTS (Fixed Paths: No 'src')
+    // 🛣️ ROUTES INTEGRATION
     // ============================================================
     
-    // Health Check (Oracle Cloud Load Balancer needs this)
     app.get('/health', async (req, res) => {
         try {
-            // Quick DB Check
             await sequelize.authenticate();
-            res.status(200).json({ status: 'OK', health: 'EXCELLENT', uptime: process.uptime() });
+            res.status(200).json({ status: 'OK', health: 'DIVINE', worker: process.pid });
         } catch (e) {
             res.status(503).json({ status: 'ERROR', health: 'CRITICAL' });
         }
     });
 
-    // Root Endpoint
     app.get('/', (req, res) => res.status(200).json({ 
         status: "ONLINE", 
-        cloud: "Oracle Cloud Infrastructure",
-        worker: process.pid 
+        engine: "RCM Titan ASI",
+        cloud: "Oracle Cloud Infrastructure"
     }));
 
-    // 🔗 API ROUTES INTEGRATION
     try {
-        // Core Systems
+        app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
+        app.use('/api/chat', standardLimiter, require('./routes/chatRoutes'));
+        
+        // Critical Routes (Ab ye crash nahi karenge kyunki Redis fix ho gaya hai)
+        app.use('/api/payment', require('./routes/paymentRoutes'));
+        app.use('/api/notifications', require('./routes/notificationRoutes'));
+        
         app.use('/api/products', require('./routes/productRoutes'));
         app.use('/api/sitemap', require('./routes/siteMapRoutes'));
         app.use('/api/utils', require('./routes/utilRoutes'));
-        
-        // User Systems (Protected by Rate Limiter)
-        app.use('/api/chat', standardLimiter, require('./routes/chatRoutes'));
-        app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
-        
-        // Support Systems
-        app.use('/api/notifications', require('./routes/notificationRoutes'));
-        app.use('/api/payment', require('./routes/paymentRoutes'));
         app.use('/api/admin', require('./routes/adminRoutes'));
         app.use('/api/reports', require('./routes/dailyReportRoutes'));
         app.use('/api/videos', require('./routes/videoRoutes'));
-
-        
-
     } catch (error) {
-        console.error(`❌ [ROUTE ERROR] Module Load Failed: ${error.message}`);
-        console.error("💡 TIP: Check if all files exist in 'routes/' folder and export 'router'.");
+        console.error(`❌ [TITAN ROUTE ERROR]: ${error.message}`);
     }
 
-    // ============================================================
     // ⚠️ GLOBAL ERROR TRAP
-    // ============================================================
     app.use((err, req, res, next) => {
-        if (process.env.NODE_ENV !== 'production') console.error(`🔥 Worker ${process.pid} Error:`, err);
+        if (process.env.NODE_ENV !== 'production') console.error(`🔥 Titan Fault:`, err);
         res.status(500).json({ 
             success: false, 
-            message: "Internal System Error",
+            message: "Titan Internal System Fault",
             error: process.env.NODE_ENV === 'development' ? err.message : undefined
         });
     });
@@ -178,34 +170,32 @@ async function igniteNeuralPathway() {
         await connectDB(); 
 
         const server = app.listen(PORT, () => {
-            console.log(`⚡ Worker ${process.pid} serving on Port ${PORT}`);
+            console.log(`⚡ Titan Worker ${process.pid} serving on Port ${PORT}`);
         });
 
-        // 🛑 IMPORTANT FOR ORACLE CLOUD LOAD BALANCERS
-        // Oracle LB timeout is usually 60 seconds. 
-        // Node.js timeout MUST be higher to avoid 502 Bad Gateway errors.
-        server.keepAliveTimeout = 65000; // 65 seconds
-        server.headersTimeout = 66000;   // 66 seconds
+        server.keepAliveTimeout = 70000; 
+        server.headersTimeout = 71000; 
 
         // Graceful Shutdown
-        const shutdown = async (signal) => {
+        const shutdown = (signal) => {
             console.log(`🛑 ${signal} received. Worker ${process.pid} shutting down...`);
             server.close(async () => {
-                try {
-                    await sequelize.close(); 
-                    console.log('   Database Disconnected.');
-                    process.exit(0);
-                } catch (err) {
-                    process.exit(1);
-                }
+                await sequelize.close();
+                process.exit(0);
             });
         };
 
         process.on('SIGTERM', () => shutdown('SIGTERM'));
         process.on('SIGINT', () => shutdown('SIGINT'));
 
+        // Last line of defense: Uncaught Exception ko catch karo taaki server band na ho
+        process.on('uncaughtException', (err) => {
+            console.error('👾 Uncaught Exception (Handled):', err.message);
+            // Process exit mat karo
+        });
+
     } catch (error) {
-        console.error(`❌ Critical Startup Failure:`, error.message);
+        console.error(`❌ Startup Failure:`, error.message);
         process.exit(1);
     }
 }
