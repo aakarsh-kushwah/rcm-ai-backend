@@ -1,6 +1,6 @@
 /**
  * @file src/models/index.js
- * @description Titan Engine Central Model Loader (ASI Level 10)
+ * @description Titan Engine Central Model Loader (Safe Boot Mode)
  * @capability Hyper-Scale (500M+ Users), Self-Healing, Zero-Downtime
  */
 
@@ -19,7 +19,7 @@ console.log(`🌍 ENVIRONMENT: ${env.toUpperCase()} | 🎯 SCALE: HYPER-SCALE`);
 console.log(`▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓\n`);
 
 // ============================================================
-// 1. DYNAMIC MODEL INJECTION (Smart Loading)
+// 1. DYNAMIC MODEL INJECTION
 // ============================================================
 fs.readdirSync(__dirname)
     .filter(file => {
@@ -33,6 +33,7 @@ fs.readdirSync(__dirname)
     .forEach(file => {
         try {
             const modelPath = path.join(__dirname, file);
+            // Handling both function exports and direct exports
             const modelDef = require(modelPath);
             let model;
             
@@ -47,20 +48,16 @@ fs.readdirSync(__dirname)
             }
         } catch (err) {
             console.error(`❌ [FATAL ERROR] Model Corrupted: ${file}`, err.message);
-            process.exit(1);
         }
     });
 
-// ============================================================
-// 2. NEURAL LINKING (Associations)
-// ============================================================
 Object.keys(db).forEach(modelName => {
     if (db[modelName].associate) {
         db[modelName].associate(db);
     }
 });
 
-// 🔍 DEBUG: MODEL ROLL CALL (Ye batayega ki kaunse model load hue)
+// 🔍 DEBUG: MODEL ROLL CALL
 const modelNames = Object.keys(db).filter(key => key !== 'sequelize' && key !== 'Sequelize');
 console.log(`📋 [TITAN MODELS LOADED]:`);
 if (modelNames.length > 0) {
@@ -74,60 +71,23 @@ db.sequelize = sequelize;
 db.Sequelize = Sequelize;
 
 // ============================================================
-// 3. 🧠 SELF-HEALING ENGINE (Titan Doctor - DEV ONLY)
-// ============================================================
-const performDevSurgery = async () => {
-    // 🛡️ SECURITY LOCK: Production me ye kabhi nahi chalega
-    if (env === 'production') return;
-
-    const qi = sequelize.getQueryInterface();
-    console.log("💉 [TITAN HEALER] Scanning for schema conflicts...");
-
-    try {
-        // 🛠️ FIX 1: NotificationTokens (Index Conflict)
-        await sequelize.query("ALTER TABLE `NotificationTokens` DROP INDEX `token`;").catch(() => {});
-        
-        // 🛠️ FIX 2: SiteMaps (🔥 NUCLEAR FIX - Recreate Table)
-        // Unique Constraint error hatane ke liye purani table uda rahe hain
-        console.log("🧹 [CLEANUP] Resetting SiteMaps Table (Fixing Unique Key)...");
-        await sequelize.query("DROP TABLE IF EXISTS `SiteMaps`;").catch(() => {});
-
-        // 🛠️ FIX 3: Voice Responses (Cache Cleanup)
-        console.log("🧹 [CLEANUP] Resetting Voice Cache Table...");
-        await sequelize.query("DROP TABLE IF EXISTS `voice_responses`;").catch(() => {});
-
-    } catch (e) {
-        console.log("⚠️ [HEALER NOTICE]:", e.message);
-    }
-};
-
-// ============================================================
-// 4. HYPER-SCALE CONNECTION MANAGER
+// 3. HYPER-SCALE CONNECTION MANAGER (Safe Boot)
 // ============================================================
 db.connectDB = async (retries = 5) => { 
     while (retries > 0) {
         try {
-            // Step A: Health Check (Read/Write Split Aware)
+            // Step A: Health Check
             await sequelize.authenticate();
             console.log(`✅ [TITAN DB] Connection Pool Established.`);
             
             // Step B: Environment Specific Logic
             if (env === 'development') {
-                // ================= DEVELOPMENT MODE =================
-                // 1. Pehle Surgery karo (Purani kharab tables hatao)
-                await performDevSurgery();
-
-                // 2. Phir Nayi Tables banao
                 console.log(`⚙️  [DEV] Synchronizing Schema...`);
-                await sequelize.sync({ force: false, alter: true }); // ⚠️ Slow but easy
-                console.log(`✅ [DEV] Database Optimized & Ready.`);
-
+                // 🛑 FORCE SAFE MODE: 'alter: false'
+                await sequelize.sync({ force: false, alter: false });
+                console.log(`✅ [DEV] Database Ready (Safe Mode).`);
             } else {
-                // ================= PRODUCTION MODE =================
-                // 🛑 CRITICAL: NO SYNC, NO ALTER, NO DROP
-                // 50 Crore users ke liye DB Locked rehta hai.
                 console.log(`🛡️ [PROD] Schema Sync DISABLED for Data Safety.`);
-                console.log(`🛡️ [PROD] Running in High-Performance Mode.`);
             }
             
             console.log(`\n🟢 [SYSTEM ONLINE] TITAN ENGINE IS READY.\n`);
@@ -142,14 +102,12 @@ db.connectDB = async (retries = 5) => {
                 process.exit(1); 
             }
             
-            // Exponential Backoff (Wait 5s, 4s, etc.)
             const waitTime = (6 - retries) * 1000; 
             await new Promise(res => setTimeout(res, waitTime));
         }
     }
 };
 
-// Graceful Shutdown for High Traffic
 db.closeDB = async () => {
     try {
         await sequelize.close();
@@ -159,4 +117,5 @@ db.closeDB = async () => {
     }
 };
 
+// EXPORT DIRECTLY (No destructuring needed on import)
 module.exports = db;

@@ -1,40 +1,61 @@
+/**
+ * @file config/firebase.js
+ * @description TITAN FIREBASE CONNECTOR (Universal Loader)
+ * @support Supports both JSON String and Individual .env variables
+ */
+
 const admin = require("firebase-admin");
-require("dotenv").config(); // .env load karna zaroori hai
+require("dotenv").config();
 
 if (!admin.apps.length) {
     try {
-        console.log("🔌 [TITAN FIREBASE]: Connecting via Environment Variables...");
+        console.log("🔌 [TITAN FIREBASE]: Connecting...");
 
-        // 1. .env se keys construct karo (File path ki ab zarurat nahi)
-        const serviceAccount = {
-            projectId: process.env.FIREBASE_PROJECT_ID,
-            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-            // .env me new line (\n) string ban jati hai, use asli new line me badalna padta hai
-            privateKey: process.env.FIREBASE_PRIVATE_KEY 
-                ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') 
-                : undefined
-        };
+        let serviceAccount;
 
-        // 🛡️ Safety Check: Dekho keys load hui ya nahi
-        if (!serviceAccount.projectId || !serviceAccount.clientEmail || !serviceAccount.privateKey) {
-            throw new Error("Critical Firebase variables are missing in .env file!");
+        // SCENARIO 1: User provided the full JSON in one variable (Your Case)
+        if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+            try {
+                // JSON string ko object me convert karein
+                serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+                console.log("🔑 [TITAN FIREBASE]: Loaded via FIREBASE_SERVICE_ACCOUNT JSON.");
+            } catch (parseError) {
+                console.error("❌ [TITAN FIREBASE]: JSON Parse Failed. Check your .env string.");
+            }
+        } 
+        
+        // SCENARIO 2: Individual Variables (Fallback)
+        if (!serviceAccount && process.env.FIREBASE_PROJECT_ID) {
+            serviceAccount = {
+                projectId: process.env.FIREBASE_PROJECT_ID,
+                clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+                privateKey: process.env.FIREBASE_PRIVATE_KEY 
+                    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') 
+                    : undefined
+            };
         }
 
+        // Final Check
+        if (!serviceAccount) {
+            throw new Error("No valid Firebase Keys found in .env (FIREBASE_SERVICE_ACCOUNT is missing or invalid).");
+        }
+
+        // Initialize App
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount),
-            // Audio save karne ke liye bucket ka naam (Aapke project ID se match hona chahiye)
-            storageBucket: `${serviceAccount.projectId}.appspot.com` 
+            // Project ID JSON me 'project_id' hota hai, aur variable me 'projectId'
+            storageBucket: `${serviceAccount.project_id || serviceAccount.projectId}.appspot.com` 
         });
         
-        console.log("✅ [TITAN FIREBASE]: Neural Notification & Storage System Online.");
+        console.log("✅ [TITAN FIREBASE]: System Online.");
 
     } catch (error) {
         console.error("❌ [TITAN FIREBASE INIT FAILED]:", error.message);
-        // Process crash na karein, lekin error dikhana zaroori hai
+        // Hum yahan process.exit() nahi karenge taaki server baaki kaam karta rahe.
     }
 }
 
-// Storage Bucket bhi export karein (Audio feature ke liye chahiye)
-const bucket = admin.storage().bucket();
+// Safely export bucket (Check if app exists first)
+const bucket = admin.apps.length ? admin.storage().bucket() : null;
 
 module.exports = { admin, bucket };

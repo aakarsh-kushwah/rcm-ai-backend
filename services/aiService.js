@@ -1,6 +1,7 @@
 /**
  * @file services/aiService.js
- * @description Titan ASI Engine
+ * @description Titan ASI Engine (V44: Precision RAG + Semantic Ranking + Weight Matching)
+ * @status PRODUCTION READY
  */
 
 const Groq = require("groq-sdk");
@@ -8,8 +9,7 @@ const NodeCache = require("node-cache");
 const axios = require('axios');
 const { uploadAudioToCloudinary } = require('./cloudinaryService');
 
-// 🛠️ FIX 1: Destructuring hatao ({ db } -> db)
-// Kyunki models/index.js seedha object export karta hai.
+// DB connection
 const db = require('../models'); 
 
 const { GET_ASI_PROMPT } = require('../utils/prompts'); 
@@ -17,8 +17,7 @@ const crypto = require('crypto');
 const path = require('path');
 const { Op } = require('sequelize'); 
 
-// 🛠️ FIX 2: Path adjust karo (Kyunki 'src' folder nahi hai)
-// Pehle '../../.env' tha, ab '../.env' hoga.
+// Env Config
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 // Cache Setup
@@ -37,6 +36,7 @@ try {
     }
 } catch (err) { console.error("❌ AI Init Failed:", err.message); }
 
+// Models
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
 const VISION_MODEL = 'llama-3.2-11b-vision-preview';
 
@@ -51,40 +51,120 @@ function cleanIncompleteSentence(text) {
 }
 
 // ============================================================
-// 🔍 RAG SYSTEM: FETCH LIVE DATA
+// 🔍 RAG SYSTEM: SUPER EXPERT RANKING (V44)
 // ============================================================
 async function fetchLiveContext(query) {
     if (!query) return "";
     
     try {
-        const keywords = query.split(' ').filter(w => w.length > 3);
+        // 1. Advanced Tokenization
+        // Extract "25g", "500ml", "1kg" specifically for weight matching
+        const weightRegex = /(\d+\s*[g|kg|ml|l|gm]+)/gi;
+        const weights = query.match(weightRegex) || [];
+        
+        // Clean query for text search
+        const cleanQuery = query.toLowerCase().replace(/[^\w\s]/g, '').trim();
+        const stopWords = [
+            'what', 'is', 'price', 'rate', 'batao', 'kya', 'hai', 'tell', 'me', 'about', 
+            'kaisa', 'cost', 'kitna', 'details', 'show', 'product', 'ka', 'ki', 'ke', 'ko', 'mein', 'he', 'this', 'that', 'it', 'for', 'of'
+        ];
+        
+        const keywords = cleanQuery.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
+
         if (keywords.length === 0) return "";
+        if (!db || !db.Product) return "";
 
-        // ✅ AB YE ERROR NAHI DEGA
-        if (!db || !db.Product) {
-            // console.warn("⚠️ Product table not loaded.");
-            return "";
-        }
-
+        // 2. BROAD FETCH (Get Candidate Pool)
+        // Fetch broad matches first, filter logic comes later in JS (Faster for <10k items)
         const products = await db.Product.findAll({
             where: {
-                [Op.or]: keywords.map(k => ({ 
-                    name: { [Op.like]: `%${k}%` } 
-                }))
+                [Op.or]: [
+                    ...keywords.map(k => ({ name: { [Op.like]: `%${k}%` } })),
+                    ...keywords.map(k => ({ category: { [Op.like]: `%${k}%` } })),
+                    ...keywords.map(k => ({ aiTags: { [Op.like]: `%${k}%` } }))
+                ]
             },
-            limit: 3, 
-            attributes: ['name', 'dp', 'pv', 'mrp', 'description']
+            limit: 15, // Get a pool of 15 candidates
+            attributes: [
+                'name', 'mrp', 'dp', 'pv', 'category', 
+                'description', 'ingredients', 'healthBenefits', 'usageInfo'
+            ],
+            raw: true 
         });
 
-        if (products.length > 0) {
-            return products.map(p => 
-                `PRODUCT MATCH: ${p.name} | MRP: ₹${p.mrp} | DP (Rate): ₹${p.dp} | PV: ${p.pv} | Desc: ${p.description}`
-            ).join('\n');
-        }
-        return "";
+        if (products.length === 0) return "";
+
+        // 3. 🧠 SEMANTIC RANKING ALGORITHM
+        const rankedProducts = products.map(p => {
+            let score = 0;
+            const pName = p.name.toLowerCase();
+            const pCat = (p.category || "").toLowerCase();
+            const pTags = JSON.stringify(p.aiTags || []).toLowerCase();
+
+            // A. Exact Name Keyword Match (High Weight)
+            keywords.forEach(k => {
+                if (pName.includes(k)) score += 40;        
+                else if (pTags.includes(k)) score += 20;   
+                else if (pCat.includes(k)) score += 10;    
+            });
+
+            // B. Exact Weight Match (Critical for variants like 25g vs 50g)
+            weights.forEach(w => {
+                const cleanW = w.replace(/\s+/g, '').toLowerCase(); // "25 g" -> "25g"
+                const cleanPName = pName.replace(/\s+/g, '');
+                if (cleanPName.includes(cleanW)) score += 50; // Huge Boost for correct size
+            });
+
+            // C. Precise Phrase Bonus
+            if (pName.startsWith(keywords[0])) score += 15; // Starts with search term
+
+            return { product: p, score };
+        });
+
+        // 4. SORT & PICK TOP 3
+        rankedProducts.sort((a, b) => b.score - a.score);
+        const topProducts = rankedProducts.slice(0, 3).map(rp => rp.product);
+
+        // 5. FORMATTING FOR AI (Explicit Context)
+        return topProducts.map((p, index) => {
+            const isBestMatch = index === 0 ? "🔥🔥 [BEST MATCH]" : "[RELATED]";
+            
+            // Helper: Clean Arrays/JSON strings
+            const parseList = (val) => {
+                if (!val) return "Not listed";
+                if (Array.isArray(val)) return val.join(", ");
+                try {
+                    const parsed = JSON.parse(val);
+                    return Array.isArray(parsed) ? parsed.join(", ") : val;
+                } catch (e) { return val; }
+            };
+
+            // Helper: Clean Usage
+            const parseUsage = (val) => {
+                if (!val) return "Check packaging";
+                try {
+                    const parsed = typeof val === 'string' ? JSON.parse(val) : val;
+                    return parsed.raw || "Check packaging";
+                } catch (e) { return val; }
+            };
+
+            // Clean Description
+            let desc = p.description ? p.description.substring(0, 500).replace(/\n/g, " ") : "N/A";
+            if (desc === p.name) desc = "No additional details available.";
+
+            return `${isBestMatch}
+📦 PRODUCT: ${p.name}
+📂 CATEGORY: ${p.category}
+💰 PRICING: MRP ₹${p.mrp} | DP ₹${p.dp} | PV ${p.pv}
+📝 ABOUT: ${desc}
+🥗 INGREDIENTS: ${parseList(p.ingredients)}
+💪 BENEFITS: ${parseList(p.healthBenefits)}
+⚙️ USAGE: ${parseUsage(p.usageInfo)}
+`;
+        }).join("\n===================================\n");
 
     } catch (error) {
-        console.error("⚠️ DB Context Fetch Failed:", error.message);
+        console.error("⚠️ Expert Context Error:", error.message);
         return "";
     }
 }
@@ -92,27 +172,34 @@ async function fetchLiveContext(query) {
 // ============================================================
 // 🧠 TEXT GENERATION (TITAN ASI)
 // ============================================================
-async function generateTitanResponse(user, message) {
+async function generateTitanResponse(user, message, history = []) {
     if (!groqClient) return "System maintenance par hai. Jai RCM.";
     
     try {
+        // 1. Fetch relevant product data (Using V44 Ranking)
         const liveData = await fetchLiveContext(message);
 
+        // 2. Generate System Prompt
         const systemPrompt = GET_ASI_PROMPT({
             userName: user?.fullName || "Leader",
             userPin: user?.pinLevel || "Associate Buyer",
             liveData: liveData 
         });
 
+        // 3. Message Chain
+        const conversationChain = [
+            { role: "system", content: systemPrompt },
+            ...history, 
+            { role: "user", content: message }
+        ];
+
         const completion = await groqClient.chat.completions.create({
             model: TEXT_MODEL,
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: message }
-            ], 
-            temperature: 0.6,
-            max_tokens: 600,
-            top_p: 0.9,
+            messages: conversationChain, 
+            // 🛑 STRICT TEMPERATURE: Keeps answers factual based on liveData
+            temperature: 0.3, 
+            max_tokens: 800,
+            top_p: 0.85,
         });
 
         let aiResponse = completion.choices[0]?.message?.content || "";
@@ -125,7 +212,7 @@ async function generateTitanResponse(user, message) {
 }
 
 // ============================================================
-// 👁️ VISION ANALYSIS
+// 👁️ VISION ANALYSIS (UNCHANGED)
 // ============================================================
 async function analyzeImageWithAI(base64Image) {
     if (!groqClient) return "Vision system abhi uplabdh nahi hai.";
@@ -138,14 +225,21 @@ async function analyzeImageWithAI(base64Image) {
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: "You are RCM Titan AI. Analyze this image. If it's a person, greet them with 'Jai RCM'. If it's a product, identify it and tell 1 key health benefit in Hindi/Hinglish." },
+                        { 
+                            type: "text", 
+                            text: "You are an RCM Product Data Scanner. Your task is to extract EXACT text from the image.\n" +
+                                  "1. IDENTIFY: Product Name, Net Quantity/Weight.\n" +
+                                  "2. EXTRACT NUMBERS: Look specifically for 'MRP', 'PV', 'DP' or 'Rate'. Quote exactly what is printed.\n" +
+                                  "3. DISCLAIMER: If the text is blurry or invisible, strictly say 'Details clear nahi hain'. Do NOT guess or hallucinate numbers.\n" +
+                                  "4. LANGUAGE: Hindi/Hinglish summary." 
+                        },
                         { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageContent}` } }
                     ],
                 },
             ],
             model: VISION_MODEL,
-            temperature: 0.5,
-            max_tokens: 200,
+            temperature: 0.2, 
+            max_tokens: 400,
         });
 
         return cleanIncompleteSentence(chatCompletion.choices[0]?.message?.content || "Main is chitra ko samajh nahi paa raha.");
@@ -156,7 +250,7 @@ async function analyzeImageWithAI(base64Image) {
 }
 
 // ============================================================
-// 🎙️ VOICE GENERATION (ELEVENLABS)
+// 🎙️ VOICE GENERATION (UNCHANGED)
 // ============================================================
 async function getOrGenerateVoice(text) {
     if (!text) return null;
@@ -165,7 +259,6 @@ async function getOrGenerateVoice(text) {
         const cleanText = text.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, '').trim();
         const textHash = crypto.createHash('sha256').update(cleanText).digest('hex');
 
-        // ✅ AB YE DB ERROR NAHI DEGA
         if (db && db.VoiceResponse) {
             const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
             if (cachedVoice) return cachedVoice.audioUrl;
@@ -188,7 +281,6 @@ async function getOrGenerateVoice(text) {
 
         const cloudinaryUrl = await uploadAudioToCloudinary(response.data, textHash);
         
-        // Async save to DB
         if (db && db.VoiceResponse) {
             db.VoiceResponse.create({ 
                 textHash, originalText: text, audioUrl: cloudinaryUrl, voiceId: "ELEVEN_LABS_AUTO" 
@@ -204,6 +296,6 @@ async function getOrGenerateVoice(text) {
 
 module.exports = { 
     generateTitanResponse, 
-    analyzeImageWithAI,    
-    getOrGenerateVoice     
+    analyzeImageWithAI,     
+    getOrGenerateVoice      
 };

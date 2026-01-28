@@ -24,6 +24,7 @@
   "dependencies": {
     "@bull-board/api": "^5.10.0",
     "@bull-board/express": "^5.10.0",
+    "@google-cloud/storage": "^7.18.0",
     "@grpc/grpc-js": "^1.10.1",
     "@grpc/proto-loader": "^0.7.10",
     "@langchain/community": "^0.3.0",
@@ -70,7 +71,7 @@
     "pino-http": "^9.0.0",
     "pm2": "^5.3.1",
     "prom-client": "^15.1.0",
-    "puppeteer": "^22.0.0",
+    "puppeteer": "^22.15.0",
     "qrcode-terminal": "^0.12.0",
     "rate-limit-redis": "^4.2.0",
     "razorpay": "^2.9.2",

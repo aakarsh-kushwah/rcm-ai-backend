@@ -1,13 +1,13 @@
 /**
  * @file src/config/db.js
- * @description Titan Hyper-Scale Database Engine (Fixed Validator & KeepAlive)
+ * @description Titan Hyper-Scale Database Engine (Fixed Configuration)
  */
 
 require('dotenv').config();
 const { Sequelize } = require('sequelize');
 
 // ============================================================
-// 1. 🧠 SMART CONFIGURATION
+// 1. SMART CONFIGURATION
 // ============================================================
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -28,31 +28,12 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
     port: DB_PORT,
     dialect: 'mysql',
     
-    // 🧠 REPLICATION
-    replication: {
-        read: [{ host: DB_HOST, username: DB_USER, password: DB_PASS }],
-        write: { host: DB_HOST, username: DB_USER, password: DB_PASS }
-    },
-
-    // 🌊 TITAN SMART POOLING (Fixed for MySQL2)
+    // 🌊 TITAN SMART POOLING
     pool: {
         max: MAX_CONNECTIONS,
         min: 0,
-        acquire: 30000,
+        acquire: 60000, 
         idle: 10000, 
-        
-        // ✨ FIX: Validator ab Promise wrapper use karega (Callback support ke liye)
-        validate: (conn) => {
-            return new Promise((resolve, reject) => {
-                // Raw MySQL connection callback based hota hai
-                conn.query('SELECT 1', (error) => {
-                    if (error) {
-                        return reject(error);
-                    }
-                    return resolve(true);
-                });
-            });
-        }
     },
 
     dialectOptions: {
@@ -62,13 +43,13 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
             rejectUnauthorized: false,
             minVersion: 'TLSv1.2'
         },
-        // ⚡ FIX: 'keepAlive' ki jagah 'enableKeepAlive' (MySQL2 Warning Fix)
+        // ⚡ FIX: 'keepAlive' ki warning hatane ke liye sahi option
         enableKeepAlive: true, 
         connectTimeout: 60000, 
         charset: 'utf8mb4',
     },
 
-    logging: false, // Logs saaf rakhne ke liye false kiya
+    logging: false, 
     benchmark: true,      
     timezone: '+05:30',   
 
@@ -79,21 +60,6 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
         underscored: false,
         freezeTableName: false 
     },
-    
-    // ✅ Retry Logic
-    retry: {
-        match: [
-            /SequelizeConnectionError/,
-            /SequelizeConnectionRefusedError/,
-            /SequelizeHostNotFoundError/,
-            /SequelizeHostNotReachableError/,
-            /InvalidConnectionError/,
-            /ConnectionLostError/,
-            /protocol_sequence_error/,
-            /ETIMEDOUT/
-        ],
-        max: 3
-    }
 });
 
 module.exports = { sequelize, Sequelize };

@@ -82,9 +82,13 @@ async function igniteNeuralPathway() {
     app.use(hpp()); 
 
     // 🌐 CORS (ENV DRIVEN)
-    const allowedOrigins = process.env.CORS_ORIGIN 
-        ? process.env.CORS_ORIGIN.split(',') 
-        : ['http://localhost:3000', 'https://rcmai.in'];
+    const allowedOrigins = [
+        'https://rcm-ai-admin-ui.vercel.app',
+        'https://rcmai.in',         // बिना www के
+        'https://www.rcmai.in',     // ✅ नया जोड़ा (With www)
+        'http://localhost:3000',
+        'http://localhost:5173'
+    ];
 
     app.use(cors({
         origin: (origin, callback) => {
@@ -143,9 +147,9 @@ async function igniteNeuralPathway() {
         app.use('/api/payment', require('./routes/paymentRoutes'));
         app.use('/api/notifications', require('./routes/notificationRoutes'));
         
-        app.use('/api/products', require('./routes/productRoutes'));
-        app.use('/api/sitemap', require('./routes/siteMapRoutes'));
-        app.use('/api/utils', require('./routes/utilRoutes'));
+        // app.use('/api/products', require('./routes/productRoutes'));
+        // app.use('/api/sitemap', require('./routes/siteMapRoutes'));
+        // app.use('/api/utils', require('./routes/utilRoutes'));
         app.use('/api/admin', require('./routes/adminRoutes'));
         app.use('/api/reports', require('./routes/dailyReportRoutes'));
         app.use('/api/videos', require('./routes/videoRoutes'));

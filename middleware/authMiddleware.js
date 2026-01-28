@@ -4,7 +4,8 @@
  */
 
 const jwt = require('jsonwebtoken');
-const { User } = require('../models');
+// ✅ FIX: Properly destructure User from the models export
+const { User } = require('../models'); 
 
 // ============================================================
 // 1. NEURAL TOKEN VALIDATOR (JWT Check)
@@ -41,6 +42,12 @@ const isActiveUser = async (req, res, next) => {
 
         if (!userId) return res.status(401).json({ success: false, message: '🚫 Identity Verification Failed.' });
 
+        // ✅ FIX: Ensure User model is available
+        if (!User) {
+            console.error("🔥 CRITICAL: User model undefined in Middleware");
+            return res.status(500).json({ success: false, message: 'System Error: DB Model Missing.' });
+        }
+
         // 1. Fetch User (Only Status Needed)
         const user = await User.findByPk(userId, {
             attributes: ['id', 'status', 'role']
@@ -61,14 +68,11 @@ const isActiveUser = async (req, res, next) => {
         }
 
         // 4. SIMPLE STATUS CHECK
-        // Agar status 'active' ya 'premium' hai -> Access Granted
-        // Agar 'pending' ya 'inactive' hai -> Access Denied
         if (user.status === 'active' || user.status === 'premium') {
             req.userStatus = user.status;
             req.userRole = user.role;
             next();
         } else {
-            // Subscription Required
             return res.status(403).json({
                 success: false,
                 message: '⛔ Subscription Required. Please complete payment.',

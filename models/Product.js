@@ -43,7 +43,10 @@ module.exports = (sequelize) => {
         // 🔗 External Data
         sitePath: DataTypes.STRING,
         productUrl: DataTypes.STRING,
-        imageUrl: DataTypes.STRING,
+        imageUrl: { 
+            type: DataTypes.TEXT, // String ki jagah TEXT (Bada storage)
+            allowNull: true 
+        },
 
         // 🏷️ AI Tags for Smart Recommendations
         // JSON: ["summer_special", "women_health", "weight_loss"]

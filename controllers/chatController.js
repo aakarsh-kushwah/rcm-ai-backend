@@ -10,8 +10,15 @@ const stringSimilarity = require('string-similarity');
 const { generateTitanResponse, analyzeImageWithAI } = require('../services/aiService');
 const { generateEdgeAudio } = require('../services/edgeTtsService');
 const { uploadAudioToCloudinary } = require('../services/cloudinaryService');
-const db = require('../models'); // ✅ यह सही है
-const { ChatMessage, FAQ, VoiceResponse, Product } = db; // Destructure here
+const db = require('../models'); 
+const { ChatMessage, FAQ, VoiceResponse, Product } = db; 
+
+// ============================================================
+// ⚙️ CONSTANTS & CONFIG (ADDED FOR EXPERT MATCHING)
+// ============================================================
+const BASE_THRESHOLD = 0.60; 
+const SHORT_TEXT_THRESHOLD = 0.75; 
+
 // ============================================================
 // 🟡 ADMIN ALERT WRAPPER (Safe Mode)
 // ============================================================
@@ -30,9 +37,6 @@ const sanitizeInput = (text = "") =>
 // ============================================================
 // 🚀 USER → AI CHAT (UPDATED FOR ASI & VISION)
 // ============================================================
-// ============================================================
-// 🚀 USER → AI CHAT (UPDATED: DEBUGGING & TAG SUPPORT)
-// ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
     
@@ -44,7 +48,11 @@ const handleChat = asyncHandler(async (req, res) => {
     }
 
     const cleanMsg = message ? sanitizeInput(message) : "Image Analysis Request";
-    const matchText = cleanMsg.toLowerCase().trim(); // Special chars rehne dein matching ke liye
+    const matchText = cleanMsg.toLowerCase().trim(); 
+
+    // 🧠 Dynamic Threshold Logic
+    const wordCount = matchText.split(/\s+/).length;
+    const currentThreshold = wordCount < 5 ? SHORT_TEXT_THRESHOLD : BASE_THRESHOLD;
 
     let replyContent = "";
     let audioUrl = "";
@@ -55,28 +63,21 @@ const handleChat = asyncHandler(async (req, res) => {
     // ========================================================
     if (!image) { 
         try {
-            console.log(`🔍 [FAQ CHECK] Searching for: "${matchText}"`);
+            console.log(`🔍 [FAQ CHECK] Searching for: "${matchText}" | Req Score: ${currentThreshold}`);
 
             const faqs = await db.FAQ.findAll({
                 where: { status: 'APPROVED' },
                 attributes: ['id', 'question', 'answer', 'audioUrl', 'tags']
             });
 
-            console.log(`📊 [FAQ CHECK] Loaded ${faqs.length} FAQs from DB.`);
-
             if (faqs.length) {
-                let bestMatch = { rating: 0, target: null };
+                let bestMatch = { rating: 0, faq: null };
 
-                // Har FAQ ko check karo
                 faqs.forEach(faq => {
-                    // 1. Main Question match karo
                     const qScore = stringSimilarity.compareTwoStrings(matchText, faq.question.toLowerCase());
-                    
-                    // 2. Tags match karo (Agar tags array hai)
                     let tScore = 0;
                     let tagsArray = [];
                     
-                    // Tags parsing logic (JSON or Array)
                     if (typeof faq.tags === 'string') {
                         try { tagsArray = JSON.parse(faq.tags); } catch(e) {}
                     } else if (Array.isArray(faq.tags)) {
@@ -88,29 +89,18 @@ const handleChat = asyncHandler(async (req, res) => {
                         tScore = tagMatch.bestMatch.rating;
                     }
 
-                    // Jo score bada ho, use lo
                     const finalScore = Math.max(qScore, tScore);
-
-                    // Debug Log per FAQ (Optional: Sirf high score dikhayein)
-                    if (finalScore > 0.3) {
-                        console.log(`   👉 Match Attempt: ID ${faq.id} | Score: ${finalScore.toFixed(2)}`);
-                    }
 
                     if (finalScore > bestMatch.rating) {
                         bestMatch = { rating: finalScore, faq: faq };
                     }
                 });
 
-                console.log(`🏆 [BEST MATCH] Score: ${bestMatch.rating.toFixed(2)}`);
-
-                // THRESHOLD: 0.4 (40% match is enough for search)
-                if (bestMatch.rating > 0.40) { 
+                if (bestMatch.rating >= currentThreshold) { 
                     replyContent = bestMatch.faq.answer;
                     audioUrl = bestMatch.faq.audioUrl || "";
                     source = "DB_FAQ_HIT";
-                    console.log("✅ FAQ Found! Serving from Database.");
-                } else {
-                    console.log("❌ No strong match found. Switching to AI.");
+                    console.log(`✅ FAQ Found! Serving from Database.`);
                 }
             }
         } catch (err) {
@@ -123,12 +113,38 @@ const handleChat = asyncHandler(async (req, res) => {
     // ========================================================
     if (!replyContent) {
         try {
+            // ✅ UPDATED: CONTEXT MEMORY FETCHING
+            // AI ko pichhle messages bhejne ke liye data fetch kar rahe hain
+            let history = [];
+            const reqUserId = userId || req.user?.id;
+
+            if (reqUserId) {
+                // Fetch last 3 full turns (User + AI) = 3 rows approx if stored together
+                // Note: ChatMessage typically stores 1 row per interaction
+                const pastMessages = await db.ChatMessage.findAll({
+                    where: { userId: reqUserId },
+                    order: [['createdAt', 'DESC']], // Latest pehle
+                    limit: 3 // Last 3 interactions fetch karenge context ke liye
+                });
+
+                // Array reverse karke chronological order (Oldest -> Newest) banayein
+                pastMessages.reverse().forEach(msg => {
+                    // User ka message
+                    history.push({ role: "user", content: msg.message });
+                    // Agar AI ka reply database me hai to use bhi add karein
+                    if (msg.response) {
+                        history.push({ role: "assistant", content: msg.response });
+                    }
+                });
+            }
+
             if (image) {
                 replyContent = await analyzeImageWithAI(image);
                 source = "TITAN_VISION";
             } else {
                 const currentUser = req.user || { fullName: "Leader", pinLevel: "Associate" };
-                replyContent = await generateTitanResponse(currentUser, cleanMsg);
+                // ✅ UPDATED: Passing 'history' to the service
+                replyContent = await generateTitanResponse(currentUser, cleanMsg, history);
             }
         } catch (error) {
             console.error("AI Generation Error:", error.message);
@@ -175,33 +191,27 @@ const handleChat = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🧑‍💼 ADMIN → CHAT USERS LIST (UNCHANGED)
+// 🧑‍💼 ADMIN → CHAT USERS LIST
 // ============================================================
 const getAllChatUsers = asyncHandler(async (req, res) => {
-    // Prevent caching for real-time admin view
     res.set("Cache-Control", "no-store");
-
     try {
         const rows = await db.ChatMessage.findAll({
             attributes: [
                 'userId',
-                // ✅ FIX: Get the LATEST message time for sorting
                 [db.sequelize.fn('MAX', db.sequelize.col('ChatMessage.createdAt')), 'lastMessageAt']
             ],
-            group: ['userId'], // Group by User
+            group: ['userId'],
             include: [{
                 model: db.User,
                 as: 'User', 
                 attributes: ['id', 'fullName', 'email']
             }],
-            // ✅ FIX: Order by the calculated 'lastMessageAt'
             order: [[db.sequelize.literal('lastMessageAt'), 'DESC']]
         });
 
-        // Filter valid users
         const users = rows.map(r => {
             if (!r.User) return null;
-            // Optional: Attach last message time to user object for frontend
             const userJson = r.User.toJSON();
             userJson.lastMessageAt = r.getDataValue('lastMessageAt');
             return userJson;
@@ -215,7 +225,7 @@ const getAllChatUsers = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🧑‍💼 ADMIN → CHAT HISTORY (UNCHANGED)
+// 🧑‍💼 ADMIN → CHAT HISTORY
 // ============================================================
 const getChatHistoryByUser = asyncHandler(async (req, res) => {
     const { userId } = req.params;
@@ -249,7 +259,7 @@ const getChatHistoryByUser = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🛡️ ADMIN → ADD SMART RESPONSE (UNCHANGED)
+// 🛡️ ADMIN → ADD SMART RESPONSE
 // ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
     const { question, answer } = req.body;
@@ -274,7 +284,7 @@ const addSmartResponse = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🛡️ ADMIN → UPGRADE FAQ (UNCHANGED)
+// 🛡️ ADMIN → UPGRADE FAQ
 // ============================================================
 const upgradeToPremium = asyncHandler(async (req, res) => {
     const { faqId, answer } = req.body;
@@ -299,7 +309,7 @@ const upgradeToPremium = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// 🔊 DIRECT TTS (UNCHANGED)
+// 🔊 DIRECT TTS
 // ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;

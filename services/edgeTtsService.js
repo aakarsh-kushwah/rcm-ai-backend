@@ -1,9 +1,9 @@
 /**
  * @file services/edgeTtsService.js
- * @description 🚀 RCM "SWARA" ENGINE (Female Professional Voice)
+ * @description 🚀 RCM "SWARA" ENGINE (Corrected DB Import)
  */
 
-// ✅ FIX 1: Correct Import (Models se db laana hai)
+// ✅ FIX: Correct Import relative to file location
 const db = require('../models'); 
 
 const crypto = require('crypto');
@@ -12,13 +12,13 @@ const sdk = require("microsoft-cognitiveservices-speech-sdk");
 const { uploadAudioToCloudinary } = require('./cloudinaryService'); 
 const path = require('path');
 
-// ✅ FIX 2: Correct .env path
+// ✅ FIX: Correct .env path for flat structure
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
 const AZURE_REGION = process.env.AZURE_SPEECH_REGION;
 
-// 🎛️ SWARA TUNING (Female Voice Settings)
+// 🎛️ SWARA TUNING
 const TUNING = {
     VOICE_NAME:    "hi-IN-SwaraNeural", 
     SILENCE_BUFFER:"300ms",            
@@ -122,7 +122,6 @@ const synthesizeWithAzureToBuffer = (text) => {
 
         const speechConfig = sdk.SpeechConfig.fromSubscription(AZURE_KEY, AZURE_REGION);
         speechConfig.speechSynthesisVoiceName = TUNING.VOICE_NAME; 
-        
         speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Audio24Khz96KBitRateMonoMp3;
 
         const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null); 
@@ -152,7 +151,7 @@ const generateEdgeAudio = async (text) => {
     const textHash = generateTextHash(cleanText);
 
     try {
-        // ✅ AB YE ERROR NAHI DEGA (Kyunki db sahi load ho raha hai)
+        // ✅ CRITICAL FIX: Safe DB Access
         if (db && db.VoiceResponse) {
             const cachedEntry = await db.VoiceResponse.findOne({ where: { textHash } });
             if (cachedEntry && cachedEntry.audioUrl) return cachedEntry.audioUrl;
