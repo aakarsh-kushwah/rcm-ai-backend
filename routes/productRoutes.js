@@ -3,29 +3,55 @@
  * @description API Routes for RCM Products & Scraper Trigger
  */
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
-// Controller Import (Path check karein: ../controllers)
-const productController = require('../controllers/productController');
+// Controller Import
+const productController = require("../controllers/productController");
+
+// Middleware Imports
+const { isAuthenticated, isActiveUser, isAdmin } = require("../middleware/authMiddleware");
+const validate = require("../middleware/validate");
+const upload = require("../middleware/uploadMiddleware");
+
+// Schema Imports
+const { productSchema, userIdParamSchema } = require("../validations/adminSchema"); // userIdParamSchema for :id validation
 
 // ============================================================
-// 🕷️ SCRAPER ROUTE (Ye sabse upar hona chahiye)
+// 🛡️ AUTHENTICATION & AUTHORIZATION (All routes below are protected)
 // ============================================================
-// URL: http://localhost:10000/api/products/scrape-live
-router.get('/scrape-live', productController.scrapeProductsLive);
-
+router.use(isAuthenticated, isActiveUser, isAdmin);
 
 // ============================================================
-// 🛍️ STANDARD PRODUCT ROUTES
+// 🕷️ 1. SCRAPER ROUTE (Admin Only)
 // ============================================================
-// URL: http://localhost:10000/api/products (Sare products)
-router.get('/', productController.getAllProducts);
+// URL: GET /api/products/scrape-live
+router.get("/scrape-live", productController.scrapeProductsLive);
 
-// URL: http://localhost:10000/api/products/search?q=nutricharge
-router.get('/search', productController.searchProducts);
+// ============================================================
+// 🆕 2. CREATE PRODUCT (Admin)
+// ============================================================
+// URL: POST /api/products
+// CRITICAL: validate(productSchema) AFTER upload.single("productImage")
+router.post("/", upload.single("productImage"), validate(productSchema), productController.createProduct);
 
-// URL: http://localhost:10000/api/products/123 (Specific ID)
-router.get('/:id', productController.getProductById);
+// ============================================================
+// 🔄 3. UPDATE PRODUCT (Admin)
+// ============================================================
+// URL: PATCH /api/products/:id
+// CRITICAL: validate(productSchema) AFTER upload.single("productImage")
+router.patch("/", upload.single("productImage"), validate(productSchema), productController.updateProduct);
+
+// ============================================================
+// 🛍️ 4. STANDARD PRODUCT ROUTES (Admin access for management)
+// ============================================================
+// URL: GET /api/products (Sare products)
+router.get("/", productController.getAllProducts);
+
+// URL: GET /api/products/search?q=nutricharge
+router.get("/search", productController.searchProducts);
+
+// URL: GET /api/products/:id (Specific ID)
+router.get("/:id", validate(userIdParamSchema), productController.getProductById);
 
 module.exports = router;

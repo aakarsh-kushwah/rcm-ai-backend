@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 
 // ✅ Import all necessary middleware
-const { isAuthenticated, isAdmin, isActiveUser } = require('../middleware/authMiddleware'); 
+const { isAuthenticated, isAdmin, isActiveUser, restrictTo } = require('../middleware/authMiddleware'); 
 
 const { 
     batchScrapeImport, 
@@ -27,18 +27,18 @@ router.get('/products/categories', isAuthenticated, isActiveUser, getProductCate
 // ============================================================
 // 2. Admin Routes (For Admins Only)
 // ============================================================
-// Admin routes generally don't need 'isActiveUser' checks, just 'isAdmin'
-router.use(isAuthenticated, isAdmin); 
+// Admin routes require approval and active status
+router.use(isAuthenticated, isActiveUser); 
 
 // ✅ Existing Batch Import Route
-router.post('/batch-scrape-import', batchScrapeImport); 
+router.post('/batch-scrape-import', restrictTo('SUPER_ADMIN', 'ADMIN'), batchScrapeImport); 
 
 // --- Leader Video Admin ---
-router.put('/leaders/:id', updateLeaderVideo);
-router.delete('/leaders/:id', deleteLeaderVideo);
+router.put('/leaders/:id', restrictTo('SUPER_ADMIN', 'ADMIN'), updateLeaderVideo);
+router.delete('/leaders/:id', restrictTo('SUPER_ADMIN', 'ADMIN'), deleteLeaderVideo);
 
 // --- Product Video Admin ---
-router.put('/products/:id', updateProductVideo);
-router.delete('/products/:id', deleteProductVideo);
+router.put('/products/:id', restrictTo('SUPER_ADMIN', 'ADMIN'), updateProductVideo);
+router.delete('/products/:id', restrictTo('SUPER_ADMIN', 'ADMIN'), deleteProductVideo);
 
 module.exports = router;

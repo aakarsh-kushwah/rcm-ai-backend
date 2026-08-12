@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { scrapeAndSave } = require('../services/rcmScraper'); // Apni service file ka naam check karein
 
-// Route: GET /api/utils/fill-data
+// Route: GET /api/scraper/fill-data
 router.get('/fill-data', async (req, res) => {
     console.log("⚡ Scraper Triggered via API...");
     
@@ -18,5 +18,7 @@ router.get('/fill-data', async (req, res) => {
         message: "✅ Command Received. Scraper background me start ho gaya hai." 
     });
 });
+
+const { Product } = require('../models');
 
 module.exports = router;

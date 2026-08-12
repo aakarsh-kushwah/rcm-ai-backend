@@ -5,7 +5,7 @@
 
 const jwt = require('jsonwebtoken');
 // ✅ FIX: Properly destructure User from the models export
-const { User } = require('../models'); 
+const { User, Admin } = require('../models'); 
 
 // ============================================================
 // 1. NEURAL TOKEN VALIDATOR (JWT Check)
@@ -38,9 +38,32 @@ const verifyTokenLogic = (req, res, next) => {
 const isActiveUser = async (req, res, next) => {
     try {
         let userId = req.userId || req.user?.id;
-        if (userId) userId = parseInt(userId, 10);
+        // ✅ FIX: Handle UUID vs Integer user IDs properly (Admin/User tables may use UUID or numeric IDs)
+        if (userId) {
+            const parsed = parseInt(userId, 10);
+            userId = Number.isNaN(parsed) ? userId : parsed;
+        }
 
         if (!userId) return res.status(401).json({ success: false, message: '🚫 Identity Verification Failed.' });
+
+        // ✅ ADMIN BRANCH: If JWT role indicates Admin/Super Admin, query Admin table instead of User table to prevent 404
+        const tokenRole = req.user?.role;
+        if (tokenRole === 'ADMIN' || tokenRole === 'SUPER_ADMIN') {
+            if (!Admin) {
+                console.error("🔥 CRITICAL: Admin model undefined in Middleware");
+                return res.status(500).json({ success: false, message: 'System Error: Admin DB Model Missing.' });
+            }
+            const admin = await Admin.findByPk(userId, {
+                attributes: ['id', 'status', 'role', 'isApproved']
+            });
+            if (!admin) return res.status(404).json({ success: false, message: '🚫 Admin Not Found.' });
+            if (!admin.isApproved || admin.status !== 'active') {
+                return res.status(403).json({ success: false, message: '🚫 Admin Account Pending Approval or Inactive.' });
+            }
+            req.userStatus = admin.status;
+            req.userRole = admin.role;
+            return next();
+        }
 
         // ✅ FIX: Ensure User model is available
         if (!User) {
@@ -50,13 +73,16 @@ const isActiveUser = async (req, res, next) => {
 
         // 1. Fetch User (Only Status Needed)
         const user = await User.findByPk(userId, {
-            attributes: ['id', 'status', 'role']
+            attributes: ['id', 'status', 'role', 'isApproved']
         });
 
         if (!user) return res.status(404).json({ success: false, message: '🚫 User Not Found.' });
 
-        // 2. ADMIN BYPASS
+        // 2. ADMIN BYPASS & APPROVAL CHECK
         if (user.role === 'ADMIN' || user.role === 'SUPPORT') {
+            if (user.role === 'ADMIN' && (!user.isApproved || user.status !== 'active')) {
+                return res.status(403).json({ success: false, message: '🚫 Admin Account Pending Approval or Inactive.' });
+            }
             req.userStatus = user.status;
             req.userRole = user.role;
             return next();
@@ -87,20 +113,37 @@ const isActiveUser = async (req, res, next) => {
 };
 
 // ============================================================
-// 3. ADMIN PRIVILEGE GUARD
+// 3. ADMIN PRIVILEGE GUARD (Legacy)
 // ============================================================
 const isAdmin = (req, res, next) => {
     const role = req.user?.role || req.userRole;
-    if (role && (role.toUpperCase() === 'ADMIN')) {
+    if (role && (role.toUpperCase() === 'ADMIN' || role.toUpperCase() === 'SUPER_ADMIN')) {
         next();
     } else {
         res.status(403).json({ success: false, message: '🚫 Access Denied: Admins Only.' });
     }
 };
 
+// ============================================================
+// 4. RBAC ROLE RESTRICTOR (Modern)
+// ============================================================
+const restrictTo = (...roles) => {
+    return (req, res, next) => {
+        const userRole = req.user?.role || req.userRole;
+        if (!roles.includes(userRole)) {
+            return res.status(403).json({
+                success: false,
+                message: `🚫 Access Denied: Required roles: [${roles.join(', ')}]`
+            });
+        }
+        next();
+    };
+};
+
 module.exports = {
     verifyToken: verifyTokenLogic,
     isAuthenticated: verifyTokenLogic,
     isActiveUser,
-    isAdmin
+    isAdmin,
+    restrictTo
 };

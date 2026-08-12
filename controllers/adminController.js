@@ -4,16 +4,16 @@
  * @capabilities Transactional Deletion, Mass Notification Batching, High-Speed Queries
  */
 
-const { db } = require('../config/db'); // For Sequelize Transactions
+const { sequelize } = require('../config/db'); // Imported sequelize instance directly from config/db for transactions
 const { Op } = require('sequelize');
 const admin = require('../config/firebase'); // Firebase Admin SDK
 
 // ✅ CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
-const { User, ChatMessage, NotificationToken } = require('../models'); 
+const { User, Admin, ChatMessage, NotificationToken } = require('../models'); 
 
 // 📊 Optimized Selection: Sirf wahi data mangaayein jo dashboard par dikhana hai
 const userSelectFields = [
-    'id', 'fullName', 'rcmId', 'email', 'phone', 'role', 'status', 'autoPayStatus', 'createdAt'
+    'id', 'fullName', 'googleId', 'email', 'phone', 'role', 'status', 'autoPayStatus', 'createdAt'
 ];
 
 // =======================================================
@@ -22,7 +22,6 @@ const userSelectFields = [
 const getRegularUsers = async (req, res) => {
     try {
         const users = await User.findAll({
-            where: { role: { [Op.ne]: 'ADMIN' } }, // 'ne' means Not Equal
             attributes: userSelectFields,
             order: [['createdAt', 'DESC']],
         });
@@ -35,13 +34,12 @@ const getRegularUsers = async (req, res) => {
 };
 
 // =======================================================
-// 2️⃣ GET ALL ADMINS (Team View)
+// 2️⃣ GET ALL ADMINS (Team View - From Separate Admin Model)
 // =======================================================
 const getAllAdmins = async (req, res) => {
     try {
-        const admins = await User.findAll({
-            where: { role: 'ADMIN' },
-            attributes: userSelectFields,
+        const admins = await Admin.findAll({
+            attributes: ['id', 'name', 'email', 'role', 'status', 'isApproved', 'createdAt'],
             order: [['createdAt', 'DESC']],
         });
         res.status(200).json({ success: true, data: admins });
@@ -58,11 +56,13 @@ const deleteUser = async (req, res) => {
     const { userId } = req.params;
     
     // 🚦 Start Transaction: Sab kuch delete hoga, ya kuch bhi nahi.
-    const t = await db.sequelize.transaction();
+    const t = await sequelize.transaction(); // Using imported sequelize instance directly
 
     try {
-        // Self-Destruct Prevention
-        if (req.user.id === parseInt(userId)) {
+        // Self-Destruct Prevention (Support both UUID string and integer ID comparison without breaking UUIDs)
+        const currentAdminId = String(req.user.id);
+        const targetUserId = String(userId);
+        if (currentAdminId === targetUserId) {
             await t.rollback();
             return res.status(403).json({ success: false, message: "Security Alert: Cannot delete yourself." });
         }
@@ -223,10 +223,28 @@ const pushNotificationToAll = async (req, res) => {
 // =======================================================
 // ✅ MODULE EXPORTS
 // =======================================================
+const approveAdmin = async (req, res) => {
+    const { adminId } = req.params;
+    try {
+        const adminRec = await Admin.findByPk(adminId);
+        if (!adminRec) {
+            return res.status(404).json({ success: false, message: "Admin candidate not found." });
+        }
+        adminRec.status = 'active';
+        adminRec.isApproved = true;
+        await adminRec.save();
+        res.status(200).json({ success: true, message: `Admin ${adminRec.email} approved.` });
+    } catch (error) {
+        console.error("❌ Approval Error:", error);
+        res.status(500).json({ success: false, message: "Approval failed." });
+    }
+};
+
 module.exports = { 
     getRegularUsers,
     getAllAdmins,
     deleteUser, 
     updateUserData,
-    pushNotificationToAll // This connects to your adminRoutes.js
+    pushNotificationToAll,
+    approveAdmin
 };

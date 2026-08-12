@@ -5,7 +5,7 @@
  */
 
 const Groq = require("groq-sdk");
-const { SYSTEM_PROMPT } = require('../utils/prompts'); // Swara's Soul (Identity)
+const { VISION_BEHAVIOR, GET_ASI_PROMPT } = require('../utils/prompts/masterPrompt'); // Corrected import
 require('dotenv').config();
 
 const groq = new Groq({ 
@@ -27,35 +27,17 @@ const analyzeImage = async (textPrompt, base64Image) => {
         }
 
         // --- 2. THE "HUMAN EYES" INSTRUCTION SET ---
-        // Ye instructions model ko batati hain ki sirf dekhna nahi hai, REACT karna hai.
-        
-        const visionBehavior = `
-        <VISION_MODE_ACTIVATED>
-        You are now seeing the world through Swara's eyes (RCM Leader).
-        
-        **CRITICAL RULE:** DO NOT describe the image like a robot (e.g., "I see a bottle on a table"). 
-        **INSTEAD:** React to it emotionally and contextually (e.g., "Waah! Nutricharge Women! Ye toh har ghar ki zarurat hai ji.").
-
-        **SCENARIO HANDLING:**
-        1. **RCM PRODUCTS:** Identify the specific product (Nutricharge, Good Dot, Key Soul). Validate it. Say something like "Great choice!" or explain a quick benefit.
-        2. **NON-RCM PRODUCTS:** Be polite but loyal. Suggest switching. (e.g., "Ye sabun achha hoga, lekin RCM ka Neem Soap try kiya? Wo skin ke liye best hai.")
-        3. **GROUP PHOTOS / MEETINGS:** Comment on the energy. Use words like "Team Spirit", "Utsah", "Future Diamonds".
-        4. **TEXT / DOCUMENTS:** If it's a plan or bill, offer to explain the calculation (PV/BV).
-        5. **UNCLEAR IMAGES:** Don't say "Image is blurry." Say "Maaf kijiye ji, photo thodi dhundhli hai. Dobara bhejengi?"
-        
-        **TONE REMINDER:** Use "Ji", "Sir/Ma'am", naturally. Keep it warm and encouraging.
-        </VISION_MODE_ACTIVATED>
-        `;
+        // Moved to masterPrompt.js
 
         // --- 3. CONTEXT FUSION ---
-        // Hum Swara ki identity (SYSTEM_PROMPT) aur Vision Rules ko jodte hain.
+        // Hum Swara ki identity (GET_ASI_PROMPT) aur Vision Rules ko jodte hain.
         
         let finalUserPrompt = "";
 
         if (textPrompt && textPrompt.trim().length > 0) {
             // User ne photo ke sath kuch likha hai
             finalUserPrompt = `
-            ${visionBehavior}
+            ${VISION_BEHAVIOR}
             
             USER'S MESSAGE: "${textPrompt}"
             
@@ -64,7 +46,7 @@ const analyzeImage = async (textPrompt, base64Image) => {
         } else {
             // User ne sirf photo bheji hai (Silent Check)
             finalUserPrompt = `
-            ${visionBehavior}
+            ${VISION_BEHAVIOR}
             
             USER'S ACTION: Sent an image without text.
             
@@ -81,7 +63,7 @@ const analyzeImage = async (textPrompt, base64Image) => {
             messages: [
                 {
                     role: "system",
-                    content: SYSTEM_PROMPT // Base Personality (Swara)
+                    content: GET_ASI_PROMPT({}) // Base Personality (Swara) - Empty context for base
                 },
                 {
                     role: "user",

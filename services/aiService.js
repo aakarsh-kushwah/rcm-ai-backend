@@ -12,7 +12,7 @@ const { uploadAudioToCloudinary } = require('./cloudinaryService');
 // DB connection
 const db = require('../models'); 
 
-const { GET_ASI_PROMPT } = require('../utils/prompts'); 
+const { GET_ASI_PROMPT, VISION_SCANNER_PROMPT } = require('../utils/prompts/masterPrompt'); 
 const crypto = require('crypto');
 const path = require('path');
 const { Op } = require('sequelize'); 
@@ -40,7 +40,126 @@ try {
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
 const VISION_MODEL = 'llama-3.2-11b-vision-preview';
 
-// --- HELPER: Sentence Finisher ---
+// ============================================================
+// 📚 RAG SYSTEM: BUSINESS KNOWLEDGE BASE & RULE-BASED LAYER
+// ============================================================
+function formatBusinessKnowledgeResponse(item, userName = "Leader") {
+    if (!item) return null;
+
+    const title = item.title || "RCM Business Rule";
+    const content = item.content || "";
+
+    return `${userName} ji, ${title} ki poori jaankari yeh hai:\n\n${content}`;
+}
+
+async function fetchBusinessKnowledge(query, options = {}) {
+    if (!query) return { textContext: "", rawMatch: null, isSingleTopic: false };
+
+    try {
+        const cleanQuery = query.toLowerCase().replace(/[^\w\s]/g, '').trim();
+        const stopWords = ['what', 'is', 'batao', 'kya', 'hai', 'tell', 'me', 'about', 'kitna', 'details', 'ka', 'ki', 'ke', 'ko', 'mein', 'this', 'that', 'for', 'of', 'bonus', 'rcm'];
+        const keywords = cleanQuery.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
+
+        if (!db || !db.BusinessKnowledge) return { textContext: "", rawMatch: null, isSingleTopic: false };
+
+        let items = [];
+        let fetchedByPrimaryCategory = false;
+        let matchedCategoryKey = null;
+
+        // Bonus category mapping
+        const bonusCategoriesMap = {
+            'royalty bonus': 'Royalty_Bonus',
+            'royalty': 'Royalty_Bonus',
+            'technical bonus': 'Technical_Bonus',
+            'technical': 'Technical_Bonus',
+            'performance bonus': 'Performance_Bonus',
+            'performance': 'Performance_Bonus',
+            'consistency bonus': 'Consistency_Bonus',
+            'consistency': 'Consistency_Bonus',
+            'vital level pin chart': 'Vital_Level_Pin_Chart',
+            'vital level': 'Vital_Level_Pin_Chart',
+            'pin chart': 'Vital_Level_Pin_Chart', // Prioritize 'vital' for this specific chart
+            'pin level income chart': 'Pin_Level_Income_Chart',
+            'pin level': 'Pin_Level_Income_Chart',
+            'milestone chart': 'Pin_Level_Income_Chart',
+            'growth bonus': 'Growth_Bonus',
+            'vital growth bonus': 'Growth_Bonus',
+            'royalty growth bonus': 'Growth_Bonus',
+            'technical growth bonus': 'Growth_Bonus',
+            'paint purchase bonus': 'Paint_Purchase_Bonus',
+            'paint bonus': 'Paint_Purchase_Bonus',
+            'paint': 'Paint_Purchase_Bonus',
+            'pv bv rules': 'PV_BV_Rules',
+            'policy faq': 'Policy_FAQ',
+            'guidelines': 'Policy_FAQ'
+        };
+        for (const [phrase, categoryName] of Object.entries(bonusCategoriesMap)) {
+            if (cleanQuery.includes(phrase)) {
+                items = await db.BusinessKnowledge.findAll({
+                    where: {
+                        isActive: true,
+                        category: categoryName
+                    },
+                    order: [['updatedAt', 'DESC']], // Fetch the latest updated record
+                    limit: 1,
+                    attributes: ['title', 'category', 'content'],
+                    raw: true
+                });
+                if (items.length > 0) {
+                    fetchedByPrimaryCategory = true;
+                    matchedCategoryKey = categoryName;
+                    break;
+                }
+            }
+        }
+
+        // Check if query is single-topic vs mixed
+        const calculationKeywords = ['calc', 'calculate', 'banega', 'kaise', 'formula', 'difference', 'differential', 'group pv', 'self pv'];
+        const isCalculation = calculationKeywords.some(k => cleanQuery.includes(k));
+        
+        // Count unique matched categories (e.g. Royalty vs Technical)
+        const uniqueMatchedCategories = new Set(
+            Object.entries(bonusCategoriesMap)
+                .filter(([phrase]) => cleanQuery.includes(phrase))
+                .map(([, category]) => category)
+        );
+
+        const isSingleTopic = fetchedByPrimaryCategory && uniqueMatchedCategories.size === 1 && !isCalculation;
+
+        // Fallback search if no category match
+        if (!fetchedByPrimaryCategory && keywords.length > 0) {
+            const whereCondition = {
+                isActive: true,
+                [Op.or]: [
+                    ...keywords.map(k => ({ title: { [Op.like]: `%${k}%` } })),
+                    ...keywords.map(k => ({ keywords: { [Op.like]: `%${k}%` } })),
+                    ...keywords.map(k => ({ category: { [Op.like]: `%${k}%` } }))
+                ]
+            };
+            items = await db.BusinessKnowledge.findAll({
+                where: whereCondition,
+                limit: 2,
+                attributes: ['title', 'category', 'content'],
+                raw: true
+            });
+        }
+
+        if (items.length === 0) {
+            return { textContext: "", rawMatch: null, isSingleTopic: false };
+        }
+
+        const textContext = items.map(item => `📌 [BUSINESS RULE: ${item.title} (${item.category})]\n${item.content}`).join("\n\n");
+
+        return {
+            textContext,
+            rawMatch: items[0],
+            isSingleTopic
+        };
+    } catch (error) {
+        console.error("⚠️ Business Knowledge Context Error:", error.message);
+        return { textContext: "", rawMatch: null, isSingleTopic: false };
+    }
+}
 function cleanIncompleteSentence(text) {
     if (!text) return "";
     let clean = text.trim();
@@ -176,14 +295,27 @@ async function generateTitanResponse(user, message, history = []) {
     if (!groqClient) return "System maintenance par hai. Jai RCM.";
     
     try {
-        // 1. Fetch relevant product data (Using V44 Ranking)
+        const userName = user?.fullName || "Leader";
+
+        // 1. Fetch relevant product data (Using V44 Ranking) & Business Knowledge RAG
         const liveData = await fetchLiveContext(message);
+        const ragResult = await fetchBusinessKnowledge(message);
+
+        // RULE-BASED EXTRACTION LAYER:
+        // Intercept single-topic queries with strong category matches directly without AI model intervention
+        if (ragResult.isSingleTopic && ragResult.rawMatch) {
+            console.log(`⚡ [RULE-BASED EXTRACTION] Intercepted single-topic query for category: ${ragResult.rawMatch.category}`);
+            return formatBusinessKnowledgeResponse(ragResult.rawMatch, userName);
+        }
+
+        const businessKnowledgeData = ragResult.textContext || "";
+        const combinedLiveData = [liveData, businessKnowledgeData].filter(Boolean).join("\n\n===================================\n\n");
 
         // 2. Generate System Prompt
         const systemPrompt = GET_ASI_PROMPT({
-            userName: user?.fullName || "Leader",
+            userName: userName,
             userPin: user?.pinLevel || "Associate Buyer",
-            liveData: liveData 
+            liveData: combinedLiveData 
         });
 
         // 3. Message Chain
@@ -193,20 +325,42 @@ async function generateTitanResponse(user, message, history = []) {
             { role: "user", content: message }
         ];
 
-        const completion = await groqClient.chat.completions.create({
-            model: TEXT_MODEL,
-            messages: conversationChain, 
-            // 🛑 STRICT TEMPERATURE: Keeps answers factual based on liveData
-            temperature: 0.3, 
-            max_tokens: 800,
-            top_p: 0.85,
-        });
+        let completion;
+        let retries = 2;
+        let delay = 1500;
+
+        for (let attempt = 1; attempt <= retries + 1; attempt++) {
+            try {
+                completion = await groqClient.chat.completions.create({
+                    model: TEXT_MODEL,
+                    messages: conversationChain, 
+                    // 🛑 STRICT TEMPERATURE: Keeps answers factual based on liveData
+                    temperature: 0.3, 
+                    max_tokens: 800,
+                    top_p: 0.85,
+                });
+                break;
+            } catch (err) {
+                const isRateLimit = err.status === 429 || (err.message && err.message.includes('429')) || (err.message && err.message.includes('rate_limit'));
+                if (isRateLimit && attempt <= retries) {
+                    console.warn(`⚠️ Groq Rate Limit (429) hit. Retrying attempt ${attempt} in ${delay}ms...`);
+                    await new Promise(res => setTimeout(res, delay));
+                    delay *= 2; // exponential backoff
+                    continue;
+                }
+                throw err;
+            }
+        }
 
         let aiResponse = completion.choices[0]?.message?.content || "";
         return cleanIncompleteSentence(aiResponse);
 
     } catch (error) {
         console.error("🔥 Titan Engine Error:", error.status || error.message);
+        const isRateLimit = error.status === 429 || (error.message && error.message.includes('429')) || (error.message && error.message.includes('rate_limit'));
+        if (isRateLimit) {
+            return "Thoda busy hoon, ek pal rukiye. Dobara koshish kar rahe hain...";
+        }
         return "Network weak hai. Kripya dobara message karein.";
     }
 }
@@ -227,11 +381,7 @@ async function analyzeImageWithAI(base64Image) {
                     content: [
                         { 
                             type: "text", 
-                            text: "You are an RCM Product Data Scanner. Your task is to extract EXACT text from the image.\n" +
-                                  "1. IDENTIFY: Product Name, Net Quantity/Weight.\n" +
-                                  "2. EXTRACT NUMBERS: Look specifically for 'MRP', 'PV', 'DP' or 'Rate'. Quote exactly what is printed.\n" +
-                                  "3. DISCLAIMER: If the text is blurry or invisible, strictly say 'Details clear nahi hain'. Do NOT guess or hallucinate numbers.\n" +
-                                  "4. LANGUAGE: Hindi/Hinglish summary." 
+                            text: VISION_SCANNER_PROMPT 
                         },
                         { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageContent}` } }
                     ],
@@ -249,6 +399,10 @@ async function analyzeImageWithAI(base64Image) {
     }
 }
 
+const { sanitizeForTTS } = require('../utils/textSanitizer'); // ADDED
+
+// ... (existing imports)
+
 // ============================================================
 // 🎙️ VOICE GENERATION (UNCHANGED)
 // ============================================================
@@ -256,8 +410,8 @@ async function getOrGenerateVoice(text) {
     if (!text) return null;
     
     try {
-        const cleanText = text.toLowerCase().replace(/[^\w\s\u0900-\u097F]/gi, '').trim();
-        const textHash = crypto.createHash('sha256').update(cleanText).digest('hex');
+        const cleanText = sanitizeForTTS(text); // UPDATED
+        const textHash = crypto.createHash('sha256').update(cleanText.toLowerCase()).digest('hex');
 
         if (db && db.VoiceResponse) {
             const cachedVoice = await db.VoiceResponse.findOne({ where: { textHash } });
@@ -297,5 +451,6 @@ async function getOrGenerateVoice(text) {
 module.exports = { 
     generateTitanResponse, 
     analyzeImageWithAI,     
-    getOrGenerateVoice      
+    getOrGenerateVoice,
+    fetchBusinessKnowledge
 };

@@ -1,5 +1,5 @@
 // ✅ सही तरीका: मॉडल को 'db.js' से इम्पोर्ट करें
-const { db } = require('../config/db');
+const { User } = require('../models'); // Imported User model directly from models hub
 
 // ============================================================
 // 🔹 GET MY PROFILE (User Only)
@@ -7,15 +7,15 @@ const { db } = require('../config/db');
 // ============================================================
 const getMyProfile = async (req, res) => {
   try {
-    // 🌟 जांचें कि User मॉडल लोड हुआ है या नहीं
-    if (!db.User) {
-        return res.status(500).json({ success: false, message: 'Server error: User model is not available.' });
-    }
+    // 🌟 जांचें कि User मॉडल लोड हुआ है या नहीं
+    if (!User) {
+        return res.status(500).json({ success: false, message: 'Server error: User model is not available.' });
+    }
 
-    // req.user 'isAuthenticated' मिडलवेयर से आता है
-    const userId = req.user.id; 
+    // req.user 'isAuthenticated' मिडलवेयर से आता है
+    const userId = req.user.id; 
 
-    const user = await db.User.findByPk(userId, {
+    const user = await User.findByPk(userId, {
       // पासवर्ड को कभी भी वापस न भेजें
       attributes: ['id', 'fullName', 'email', 'rcmId', 'status', 'role', 'autoPayStatus', 'nextBillingDate']
     });

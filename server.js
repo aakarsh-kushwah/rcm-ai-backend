@@ -1,205 +1,255 @@
 /**
  * @file server.js
- * @title RCM TITAN ASI ENGINE - GEN 11 (STABLE PRODUCTION CORE)
- * @description Hyper-Scale Distributed Architecture.
- * @status GOD MODE ENABLED | CRASH PROOF | REDIS FIXED
+ * @version 14.0.0 "THE ALPHA CORE"
+ * @description Cloud-Native (Docker/K8s Ready) - OCI Optimized
+ * @standard Enterprise Tier-0 (Zero-Trust, High-Observability)
  */
 
-require('dotenv').config();
-const cluster = require('cluster');
-const os = require('os');
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const hpp = require('hpp');
-const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis').default; 
-const compression = require('compression');
-const toobusy = require('toobusy-js'); 
-const { connectDB, sequelize } = require('./models'); 
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const helmet = require("helmet");
+const compression = require("compression");
+const pino = require("pino");
+const pinoHttp = require("pino-http");
+const socketIo = require("socket.io");
+const { logger } = require("./utils/logger");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const client = require("prom-client");
+const { rateLimit } = require("express-rate-limit");
+const { RedisStore } = require("rate-limit-redis");
 
-// ✅ FIX 1: LOAD CENTRAL REDIS (Split Brain Problem Solved)
-// Hum wahi connection use karenge jo humne config/redis.js me banaya hai.
-// Isme 'enableOfflineQueue: true' hai, to ye crash nahi karega.
-const { connection: redisClient } = require('./config/redis');
+// Internal Modules
+const bcrypt = require("bcryptjs");
+const { connectDB, sequelize, User, Admin } = require("./models");
+const { connection: redisClient } = require("./config/redis");
+const { setIoInstance } = require("./services/socketService");
 
-// 🧠 SCALABILITY CONFIG
+const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 10000;
-const TOTAL_CORES = process.env.NODE_ENV === 'production' ? os.cpus().length : 1;
+
+// 📊 OBSERVABILITY: Real-time Metrics & Lifecycle Tracing
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+const httpRequestDuration = new client.Histogram({
+    name: 'http_request_duration_seconds',
+    help: 'Duration of HTTP requests in seconds',
+    labelNames: ['method', 'route', 'status_code'],
+    buckets: [0.1, 0.5, 1, 2, 5]
+});
+register.registerMetric(httpRequestDuration);
 
 // ============================================================
-// 1. MASTER NODE (The Cosmic Brain)
+// 🛡️ MIDDLEWARE STACK (Zero-Trust Architecture)
 // ============================================================
-if (cluster.isPrimary) {
-    console.clear();
-    console.log(`
-    /////////////////////////////////////////////////////////////////////////////////////////
-    🚀 RCM TITAN ASI: THE OMNIPOTENT ENGINE IS IGNITING
-    🧠 Master PID: ${process.pid} | 💻 Active Cores: ${TOTAL_CORES}
-    🌍 OCI Region: ${process.env.AZURE_SPEECH_REGION || 'Central-India'}
-    🗄️  DB: TiDB Distributed | ⚡ Redis: Unified Core Link
-    /////////////////////////////////////////////////////////////////////////////////////////
-    `);
 
-    // Fork workers based on CPU cores
-    for (let i = 0; i < TOTAL_CORES; i++) {
-        cluster.fork();
+// 1. Request Tracing & Performance Logging
+app.use(pinoHttp({
+    logger,
+    genReqId: (req) => req.headers['x-trace-id'] || Math.random().toString(36).substring(7),
+    customSuccessMessage: (req, res) => `✓ ${req.method} ${req.url} completed [${res.statusCode}]`,
+}));
+
+// 2. Metrics Integration (Request Lifecycle)
+app.use((req, res, next) => {
+    const end = httpRequestDuration.startTimer();
+    res.on('finish', () => {
+        end({ method: req.method, route: req.route?.path || req.path, status_code: res.statusCode });
+    });
+    next();
+});
+
+// 3. Hardened Security
+app.use(helmet());
+app.use(compression());
+
+// 4. Strict CORS (No Wildcards)
+const allowedOrigins = [
+    "https://rcmai.in",
+    "https://www.rcmai.in",
+    "https://rcm-ai-admin-ui.vercel.app",
+    "http://localhost:3000", // For local development
+    "http://localhost:3001", // For local development
+    "http://localhost:5173"  // For local development
+];
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error("🚫 Titan Firewall: CORS Violation"), false);
+        }
+    },
+    credentials: true
+}));
+
+// 5. Distributed Rate Limiting (Redis Optimized)
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 1000,
+    store: new RedisStore({
+        sendCommand: (...args) => redisClient.call(...args),
+        prefix: "titan_rl:",
+    }),
+});
+app.use(globalLimiter);
+
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// ============================================================
+// 🚦 CORE ENGINE COMPONENTS
+// ============================================================
+
+// Redis Adapter for Scaling (Docker/K8s Friendly)
+// server.js mein isey dhundo aur badlo
+const io = socketIo(server, {
+    cors: { 
+        origin: allowedOrigins, 
+        credentials: true 
+    },
+    transports: ['websocket', 'polling'], // 👈 'polling' ko wapas add karo
+    allowEIO3: true // Backward compatibility ke liye (optional)
+});
+
+// ============================================================
+// 🛣️ ROUTES & OBSERVABILITY ENDPOINTS
+// ============================================================
+
+// Prometheus Scraping Endpoint
+app.get("/metrics", async (req, res) => {
+    res.setHeader('Content-Type', register.contentType);
+    res.send(await register.metrics());
+});
+
+// Lightweight Health Check (Caching DB Status)
+let lastDbCheck = false;
+setInterval(async () => {
+    try {
+        await sequelize.authenticate();
+        lastDbCheck = true;
+    } catch (e) {
+        lastDbCheck = false;
+        logger.error("HealthCheck: Database Down");
     }
+}, 30000);
 
-    // Auto-Respawn (Self-Healing Architecture)
-    cluster.on('exit', (worker, code, signal) => {
-        console.warn(`⚠️ [TITAN-REGEN] Worker ${worker.process.pid} died. Spawning replacement...`);
-        cluster.fork();
+app.get("/health", (req, res) => {
+    const status = lastDbCheck ? 200 : 503;
+    res.status(status).json({
+        status: lastDbCheck ? "healthy" : "degraded",
+        timestamp: new Date().toISOString(),
+        version: "14.0.0-alpha"
     });
+});
 
-} else {
-    // ============================================================
-    // 2. WORKER NODE (The Neural Pathway)
-    // ============================================================
-    igniteNeuralPathway();
-}
+// API v1 Mounting
+const apiV1 = express.Router();
 
-async function igniteNeuralPathway() {
-    const app = express();
+// Import Routes
+apiV1.use("/auth", require("./routes/authRoutes"));
+apiV1.use("/admin", require("./routes/adminRoutes"));
+apiV1.use("/products", require("./routes/productRoutes"));
+apiV1.use("/chat", require("./routes/chatRoutes"));
+apiV1.use("/reports", require("./routes/dailyReportRoutes"));
+apiV1.use("/notifications", require("./routes/notificationRoutes"));
+apiV1.use("/payment", require("./routes/paymentRoutes"));
+apiV1.use("/scraper", require("./routes/scraperRoutes"));
+apiV1.use("/sitemap", require("./routes/siteMapRoutes"));
+apiV1.use("/users", require("./routes/userRoutes"));
+apiV1.use("/utils", require("./routes/utilsRoutes"));
+apiV1.use("/videos", require("./routes/videoRoutes"));
+apiV1.use("/calculator", require("./routes/calculatorRoutes"));
 
-    // 🛡️ SELF-PRESERVATION SYSTEM
-    app.use((req, res, next) => {
-        if (toobusy()) {
-            return res.status(503).json({ error: "Titan is processing heavy load. Please retry in seconds." });
-        }
-        next();
+// Mount under both /api and /api/v1 for compatibility
+app.use("/api/v1", apiV1);
+app.use("/api", apiV1);
+
+// ⚠️ GLOBAL ERROR HANDLER (Environment Aware)
+app.use((err, req, res, next) => {
+    const isProd = process.env.NODE_ENV === "production";
+    logger.error({ 
+        traceId: req.id, 
+        msg: err.message, 
+        stack: isProd ? null : err.stack 
+    }, "Internal Fault");
+
+    res.status(err.status || 500).json({
+        success: false,
+        message: isProd ? "Internal Server Error" : err.message,
+        traceId: req.id
     });
+});
 
-    // 🚀 PERFORMANCE LAYERS
-    app.set('trust proxy', 1); 
-    app.use(compression()); 
-    
-    // 🛡️ SECURITY LAYERS
-    app.use(helmet({ 
-        contentSecurityPolicy: false,
-        crossOriginResourcePolicy: { policy: "cross-origin" }
-    }));
-    app.use(hpp()); 
-
-    // 🌐 CORS (ENV DRIVEN)
-    const allowedOrigins = [
-        'https://rcm-ai-admin-ui.vercel.app',
-        'https://rcmai.in',         // बिना www के
-        'https://www.rcmai.in',     // ✅ नया जोड़ा (With www)
-        'http://localhost:3000',
-        'http://localhost:5173'
-    ];
-
-    app.use(cors({
-        origin: (origin, callback) => {
-            if (!origin) return callback(null, true);
-            if (allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
-                return callback(null, true);
-            }
-            return callback(new Error('🚫 Titan Firewall: Origin Blocked'), false);
-        },
-        credentials: true
-    }));
-
-    // Body Parsers
-    app.use(express.json({ limit: '50mb' })); 
-    app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-    // 🚦 DISTRIBUTED TRAFFIC CONTROL (CRASH PROOF)
-    // ✅ FIX 2: Offline Queue Enabled (Via Config)
-    // Ab agar Redis 1 sec late bhi connect hoga, to ye crash nahi karega.
-    const standardLimiter = rateLimit({
-        store: new RedisStore({
-            // Hum directly central connection pass kar rahe hain
-            sendCommand: (...args) => redisClient.call(...args),
-        }),
-        windowMs: 1 * 60 * 1000, 
-        max: 5000, 
-        message: { error: "Neural Overload. Scaling in progress..." },
-        standardHeaders: true,
-        legacyHeaders: false,
-    });
-
-    // ============================================================
-    // 🛣️ ROUTES INTEGRATION
-    // ============================================================
-    
-    app.get('/health', async (req, res) => {
-        try {
-            await sequelize.authenticate();
-            res.status(200).json({ status: 'OK', health: 'DIVINE', worker: process.pid });
-        } catch (e) {
-            res.status(503).json({ status: 'ERROR', health: 'CRITICAL' });
-        }
-    });
-
-    app.get('/', (req, res) => res.status(200).json({ 
-        status: "ONLINE", 
-        engine: "RCM Titan ASI",
-        cloud: "Oracle Cloud Infrastructure"
-    }));
+// ============================================================
+// 🏁 GRACEFUL IGNITION PROTOCOL
+// ============================================================
+const initSuperAdmin = async () => {
+    const superAdminEmail = "rcmaiasistant@gmail.com";
+    const defaultPassword = process.env.SUPER_ADMIN_DEFAULT_PASSWORD || "admin123"; // Use environment variable or a strong default
+    const SALT_ROUNDS = 10; // Make sure this matches authController
 
     try {
-        app.use('/api/auth', standardLimiter, require('./routes/authRoutes'));
-        app.use('/api/chat', standardLimiter, require('./routes/chatRoutes'));
-        
-        // Critical Routes (Ab ye crash nahi karenge kyunki Redis fix ho gaya hai)
-        app.use('/api/payment', require('./routes/paymentRoutes'));
-        app.use('/api/notifications', require('./routes/notificationRoutes'));
-        
-        // app.use('/api/products', require('./routes/productRoutes'));
-        // app.use('/api/sitemap', require('./routes/siteMapRoutes'));
-        // app.use('/api/utils', require('./routes/utilRoutes'));
-        app.use('/api/admin', require('./routes/adminRoutes'));
-        app.use('/api/reports', require('./routes/dailyReportRoutes'));
-        app.use('/api/videos', require('./routes/videoRoutes'));
-    } catch (error) {
-        console.error(`❌ [TITAN ROUTE ERROR]: ${error.message}`);
-    }
+        const existingSuperAdmin = await Admin.findOne({ where: { email: superAdminEmail } });
 
-    // ⚠️ GLOBAL ERROR TRAP
-    app.use((err, req, res, next) => {
-        if (process.env.NODE_ENV !== 'production') console.error(`🔥 Titan Fault:`, err);
-        res.status(500).json({ 
-            success: false, 
-            message: "Titan Internal System Fault",
-            error: process.env.NODE_ENV === 'development' ? err.message : undefined
-        });
-    });
-
-    // ============================================================
-    // 🏁 IGNITION
-    // ============================================================
-    try {
-        await connectDB(); 
-
-        const server = app.listen(PORT, () => {
-            console.log(`⚡ Titan Worker ${process.pid} serving on Port ${PORT}`);
-        });
-
-        server.keepAliveTimeout = 70000; 
-        server.headersTimeout = 71000; 
-
-        // Graceful Shutdown
-        const shutdown = (signal) => {
-            console.log(`🛑 ${signal} received. Worker ${process.pid} shutting down...`);
-            server.close(async () => {
-                await sequelize.close();
-                process.exit(0);
+        if (!existingSuperAdmin) {
+            const hashedPassword = await bcrypt.hash(defaultPassword, SALT_ROUNDS);
+            await Admin.create({
+                name: "Super Admin", // Changed from fullName to name
+                email: superAdminEmail,
+                masterPassword: hashedPassword, // Changed from password to masterPassword
+                role: "SUPER_ADMIN", // Explicitly set as SUPER_ADMIN
+                status: "active",
+                isApproved: true,
             });
-        };
+            logger.info("✅ Super Admin user created in Admin model: rcmaiasistant@gmail.com");
+        } else {
+            logger.info("Super Admin user already exists in Admin model: rcmaiasistant@gmail.com");
+            if (existingSuperAdmin.role !== "SUPER_ADMIN" || !existingSuperAdmin.isApproved || existingSuperAdmin.status !== "active") {
+                await existingSuperAdmin.update({ role: "SUPER_ADMIN", status: "active", isApproved: true });
+                logger.info("Super Admin role and approval status updated in Admin model.");
+            }
+        }
+    } catch (error) {
+        logger.error({ error: error.message, stack: error.stack }, "Error setting up Super Admin");
+    }
+};
 
-        process.on('SIGTERM', () => shutdown('SIGTERM'));
-        process.on('SIGINT', () => shutdown('SIGINT'));
-
-        // Last line of defense: Uncaught Exception ko catch karo taaki server band na ho
-        process.on('uncaughtException', (err) => {
-            console.error('👾 Uncaught Exception (Handled):', err.message);
-            // Process exit mat karo
+const startServer = async () => {
+    try {
+        await connectDB();
+        await initSuperAdmin(); // Call super admin setup here
+        server.listen(PORT, () => {
+            logger.info(`⚡ TITAN ALPHA-14 ONLINE [Port: ${PORT}]`);
         });
 
-    } catch (error) {
-        console.error(`❌ Startup Failure:`, error.message);
+        // OCI Keep-Alive Optimization
+        server.keepAliveTimeout = 61000;
+        server.headersTimeout = 65000;
+
+    } catch (err) {
+        logger.fatal(err, "Startup Failure");
         process.exit(1);
     }
-}
+};
+
+startServer();
+
+// Graceful Shutdown (Memory & Connection Drain)
+const shutdown = async (signal) => {
+    logger.info(`🛑 ${signal} received. Initiating Graceful Shutdown...`);
+    server.close(async () => {
+        logger.info("HTTP Server drained.");
+        await sequelize.close();
+        await redisClient.quit();
+        logger.info("All connections closed. Titan Off.");
+        process.exit(0);
+    });
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+

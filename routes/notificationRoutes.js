@@ -50,6 +50,7 @@ const syncLimiter = rateLimit({
 router.post(
     '/save-token', 
     isAuthenticated, 
+    // isActiveUser is omitted to allow 'pending' users to register tokens
     syncLimiter,    
     asyncHandler(notificationController.registerDevice) 
 );

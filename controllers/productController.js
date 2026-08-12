@@ -1,80 +1,128 @@
 /**
  * @file controllers/productController.js
  * @description Smart Product Manager for Titan Engine
- * @capabilities AI Search, Live Scraping, Pagination, Intelligent Filtering
+ * @capabilities AI Search, Live Scraping, Pagination, Intelligent Filtering, Product Management
  */
 
-const { Product, Sequelize } = require('../models');
-const { scrapeAndSave } = require('../services/rcmScraper'); // Real Scraper Service
+const { Product, Sequelize } = require("../models");
+const { scrapeAndSave } = require("../services/rcmScraper"); // Real Scraper Service
+const { uploadProductImage } = require("../services/cloudinaryService"); // Cloudinary Service
 const Op = Sequelize.Op;
+const { logger } = require("../utils/logger"); // Import logger from common utility
 
 // ============================================================
 // 🕷️ 1. LIVE SCRAPER (Hybrid Engine)
 // ============================================================
 exports.scrapeProductsLive = async (req, res) => {
     try {
-        console.log("🕷️ [CONTROLLER] Triggering Live Scraper...");
-
-        // 1. Asli Scraper chalane ki koshish karein
-        try {
-            // Background me start karein (await nahi karenge taaki timeout na ho)
-            scrapeAndSave(); 
-            
-            return res.status(200).json({
-                success: true,
-                message: "✅ Titan Explorer Started in Background. Data will appear shortly.",
-                status: "PROCESSING"
-            });
-
-        } catch (scraperError) {
-            console.warn("⚠️ Real Scraper failed, falling back to Emergency Data:", scraperError.message);
-            throw new Error("Scraper Service Unavailable");
-        }
-
-    } catch (error) {
-        // 2. Agar Scraper fail ho jaye, to kam se kam ye Demo Data bhar de
-        // Taaki Admin Panel khali na dikhe
-        console.log("⚡ Injecting Emergency Backup Data...");
+        logger.info({ traceId: req.id }, "Triggering Live Scraper...");
+        // Background me start karein (await nahi karenge taaki timeout na ho)
+        scrapeAndSave(); 
         
-        const backupData = [
-            {
-                name: "Nutricharge Man",
-                category: "Health Supplement",
-                mrp: 450,
-                dp: 360,
-                pv: 270,
-                description: "Daily multivitamin with Zinc & Lycopene.",
-                ingredients: ["Zinc", "Lycopene", "Green Tea"],
-                healthBenefits: ["Immunity", "Energy", "Stamina"],
-                aiTags: ["men", "health", "power"]
-            },
-            {
-                name: "Health Guard Rice Bran Oil",
-                category: "Grocery",
-                mrp: 220,
-                dp: 185,
-                pv: 110,
-                description: "Physically refined oil with Gamma Oryzanol.",
-                ingredients: ["Rice Bran", "Oryzanol"],
-                healthBenefits: ["Heart Health", "Cholesterol Control"],
-                aiTags: ["heart", "oil", "cooking"]
-            }
-        ];
-
-        for (const item of backupData) {
-            await Product.upsert(item);
-        }
-
         return res.status(200).json({
             success: true,
-            message: "⚠️ Scraper Busy. Injected Backup Data successfully.",
-            count: backupData.length
+            message: "✅ Titan Explorer Started in Background. Data will appear shortly.",
+            status: "PROCESSING"
         });
+
+    } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Scraper Trigger Error");
+        return res.status(500).json({ success: false, message: "Failed to trigger scraper." });
     }
 };
 
 // ============================================================
-// 🛍️ 2. GET ALL PRODUCTS (With Pagination)
+// 🆕 2. CREATE PRODUCT (Admin)
+// ============================================================
+exports.createProduct = async (req, res) => {
+    try {
+        const { name, category, mrp, dp, pv, description, ingredients, healthBenefits, usageInfo, sitePath, productUrl, aiTags, isFeatured } = req.body;
+        let imageUrl = null;
+
+        // Handle image upload if present
+        if (req.file && req.file.buffer) {
+            const cdnUrl = await uploadProductImage(req.file.buffer, name);
+            if (cdnUrl) imageUrl = cdnUrl;
+        }
+
+        const newProduct = await Product.create({
+            name,
+            category,
+            mrp,
+            dp,
+            pv,
+            description,
+            ingredients: ingredients ? JSON.parse(ingredients) : [],
+            healthBenefits: healthBenefits ? JSON.parse(healthBenefits) : [],
+            usageInfo: usageInfo ? JSON.parse(usageInfo) : {},
+            sitePath,
+            productUrl,
+            imageUrl,
+            aiTags: aiTags ? JSON.parse(aiTags) : [],
+            isFeatured
+        });
+
+        logger.info({ traceId: req.id, productId: newProduct.id, productName: newProduct.name }, "Product created successfully");
+        return res.status(201).json({ success: true, message: "Product created successfully.", data: newProduct });
+
+    } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Create Product Error");
+        return res.status(500).json({ success: false, message: "Failed to create product.", error: error.message });
+    }
+};
+
+// ============================================================
+// 🔄 3. UPDATE PRODUCT (Admin)
+// ============================================================
+exports.updateProduct = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, category, mrp, dp, pv, description, ingredients, healthBenefits, usageInfo, sitePath, productUrl, aiTags, isFeatured } = req.body;
+        
+        const product = await Product.findByPk(id);
+        if (!product) {
+            logger.warn({ traceId: req.id, productId: id }, "Product not found for update");
+            return res.status(404).json({ success: false, message: "Product not found." });
+        }
+
+        let imageUrl = product.imageUrl;
+
+        // Handle image upload if present
+        if (req.file && req.file.buffer) {
+            const cdnUrl = await uploadProductImage(req.file.buffer, name);
+            if (cdnUrl) imageUrl = cdnUrl;
+        }
+
+        const updatedFields = {
+            name,
+            category,
+            mrp,
+            dp,
+            pv,
+            description,
+            ingredients: ingredients ? JSON.parse(ingredients) : product.ingredients,
+            healthBenefits: healthBenefits ? JSON.parse(healthBenefits) : product.healthBenefits,
+            usageInfo: usageInfo ? JSON.parse(usageInfo) : product.usageInfo,
+            sitePath,
+            productUrl,
+            imageUrl,
+            aiTags: aiTags ? JSON.parse(aiTags) : product.aiTags,
+            isFeatured
+        };
+
+        await product.update(updatedFields);
+
+        logger.info({ traceId: req.id, productId: product.id, productName: product.name }, "Product updated successfully");
+        return res.status(200).json({ success: true, message: "Product updated successfully.", data: product });
+
+    } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Update Product Error");
+        return res.status(500).json({ success: false, message: "Failed to update product.", error: error.message });
+    }
+};
+
+// ============================================================
+// 🛍️ 4. GET ALL PRODUCTS (With Pagination)
 // ============================================================
 exports.getAllProducts = async (req, res) => {
     try {
@@ -85,9 +133,10 @@ exports.getAllProducts = async (req, res) => {
         const { count, rows } = await Product.findAndCountAll({
             limit: limit,
             offset: offset,
-            order: [['createdAt', 'DESC']] // Newest first
+            order: [["createdAt", "DESC"]] // Newest first
         });
 
+        logger.info({ traceId: req.id, page, limit, totalItems: count }, "Fetched all products");
         res.json({
             success: true,
             totalItems: count,
@@ -97,38 +146,36 @@ exports.getAllProducts = async (req, res) => {
         });
 
     } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Fetch All Products Error");
         res.status(500).json({ success: false, error: error.message });
     }
 };
 
 // ============================================================
-// 🔍 3. AI SEARCH (Deep Search)
+// 🔍 5. AI SEARCH (Deep Search)
 // ============================================================
 exports.searchProducts = async (req, res) => {
     try {
         const { q } = req.query;
-        if (!q) return res.status(400).json({ success: false, message: "Search query 'q' missing" });
+        if (!q) {
+            logger.warn({ traceId: req.id }, "Search query 'q' missing");
+            return res.status(400).json({ success: false, message: "Search query 'q' missing" });
+        }
 
-        console.log(`🔍 [AI SEARCH] User looking for: ${q}`);
+        logger.info({ traceId: req.id, query: q }, "User looking for products");
 
         const products = await Product.findAll({
             where: {
                 [Op.or]: [
-                    // Name match (Nutricharge)
                     { name: { [Op.like]: `%${q}%` } },
-                    // Category match (Health)
                     { category: { [Op.like]: `%${q}%` } },
-                    // Description match
                     { description: { [Op.like]: `%${q}%` } }
-                    
-                    // Note: JSON search (Ingredients/Tags) ke liye 
-                    // MySQL/TiDB ka specific syntax lagta hai, 
-                    // abhi ke liye Text Search kaafi hai 50 Cr scale par performance ke liye.
                 ]
             },
             limit: 20
         });
 
+        logger.info({ traceId: req.id, query: q, count: products.length }, "Products search complete");
         res.json({
             success: true,
             count: products.length,
@@ -136,48 +183,56 @@ exports.searchProducts = async (req, res) => {
         });
 
     } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Search Products Error");
         res.status(500).json({ success: false, error: error.message });
     }
 };
 
 // ============================================================
-// 🆔 4. GET SINGLE PRODUCT
+// 🆔 6. GET SINGLE PRODUCT
 // ============================================================
 exports.getProductById = async (req, res) => {
     try {
         const product = await Product.findByPk(req.params.id);
         
         if (!product) {
+            logger.warn({ traceId: req.id, productId: req.params.id }, "Product not found by ID");
             return res.status(404).json({ success: false, message: "Product not found" });
         }
 
+        logger.info({ traceId: req.id, productId: product.id }, "Fetched single product by ID");
         res.json({ success: true, data: product });
 
     } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Get Product By ID Error");
         res.status(500).json({ success: false, error: error.message });
     }
 };
 
 // ============================================================
-// 🤖 5. GET RECOMMENDATIONS (AI Logic)
+// 🤖 7. GET RECOMMENDATIONS (AI Logic)
 // ============================================================
 exports.getRecommendations = async (req, res) => {
     try {
         const { category } = req.query;
         
-        // Agar user 'Health' dekh raha hai, to aur 'Health' products dikhao
+        logger.info({ traceId: req.id, category }, "Fetching product recommendations");
         const recommendations = await Product.findAll({
             where: {
-                category: category || 'General',
-                inStock: true
+                category: category || "General",
+                isAvailable: true
             },
             limit: 5,
-            order: sequelize.random() // Random 5 products from same category
+            order: Sequelize.literal("rand()") // Random 5 products from same category
         });
 
+        logger.info({ traceId: req.id, category, count: recommendations.length }, "Product recommendations fetched");
         res.json({ success: true, data: recommendations });
 
     } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Get Recommendations Error");
         res.status(500).json({ success: false, error: error.message });
     }
 };
+
+module.exports = exports;

@@ -4,38 +4,46 @@
  * @security Level 5: Auth + Admin Check + Rate Limiting + Validation
  */
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
-const rateLimit = require('express-rate-limit');
+const rateLimit = require("express-rate-limit");
 
 // ✅ Import Controller Functions
-const { 
-  getRegularUsers, 
+const {
+  getRegularUsers,
   getAllAdmins,
   deleteUser,
   updateUserData,
-  pushNotificationToAll // ✨ New ASI Feature
-} = require('../controllers/adminController');
+  pushNotificationToAll,
+  approveAdmin // ✨ New Feature
+} = require("../controllers/adminController");
 
 // ✅ Import Middleware
-const { isAuthenticated, isAdmin } = require('../middleware/authMiddleware');
+const { isAuthenticated, isActiveUser, isAdmin, restrictTo } = require("../middleware/authMiddleware");
+const validate = require("../middleware/validate"); // Import validation middleware
+
+// ✅ Import Schemas
+const { 
+  userIdParamSchema, 
+  adminApprovalSchema, 
+  updateUserDetailsSchema, 
+  notificationSchema 
+} = require("../validations/adminSchema");
 
 // ============================================================
 // 🛡️ SECURITY CONFIGURATION
 // ============================================================
 
 // 1. GLOBAL GUARD: Protect ALL routes in this file
-// Koi bhi bina login ya bina Admin role ke is file ko touch nahi kar sakta.
-router.use(isAuthenticated, isAdmin);
+router.use(isAuthenticated, isActiveUser);
 
 // 2. SAFETY VALVE: Notification Blast Limiter
-// Rule: 15 minute me sirf 5 baar 'Mass Notification' allowed hai.
 const blastLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 Minutes
     max: 5, // Limit
-    message: { 
-        success: false, 
-        message: "⚠️ Titan Cooling Down: Broadcast limit reached. Try again in 15 mins." 
+    message: {
+        success: false,
+        message: "⚠️ Titan Cooling Down: Broadcast limit reached. Try again in 15 mins."
     },
     standardHeaders: true,
     legacyHeaders: false,
@@ -46,36 +54,35 @@ const blastLimiter = rateLimit({
 // ============================================================
 
 // 1. Get Regular Users (Dashboard Data)
-// URL: GET /api/admin/users/regular
-router.get('/users/regular', getRegularUsers);
+router.get("/users", restrictTo("SUPER_ADMIN", "ADMIN"), getRegularUsers);
+router.get("/users/regular", restrictTo("SUPER_ADMIN", "ADMIN"), getRegularUsers);
 
 // 2. Chat Alias (For Chat System Compatibility)
-// URL: GET /api/admin/chat/all
-router.get('/chat/all', getRegularUsers);
+router.get("/chat/all", restrictTo("SUPER_ADMIN", "ADMIN"), getRegularUsers);
 
 // 3. Get All Admins (Team Management)
-// URL: GET /api/admin/admins
-router.get('/admins', getAllAdmins);
+router.get("/admins", restrictTo("SUPER_ADMIN", "ADMIN"), getAllAdmins);
 
 // 4. Update User Profile (CRM)
-// URL: PATCH /api/admin/users/:userId
-router.patch('/users/:userId', updateUserData);
+router.patch("/users/:userId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(updateUserDetailsSchema), updateUserData);
 
 // 5. Hard Delete User (Cleanup)
-// URL: DELETE /api/admin/users/:userId
-router.delete('/users/:userId', deleteUser);
+router.delete("/users/:userId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(userIdParamSchema), deleteUser);
 
 // ============================================================
 // 🚀 MODULE B: TITAN NOTIFICATION WAR ROOM
 // ============================================================
 
 // 1. Titan Blast: Send Push Notification to ALL Users
-// Features: Parallel Batching, Rich Media, Deep Linking
-// URL: POST /api/admin/notifications/send-all
 router.post(
-    '/notifications/send-all', 
+    "/notifications/send-all",
+    restrictTo("SUPER_ADMIN", "ADMIN"),
     blastLimiter, // 🛡️ Rate Limit Applied Here
+    validate(notificationSchema), // Validate notification payload
     pushNotificationToAll
 );
+
+// 6. Approve Admin (IAM)
+router.post("/approve/:adminId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(adminApprovalSchema), approveAdmin);
 
 module.exports = router;

@@ -14,6 +14,7 @@ const googleTTS = require('google-tts-api');
 const axios = require('axios');
 const crypto = require('crypto');
 const { uploadAudioToCloudinary } = require('./cloudinaryService');
+const { sanitizeForTTS } = require('../utils/textSanitizer'); // ADDED
 const db = require('../models');
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
@@ -153,7 +154,7 @@ class TextToSpeechService {
     async generateAudio(text) {
         if (!text) return null;
         
-        const cleanText = text.replace(/[*#_`]/g, '').trim();
+        const cleanText = sanitizeForTTS(text); // UPDATED
         const textHash = crypto.createHash('sha256').update(cleanText.toLowerCase()).digest('hex');
 
         // 1. Check Cache

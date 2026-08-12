@@ -24,11 +24,19 @@ module.exports = (sequelize) => {
         field: 'full_name',
       },
 
-      rcmId: {
+
+
+      googleId: {
         type: DataTypes.STRING(200),
         allowNull: true,
-        // Unique Index niche define kiya hai performance ke liye
-        field: 'rcm_id',
+        unique: true,
+        field: 'google_id',
+      },
+
+      avatar: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+        field: 'avatar',
       },
 
       email: {
@@ -44,13 +52,10 @@ module.exports = (sequelize) => {
         allowNull: true,
       },
 
-      password: {
-        type: DataTypes.STRING(200),
-        allowNull: false,
-      },
+
 
       role: {
-        type: DataTypes.ENUM('USER', 'ADMIN', 'SUPPORT'),
+        type: DataTypes.ENUM('USER'),
         defaultValue: 'USER',
       },
 
@@ -77,12 +82,6 @@ module.exports = (sequelize) => {
       status: {
         type: DataTypes.ENUM('pending', 'active', 'inactive', 'premium', 'banned'),
         defaultValue: 'pending',
-      },
-
-      fcmToken: {
-        type: DataTypes.TEXT,
-        allowNull: true,
-        field: 'fcm_token',
       },
 
       // 🕒 Timestamps
@@ -114,11 +113,7 @@ module.exports = (sequelize) => {
           unique: true,
           fields: ['email'],
         },
-        {
-          name: 'idx_user_rcm_id',
-          unique: false, // Kuch cases me duplicate allow ho sakta hai, agar nahi to true karein
-          fields: ['rcm_id'],
-        },
+
         {
           name: 'idx_user_phone',
           fields: ['phone'],
