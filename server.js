@@ -63,7 +63,9 @@ app.use((req, res, next) => {
 });
 
 // 3. Hardened Security
-app.use(helmet());
+app.use(helmet({
+    crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" }
+}));
 app.use(compression());
 
 // 4. Strict CORS (No Wildcards)
