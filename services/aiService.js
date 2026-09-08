@@ -1,6 +1,6 @@
 /**
  * @file services/aiService.js
- * @description Titan ASI Engine (V44: Precision RAG + Semantic Ranking + Weight Matching)
+ * @description Titan ASI Engine (V44: Precision RAG + Semantic Ranking + Weight Matching + ImageUrl Support)
  * @status PRODUCTION READY
  */
 
@@ -40,6 +40,9 @@ try {
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
 const VISION_MODEL = 'llama-3.2-11b-vision-preview';
 
+let globalLastMatchedImageUrl = null;
+const getLastMatchedImageUrl = () => globalLastMatchedImageUrl;
+
 // ============================================================
 // 📚 RAG SYSTEM: BUSINESS KNOWLEDGE BASE & RULE-BASED LAYER
 // ============================================================
@@ -78,7 +81,7 @@ async function fetchBusinessKnowledge(query, options = {}) {
             'consistency': 'Consistency_Bonus',
             'vital level pin chart': 'Vital_Level_Pin_Chart',
             'vital level': 'Vital_Level_Pin_Chart',
-            'pin chart': 'Vital_Level_Pin_Chart', // Prioritize 'vital' for this specific chart
+            'pin chart': 'Vital_Level_Pin_Chart',
             'pin level income chart': 'Pin_Level_Income_Chart',
             'pin level': 'Pin_Level_Income_Chart',
             'milestone chart': 'Pin_Level_Income_Chart',
@@ -100,7 +103,7 @@ async function fetchBusinessKnowledge(query, options = {}) {
                         isActive: true,
                         category: categoryName
                     },
-                    order: [['updatedAt', 'DESC']], // Fetch the latest updated record
+                    order: [['updatedAt', 'DESC']],
                     limit: 1,
                     attributes: ['title', 'category', 'content'],
                     raw: true
@@ -113,11 +116,9 @@ async function fetchBusinessKnowledge(query, options = {}) {
             }
         }
 
-        // Check if query is single-topic vs mixed
         const calculationKeywords = ['calc', 'calculate', 'banega', 'kaise', 'formula', 'difference', 'differential', 'group pv', 'self pv'];
         const isCalculation = calculationKeywords.some(k => cleanQuery.includes(k));
         
-        // Count unique matched categories (e.g. Royalty vs Technical)
         const uniqueMatchedCategories = new Set(
             Object.entries(bonusCategoriesMap)
                 .filter(([phrase]) => cleanQuery.includes(phrase))
@@ -126,7 +127,6 @@ async function fetchBusinessKnowledge(query, options = {}) {
 
         const isSingleTopic = fetchedByPrimaryCategory && uniqueMatchedCategories.size === 1 && !isCalculation;
 
-        // Fallback search if no category match
         if (!fetchedByPrimaryCategory && keywords.length > 0) {
             const whereCondition = {
                 isActive: true,
@@ -160,6 +160,7 @@ async function fetchBusinessKnowledge(query, options = {}) {
         return { textContext: "", rawMatch: null, isSingleTopic: false };
     }
 }
+
 function cleanIncompleteSentence(text) {
     if (!text) return "";
     let clean = text.trim();
@@ -176,12 +177,9 @@ async function fetchLiveContext(query) {
     if (!query) return "";
     
     try {
-        // 1. Advanced Tokenization
-        // Extract "25g", "500ml", "1kg" specifically for weight matching
         const weightRegex = /(\d+\s*[g|kg|ml|l|gm]+)/gi;
         const weights = query.match(weightRegex) || [];
         
-        // Clean query for text search
         const cleanQuery = query.toLowerCase().replace(/[^\w\s]/g, '').trim();
         const stopWords = [
             'what', 'is', 'price', 'rate', 'batao', 'kya', 'hai', 'tell', 'me', 'about', 
@@ -193,8 +191,6 @@ async function fetchLiveContext(query) {
         if (keywords.length === 0) return "";
         if (!db || !db.Product) return "";
 
-        // 2. BROAD FETCH (Get Candidate Pool)
-        // Fetch broad matches first, filter logic comes later in JS (Faster for <10k items)
         const products = await db.Product.findAll({
             where: {
                 [Op.or]: [
@@ -203,52 +199,49 @@ async function fetchLiveContext(query) {
                     ...keywords.map(k => ({ aiTags: { [Op.like]: `%${k}%` } }))
                 ]
             },
-            limit: 15, // Get a pool of 15 candidates
+            limit: 15,
             attributes: [
                 'name', 'mrp', 'dp', 'pv', 'category', 
-                'description', 'ingredients', 'healthBenefits', 'usageInfo'
+                'description', 'ingredients', 'healthBenefits', 'usageInfo', 'imageUrl'
             ],
             raw: true 
         });
 
-        if (products.length === 0) return "";
+        if (products.length === 0) {
+            globalLastMatchedImageUrl = null;
+            return "";
+        }
 
-        // 3. 🧠 SEMANTIC RANKING ALGORITHM
         const rankedProducts = products.map(p => {
             let score = 0;
             const pName = p.name.toLowerCase();
             const pCat = (p.category || "").toLowerCase();
             const pTags = JSON.stringify(p.aiTags || []).toLowerCase();
 
-            // A. Exact Name Keyword Match (High Weight)
             keywords.forEach(k => {
                 if (pName.includes(k)) score += 40;        
                 else if (pTags.includes(k)) score += 20;   
                 else if (pCat.includes(k)) score += 10;    
             });
 
-            // B. Exact Weight Match (Critical for variants like 25g vs 50g)
             weights.forEach(w => {
-                const cleanW = w.replace(/\s+/g, '').toLowerCase(); // "25 g" -> "25g"
+                const cleanW = w.replace(/\s+/g, '').toLowerCase();
                 const cleanPName = pName.replace(/\s+/g, '');
-                if (cleanPName.includes(cleanW)) score += 50; // Huge Boost for correct size
+                if (cleanPName.includes(cleanW)) score += 50;
             });
 
-            // C. Precise Phrase Bonus
-            if (pName.startsWith(keywords[0])) score += 15; // Starts with search term
+            if (pName.startsWith(keywords[0])) score += 15;
 
             return { product: p, score };
         });
 
-        // 4. SORT & PICK TOP 3
         rankedProducts.sort((a, b) => b.score - a.score);
         const topProducts = rankedProducts.slice(0, 3).map(rp => rp.product);
+        globalLastMatchedImageUrl = topProducts[0]?.imageUrl || null;
 
-        // 5. FORMATTING FOR AI (Explicit Context)
         return topProducts.map((p, index) => {
             const isBestMatch = index === 0 ? "🔥🔥 [BEST MATCH]" : "[RELATED]";
             
-            // Helper: Clean Arrays/JSON strings
             const parseList = (val) => {
                 if (!val) return "Not listed";
                 if (Array.isArray(val)) return val.join(", ");
@@ -258,7 +251,6 @@ async function fetchLiveContext(query) {
                 } catch (e) { return val; }
             };
 
-            // Helper: Clean Usage
             const parseUsage = (val) => {
                 if (!val) return "Check packaging";
                 try {
@@ -267,7 +259,6 @@ async function fetchLiveContext(query) {
                 } catch (e) { return val; }
             };
 
-            // Clean Description
             let desc = p.description ? p.description.substring(0, 500).replace(/\n/g, " ") : "N/A";
             if (desc === p.name) desc = "No additional details available.";
 
@@ -284,6 +275,7 @@ async function fetchLiveContext(query) {
 
     } catch (error) {
         console.error("⚠️ Expert Context Error:", error.message);
+        globalLastMatchedImageUrl = null;
         return "";
     }
 }
@@ -297,28 +289,24 @@ async function generateTitanResponse(user, message, history = []) {
     try {
         const userName = user?.fullName || "Leader";
 
-        // 1. Fetch relevant product data (Using V44 Ranking) & Business Knowledge RAG
         const liveData = await fetchLiveContext(message);
         const ragResult = await fetchBusinessKnowledge(message);
 
-        // RULE-BASED EXTRACTION LAYER:
-        // Intercept single-topic queries with strong category matches directly without AI model intervention
         if (ragResult.isSingleTopic && ragResult.rawMatch) {
             console.log(`⚡ [RULE-BASED EXTRACTION] Intercepted single-topic query for category: ${ragResult.rawMatch.category}`);
+            globalLastMatchedImageUrl = null;
             return formatBusinessKnowledgeResponse(ragResult.rawMatch, userName);
         }
 
         const businessKnowledgeData = ragResult.textContext || "";
         const combinedLiveData = [liveData, businessKnowledgeData].filter(Boolean).join("\n\n===================================\n\n");
 
-        // 2. Generate System Prompt
         const systemPrompt = GET_ASI_PROMPT({
             userName: userName,
             userPin: user?.pinLevel || "Associate Buyer",
             liveData: combinedLiveData 
         });
 
-        // 3. Message Chain
         const conversationChain = [
             { role: "system", content: systemPrompt },
             ...history, 
@@ -334,7 +322,6 @@ async function generateTitanResponse(user, message, history = []) {
                 completion = await groqClient.chat.completions.create({
                     model: TEXT_MODEL,
                     messages: conversationChain, 
-                    // 🛑 STRICT TEMPERATURE: Keeps answers factual based on liveData
                     temperature: 0.3, 
                     max_tokens: 800,
                     top_p: 0.85,
@@ -345,7 +332,7 @@ async function generateTitanResponse(user, message, history = []) {
                 if (isRateLimit && attempt <= retries) {
                     console.warn(`⚠️ Groq Rate Limit (429) hit. Retrying attempt ${attempt} in ${delay}ms...`);
                     await new Promise(res => setTimeout(res, delay));
-                    delay *= 2; // exponential backoff
+                    delay *= 2;
                     continue;
                 }
                 throw err;
@@ -366,7 +353,7 @@ async function generateTitanResponse(user, message, history = []) {
 }
 
 // ============================================================
-// 👁️ VISION ANALYSIS (UNCHANGED)
+// 👁️ VISION ANALYSIS
 // ============================================================
 async function analyzeImageWithAI(base64Image) {
     if (!groqClient) return "Vision system abhi uplabdh nahi hai.";
@@ -399,18 +386,16 @@ async function analyzeImageWithAI(base64Image) {
     }
 }
 
-const { sanitizeForTTS } = require('../utils/textSanitizer'); // ADDED
-
-// ... (existing imports)
+const { sanitizeForTTS } = require('../utils/textSanitizer');
 
 // ============================================================
-// 🎙️ VOICE GENERATION (UNCHANGED)
+// 🎙️ VOICE GENERATION
 // ============================================================
 async function getOrGenerateVoice(text) {
     if (!text) return null;
     
     try {
-        const cleanText = sanitizeForTTS(text); // UPDATED
+        const cleanText = sanitizeForTTS(text);
         const textHash = crypto.createHash('sha256').update(cleanText.toLowerCase()).digest('hex');
 
         if (db && db.VoiceResponse) {
@@ -452,5 +437,6 @@ module.exports = {
     generateTitanResponse, 
     analyzeImageWithAI,     
     getOrGenerateVoice,
-    fetchBusinessKnowledge
+    fetchBusinessKnowledge,
+    getLastMatchedImageUrl
 };

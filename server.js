@@ -6,6 +6,7 @@
  */
 
 require("dotenv").config();
+const cookieParser = require("cookie-parser");
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -99,6 +100,7 @@ const globalLimiter = rateLimit({
 });
 app.use(globalLimiter);
 
+app.use(cookieParser());
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -164,6 +166,7 @@ apiV1.use("/sitemap", require("./routes/siteMapRoutes"));
 apiV1.use("/users", require("./routes/userRoutes"));
 apiV1.use("/utils", require("./routes/utilsRoutes"));
 apiV1.use("/videos", require("./routes/videoRoutes"));
+apiV1.use("/channels", require("./routes/channelRoutes"));
 apiV1.use("/calculator", require("./routes/calculatorRoutes"));
 
 // Mount under both /api and /api/v1 for compatibility

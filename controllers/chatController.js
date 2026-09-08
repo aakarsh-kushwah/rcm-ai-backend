@@ -1,20 +1,20 @@
 /**
  * @file src/controllers/chatController.js
- * @description Optimized Flow: FAQ Cache -> Titan ASI Engine (Text/Vision) -> Response
+ * @description Optimized Flow: FAQ Cache -> Titan ASI Engine (Text/Vision) -> Response with imageUrl support
  */
 
 const asyncHandler = require('express-async-handler');
 const stringSimilarity = require('string-similarity');
 
 // UPDATED IMPORTS FOR ASI & VISION
-const { generateTitanResponse, analyzeImageWithAI } = require('../services/aiService');
+const { generateTitanResponse, analyzeImageWithAI, getLastMatchedImageUrl } = require('../services/aiService');
 const { generateEdgeAudio } = require('../services/edgeTtsService');
 const { uploadAudioToCloudinary } = require('../services/cloudinaryService');
 const db = require('../models'); 
 const { ChatMessage, FAQ, VoiceResponse, Product } = db;
 
 // ============================================================
-// ⚙️ CONSTANTS & CONFIG (ADDED FOR EXPERT MATCHING)
+// ⚙️ CONSTANTS & CONFIG
 // ============================================================
 const BASE_THRESHOLD = 0.92; 
 const SHORT_TEXT_THRESHOLD = 0.95; 
@@ -31,12 +31,11 @@ const sanitizeInput = (text = "") =>
     text.substring(0, 500).trim().replace(/[<>{}]/g, "");
 
 // ============================================================
-// 🚀 USER → AI CHAT (UPDATED FOR ASI & VISION)
+// 🚀 USER → AI CHAT
 // ============================================================
 const handleChat = asyncHandler(async (req, res) => {
     const start = Date.now();
     
-    // IMAGE HANDLING
     const { message, userId, image } = req.body; 
     const requestingUser = req.user;
 
@@ -44,23 +43,20 @@ const handleChat = asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: "Input missing" });
     }
 
-    // 🛡️ BACKEND PAYWALL ENFORCEMENT
-    // Only allow 'active' or 'premium' users to use chat features
     if (requestingUser && requestingUser.role === "USER" && (requestingUser.status !== "active" && requestingUser.status !== "premium")) {
         return res.status(403).json({ 
             success: false, 
             message: "🚫 Access Denied: Please subscribe to use chat features.",
-            redirect: "/payment-setup" // Frontend can use this for redirection
+            redirect: "/payment-setup"
         });
     }
 
     const cleanMsg = message ? sanitizeInput(message) : "Image Analysis Request";
     const matchText = cleanMsg.toLowerCase().trim(); 
-    let replyContent = ""; // Initialize once at top level
+    let replyContent = ""; 
     let audioUrl = "";
-    let source = "TITAN_ASI"; // Default source, initialized once at top level
+    let source = "TITAN_ASI"; 
 
-    // Attempt business calculation first
     const CALCULATOR_KEYWORDS = [
         "calculate", "calculator", "income kitna", "business check", "kitna banega",
         "pv calculate", "bonus calculate", "earning check", "earning kitna", "rotyalty"
@@ -72,12 +68,6 @@ const handleChat = asyncHandler(async (req, res) => {
         legB: ["leg b pv", "b leg pv", "second leg pv"]
     };
 
-    /**
-     * @function detectAndExtractPvValues
-     * @description Detects calculator intent and extracts PV values from a user message.
-     * @param {string} message - The user's chat message.
-     * @returns {object} An object containing `isCalculatorIntent` (boolean) and extracted PV values.
-     */
     const detectAndExtractPvValues = (message) => {
         const lowerCaseMessage = message.toLowerCase();
         let isCalculatorIntent = CALCULATOR_KEYWORDS.some(keyword => lowerCaseMessage.includes(keyword));
@@ -85,7 +75,6 @@ const handleChat = asyncHandler(async (req, res) => {
         let legAPv = null;
         let legBPv = null;
 
-        // Regex to find numbers associated with PV keywords
         const extractValue = (keywords) => {
             for (const keyword of keywords) {
                 const regex = new RegExp(`${keyword}\\s*(\\d+)`, "i");
@@ -101,12 +90,9 @@ const handleChat = asyncHandler(async (req, res) => {
         legAPv = extractValue(PV_KEYWORDS.legA);
         legBPv = extractValue(PV_KEYWORDS.legB);
 
-        // If PV values are explicitly mentioned, it's a calculator intent even if general keywords are missing
         if ((selfPurchasePv !== null || legAPv !== null || legBPv !== null) && !isCalculatorIntent) {
              isCalculatorIntent = true;
         }
-
-        console.log(`[Calculator Intent] Detected: ${isCalculatorIntent}, Self PV: ${selfPurchasePv}, Leg A PV: ${legAPv}, Leg B PV: ${legBPv}`);
 
         return {
             isCalculatorIntent,
@@ -120,7 +106,6 @@ const handleChat = asyncHandler(async (req, res) => {
     if (!image && message) {
         calculatorData = detectAndExtractPvValues(cleanMsg);
         if (calculatorData.isCalculatorIntent) {
-            // If calculator intent, prepare the special widget response
             replyContent = JSON.stringify({
                 type: "calculator_widget",
                 data: {
@@ -133,21 +118,13 @@ const handleChat = asyncHandler(async (req, res) => {
         }
     }
 
-    // If a calculation was made, skip FAQ and AI processing
     if (!calculatorData.isCalculatorIntent) {
-        // 🧠 Dynamic Threshold Logic
         const wordCount = matchText.split(/\s+/).length;
         const currentThreshold = wordCount < 5 ? SHORT_TEXT_THRESHOLD : BASE_THRESHOLD;
 
-
         if (!calculatorData.isCalculatorIntent) {
-            // ========================================================
-            // 1️⃣ DB FAQ MATCH (SMART TAG SEARCH)
-            // ========================================================
             if (!image) { 
                 try {
-                    console.log(`🔍 [FAQ CHECK] Searching for: "${matchText}" | Req Score: ${currentThreshold}`);
-
                     const faqs = await db.FAQ.findAll({
                         where: { status: 'APPROVED' },
                         attributes: ['id', 'question', 'answer', 'audioUrl', 'tags']
@@ -183,7 +160,6 @@ const handleChat = asyncHandler(async (req, res) => {
                             replyContent = bestMatch.faq.answer;
                             audioUrl = bestMatch.faq.audioUrl || "";
                             source = "DB_FAQ_HIT";
-                            console.log(`✅ FAQ Found! Serving from Database.`);
                         }
                     }
                 } catch (err) {
@@ -191,30 +167,20 @@ const handleChat = asyncHandler(async (req, res) => {
                 }
             }
 
-            // ========================================================
-            // 2️⃣ TITAN ASI ENGINE (RAG + VISION)
-            // ========================================================
             if (!replyContent) {
                 try {
-                    // ✅ UPDATED: CONTEXT MEMORY FETCHING
-                    // AI ko pichhle messages bhejne ke liye data fetch kar rahe hain
                     let history = [];
                     const reqUserId = userId || req.user?.id;
 
                     if (reqUserId) {
-                        // Fetch last 3 full turns (User + AI) = 3 rows approx if stored together
-                        // Note: ChatMessage typically stores 1 row per interaction
                         const pastMessages = await db.ChatMessage.findAll({
                             where: { userId: reqUserId },
-                            order: [['createdAt', 'DESC']], // Latest pehle
-                            limit: 12 // Last 12 interactions fetch karenge context ke liye
+                            order: [['createdAt', 'DESC']],
+                            limit: 12
                         });
 
-                        // Array reverse karke chronological order (Oldest -> Newest) banayein
                         pastMessages.reverse().forEach(msg => {
-                            // User ka message
                             history.push({ role: "user", content: msg.message });
-                            // Agar AI ka reply database me hai to use bhi add karein
                             if (msg.response) {
                                 let aiContent = msg.response;
                                 try {
@@ -233,7 +199,6 @@ const handleChat = asyncHandler(async (req, res) => {
                         source = "TITAN_VISION";
                     } else {
                         const currentUser = req.user || { fullName: "Leader", pinLevel: "Associate" };
-                        // ✅ UPDATED: Passing 'history' to the service
                         replyContent = await generateTitanResponse(currentUser, cleanMsg, history);
                     }
                 } catch (error) {
@@ -241,7 +206,6 @@ const handleChat = asyncHandler(async (req, res) => {
                     replyContent = "Network issue. Kripya thodi der baad try karein. Jai RCM.";
                 }
 
-                // Generate Audio for AI response
                 try {
                     if (replyContent.length < 600) {
                         audioUrl = await generateEdgeAudio(replyContent);
@@ -253,61 +217,49 @@ const handleChat = asyncHandler(async (req, res) => {
         }
     }
 
-    // ========================================================
-    // 3️⃣ RESPONSE
-    // ========================================================
     res.status(200).json({
         success: true,
-        message: replyContent, // This will be the stringified JSON or regular text
-        reply: replyContent,   // This will be the stringified JSON or regular text
+        message: replyContent,
+        reply: replyContent,
         audioUrl: audioUrl || "",
         source,
         latency: `${Date.now() - start}ms`,
-        // Add type and data if it's a calculator widget
+        imageUrl: getLastMatchedImageUrl() || null,
         ...(source === "BUSINESS_CALCULATOR_WIDGET" && {
             type: "calculator_widget",
-            data: JSON.parse(replyContent).data // Parse back to send as object
+            data: JSON.parse(replyContent).data
         })
     });
 
-    // Logging...
     setImmediate(async () => {
         try {
             const currentUserId = userId || req.user?.id;
             if (currentUserId) {
-                // Log user's message
-                const userMessageRecord = await db.ChatMessage.create({
+                await db.ChatMessage.create({
                     userId: currentUserId,
-                    sender: 'user', // Corrected enum value
+                    sender: 'user',
                     message: cleanMsg,
-                    isAudio: false, // Assuming user input is text. If there was user audio, this should be true.
-                    metadata: { // Store additional data in metadata JSON column
-                        source: 'USER_INPUT' // Or original source if from voice input
-                    }
+                    isAudio: false,
+                    metadata: { source: 'USER_INPUT' }
                 });
-                console.log(`User message logged with ID: ${userMessageRecord.id}`);
 
-                // Log AI's response as a separate message
-                const aiResponseRecord = await db.ChatMessage.create({
+                await db.ChatMessage.create({
                     userId: currentUserId,
-                    sender: 'ai', // Corrected enum value
+                    sender: 'ai',
                     message: replyContent,
-                    isAudio: (audioUrl !== ''), // Set true if AI generated audio
-                    metadata: { // Store additional data in metadata JSON column
+                    isAudio: (audioUrl !== ''),
+                    metadata: {
                         audioUrl: audioUrl || null,
                         source: source,
-                        latency: `${Date.now() - start}ms`
+                        latency: `${Date.now() - start}ms`,
+                        imageUrl: getLastMatchedImageUrl() || null
                     }
                 });
-                console.log(`AI response logged with ID: ${aiResponseRecord.id}`);
             }
         } catch (err) { console.error("Log Error:", err.message); }
     });
 });
 
-// ============================================================
-// 🧑‍💼 ADMIN → CHAT USERS LIST
-// ============================================================
 const getAllChatUsers = asyncHandler(async (req, res) => {
     res.set("Cache-Control", "no-store");
     try {
@@ -339,18 +291,14 @@ const getAllChatUsers = asyncHandler(async (req, res) => {
     }
 });
 
-// ============================================================
-// 🧑‍💼 ADMIN → CHAT HISTORY
-// ============================================================
 const getChatHistoryByUser = asyncHandler(async (req, res) => {
     const { userId: userIdParam } = req.params;
-    const userId = parseInt(userIdParam, 10); // Convert userId to integer
+    const userId = parseInt(userIdParam, 10);
 
     if (isNaN(userId)) {
         return res.status(400).json({ success: false, message: "Invalid User ID" });
     }
 
-    console.log(`[getChatHistoryByUser] Fetching chat history for userId: ${userId} (type: ${typeof userId})`);
     const page = Number(req.query.page || 1);
     const limit = 30;
     const offset = (page - 1) * limit;
@@ -380,9 +328,6 @@ const getChatHistoryByUser = asyncHandler(async (req, res) => {
     }
 });
 
-// ============================================================
-// 🛡️ ADMIN → ADD SMART RESPONSE
-// ============================================================
 const addSmartResponse = asyncHandler(async (req, res) => {
     const { question, answer } = req.body;
 
@@ -405,9 +350,6 @@ const addSmartResponse = asyncHandler(async (req, res) => {
     res.json({ success: true, message: "Smart response saved" });
 });
 
-// ============================================================
-// 🛡️ ADMIN → UPGRADE FAQ
-// ============================================================
 const upgradeToPremium = asyncHandler(async (req, res) => {
     const { faqId, answer } = req.body;
 
@@ -430,9 +372,6 @@ const upgradeToPremium = asyncHandler(async (req, res) => {
     res.json({ success: true, message: "FAQ upgraded" });
 });
 
-// ============================================================
-// 🔊 DIRECT TTS
-// ============================================================
 const handleSpeak = asyncHandler(async (req, res) => {
     const { text } = req.body;
     if (!text) {
@@ -443,9 +382,6 @@ const handleSpeak = asyncHandler(async (req, res) => {
     res.json({ success: true, audioUrl });
 });
 
-// ============================================================
-// 📦 EXPORTS
-// ============================================================
 module.exports = {
     handleChat,
     handleSpeak,

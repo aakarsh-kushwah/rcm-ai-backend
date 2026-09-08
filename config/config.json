@@ -1,9 +1,33 @@
 {
-    "database": {
-        "host": "gateway01.ap-southeast-1.prod.aws.tidbcloud.com",
-        "port": 4000,
-        "user": "2ZwsbT1UEAt2BGT.root",
-        "password":"fpIW3FdQn6J3CxSX",
-        "database": "test"
+  "development": {
+    "username": "root",
+    "password": "password",
+    "database": "rcm_ai_db",
+    "host": "localhost",
+    "dialect": "mysql"
+  },
+  "test": {
+    "username": "root",
+    "password": "password",
+    "database": "rcm_ai_db_test",
+    "host": "localhost",
+    "dialect": "mysql"
+  },
+  "production": {
+    "username": "2ZwsbT1UEAt2BGT.root",
+    "password": "6SKhRoczjqK8ICaC",
+    "database": "rcm_ai",
+    "host": "gateway01.ap-southeast-1.prod.aws.tidbcloud.com",
+    "port": 4000,
+    "dialect": "mysql",
+    "dialectOptions": {
+      "ssl": {
+        "require": true,
+        "rejectUnauthorized": false,
+        "minVersion": "TLSv1.2"
+      },
+      "enableKeepAlive": true,
+      "connectTimeout": 60000
     }
+  }
 }

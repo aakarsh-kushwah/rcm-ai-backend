@@ -13,6 +13,11 @@ module.exports = (sequelize) => {
         type: DataTypes.STRING(200),
         allowNull: false,
       },
+      leaderName: {
+        type: DataTypes.STRING(150),
+        allowNull: true,
+        field: 'leader_name',
+      },
       description: {
         type: DataTypes.TEXT,
         allowNull: true,

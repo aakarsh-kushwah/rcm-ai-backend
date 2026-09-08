@@ -1,7 +1,17 @@
 const express = require("express");
 const router = express.Router();
 const rateLimit = require("express-rate-limit");
-const { googleAuthLogin, adminSignup, adminVerify, refreshToken, adminGooglePhaseOne, adminMasterPasswordPhaseTwo } = require("../controllers/authController");
+const { 
+    googleAuthLogin, 
+    adminSignup, 
+    adminVerify, 
+    refreshToken, 
+    adminRefresh,
+    logout,
+    adminGooglePhaseOne, 
+    adminMasterPasswordPhaseTwo, 
+    adminLogin 
+} = require("../controllers/authController");
 const validate = require("../middleware/validate");
 const { adminSignupSchema, adminVerifySchema } = require("../validations/adminSchema");
 
@@ -39,10 +49,24 @@ router.post("/admin/signup", authLimiter, validate(adminSignupSchema), adminSign
 
 /**
  * @route   POST /api/auth/refresh
- * @desc    Refresh Token
+ * @desc    Refresh Token (User)
  * @access  Public
  */
 router.post("/refresh", authLimiter, refreshToken);
+
+/**
+ * @route   POST /api/auth/admin/refresh
+ * @desc    Refresh Token (Admin)
+ * @access  Public
+ */
+router.post("/admin/refresh", authLimiter, adminRefresh);
+
+/**
+ * @route   POST /api/auth/logout
+ * @desc    Logout User/Admin
+ * @access  Public
+ */
+router.post("/logout", logout);
 
 /**
  * @route   POST /api/auth/admin/verify
@@ -64,5 +88,13 @@ router.post("/admin/google-phase-one", googleAuthLimiter, adminGooglePhaseOne);
  * @access  Public
  */
 router.post("/admin/verify-master-password", authLimiter, adminMasterPasswordPhaseTwo);
+
+/**
+ * @route   POST /api/auth/admin/login
+ * @desc    Admin Direct Login (Email & Password)
+ * @access  Public
+ */
+router.post("/admin/login", authLimiter, adminLogin);
+router.post("/login", authLimiter, adminLogin);
 
 module.exports = router;

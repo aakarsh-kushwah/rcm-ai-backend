@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node server.js",
+    "migrate": "sequelize-cli db:migrate --env production",
     "start:godmode": "cross-env NODE_ENV=production pm2 start server.js -i max --name titan-core --node-args='--max-old-space-size=8192 --expose-gc --use-largepages'",
     "dev": "cross-env NODE_ENV=development nodemon server.js",
     "worker": "cross-env NODE_ENV=production node workers/ai-processor.js",
@@ -28,6 +29,7 @@
     "bullmq": "^5.4.0",
     "cloudinary": "^2.9.0",
     "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "cross-env": "^7.0.3",
     "dotenv": "^16.4.1",

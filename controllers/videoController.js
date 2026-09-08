@@ -50,16 +50,28 @@ const fetchUrlDetails = async (videoUrl) => {
       throw new Error(`Invalid YouTube ID extracted: ${publicId}`);
     }
     
-    const oEmbedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${publicId}&format=json`;
-    const response = await axios.get(oEmbedUrl);
-    
-    const title = removeEmojis(response.data.title);
-    const description = removeEmojis(response.data.author_name) || ''; 
-    const thumbnailUrl = response.data.thumbnail_url || `https://i.ytimg.com/vi/${publicId}/mqdefault.jpg`;
+    let title = `YouTube Video (${publicId})`;
+    let description = '';
+    let authorName = '';
+    let thumbnailUrl = `https://i.ytimg.com/vi/${publicId}/mqdefault.jpg`;
+
+    try {
+      const oEmbedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${publicId}&format=json`;
+      const response = await axios.get(oEmbedUrl, { timeout: 5000 });
+      if (response.data) {
+        title = removeEmojis(response.data.title) || title;
+        description = removeEmojis(response.data.author_name) || '';
+        authorName = removeEmojis(response.data.author_name) || '';
+        thumbnailUrl = response.data.thumbnail_url || thumbnailUrl;
+      }
+    } catch (oEmbedErr) {
+      console.warn(`⚠️ oEmbed failed for ${publicId}, using fallback: ${oEmbedErr.message}`);
+    }
 
     return {
       title,
       description,
+      authorName,
       publicId,
       videoUrl: `https://www.youtube.com/watch?v=${publicId}`,
       thumbnailUrl,
@@ -74,7 +86,7 @@ const fetchUrlDetails = async (videoUrl) => {
 // 🔹 4. Batch Scrape & Import
 // ============================================================
 const batchScrapeImport = asyncHandler(async (req, res) => {
-    const { urls, videoType, category } = req.body;
+    const { urls, videoType, category, leaderName } = req.body;
     
     if (!Array.isArray(urls) || urls.length === 0) {
         return res.status(400).json({ success: false, message: 'No URLs provided.' });
@@ -113,7 +125,8 @@ const batchScrapeImport = asyncHandler(async (req, res) => {
             .filter(video => !existingPublicIds.includes(video.publicId))
             .map(video => ({
                 ...video,
-                category: videoType === 'products' ? videoCategory : undefined 
+                category: videoType === 'products' ? videoCategory : undefined,
+                leaderName: videoType === 'leaders' ? (leaderName?.trim() || video.authorName || 'RCM Leader') : undefined
             }));
 
         if (newVideosToSave.length > 0) {
@@ -187,6 +200,8 @@ const updateVideo = async (Model, req, res) => {
 
   if (Model.name === 'ProductVideo' && category) {
     dataToUpdate.category = category.trim() || 'General';
+  } else if (Model.name === 'LeaderVideo' && leaderName) {
+    dataToUpdate.leaderName = leaderName.trim();
   }
 
   try {

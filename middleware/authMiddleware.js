@@ -72,8 +72,11 @@ const isActiveUser = async (req, res, next) => {
         }
 
         // 1. Fetch User (Only Status Needed)
+        // ✅ FIX: Removed 'isApproved' from attributes. The User model does not have
+        // an 'isApproved' column (only the Admin model does). Requesting it caused
+        // a "Unknown column 'isapproved'" 500 error in production.
         const user = await User.findByPk(userId, {
-            attributes: ['id', 'status', 'role', 'isApproved']
+            attributes: ['id', 'status', 'role']
         });
 
         if (!user) return res.status(404).json({ success: false, message: '🚫 User Not Found.' });

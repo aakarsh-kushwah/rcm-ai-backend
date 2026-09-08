@@ -3,7 +3,7 @@
  * @description Titan Hyper-Scale DB: Optimized for Oracle 24GB & TiDB Cloud
  */
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { Sequelize } = require('sequelize');
 
 // Priority: Use DB_HOST from .env as TiDB Cloud address
@@ -33,8 +33,8 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
             rejectUnauthorized: false,
             minVersion: 'TLSv1.2'
         },
-        enableKeepAlive: true, 
-        connectTimeout: 60000, 
+        enableKeepAlive: true,
+        connectTimeout: 60000,
     },
 
     logging: console.log, // Log all SQL queries

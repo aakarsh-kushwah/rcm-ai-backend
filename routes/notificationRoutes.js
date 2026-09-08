@@ -62,6 +62,12 @@ router.post(
     asyncHandler(notificationController.registerDevice)
 );
 
+router.post(
+    '/send',
+    isAuthenticated,
+    asyncHandler(notificationController.sendTitanBroadcast)
+);
+
 router.get('/health', (req, res) => {
     res.status(200).json({ status: 'active', subsystem: 'Titan Notification Gateway' });
 });

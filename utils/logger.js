@@ -6,4 +6,7 @@ const logger = pino({
     transport: process.env.NODE_ENV !== "production" ? { target: 'pino-pretty' } : undefined
 });
 
-module.exports = { logger };
+// Support both `const logger = require('./logger')` and `const { logger } = require('./logger')`
+logger.logger = logger;
+
+module.exports = logger;

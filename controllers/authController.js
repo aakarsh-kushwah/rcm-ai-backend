@@ -1,23 +1,28 @@
 /**
  * @file src/controllers/authController.js
- * @description Titan Authentication Core (Google-Only Auth & Admin Gateway)
+ * @description Titan Authentication Core (Opaque Refresh Tokens, Rotation, Reuse Detection, HttpOnly Cookies)
  */
 
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-const { User, Admin } = require("../models");
+const { User, Admin, RefreshToken } = require("../models");
 const { Op } = require("sequelize");
 const { logger } = require("../utils/logger");
 const crypto = require("crypto");
 
 // ⚙️ CONFIGURATION
 const JWT_ACCESS_EXPIRY = "1h";
-const JWT_REFRESH_EXPIRY = "30d";
 const SALT_ROUNDS = 10;
+const COOKIE_OPTIONS = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
+};
 
-// Helper: Token Generator
+// Helper: Token Generator (Access Token JWT)
 const generateToken = (user, expiresIn) => {
     const parsedId = parseInt(user.id, 10);
     const tokenId = Number.isNaN(parsedId) ? user.id : parsedId;
@@ -33,13 +38,31 @@ const generateToken = (user, expiresIn) => {
     );
 };
 
+// Helper: Generate Opaque Refresh Token & Store Hash in DB
+const generateOpaqueRefreshToken = async (userId, adminId, userType, userAgent) => {
+    const rawToken = crypto.randomBytes(40).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+
+    await RefreshToken.create({
+        userId: userId || null,
+        adminId: adminId || null,
+        userType: userType || "USER",
+        tokenHash,
+        expiresAt,
+        userAgent: userAgent || null
+    });
+
+    return rawToken;
+};
+
 // Helper: Generate a secure 6-digit verification code
 const generateVerificationCode = () => {
     return crypto.randomInt(100000, 999999).toString();
 };
 
 // ============================================================
-// 1. GOOGLE OAUTH LOGIN & ONBOARDING
+// 1. GOOGLE OAUTH LOGIN & ONBOARDING (User)
 // ============================================================
 exports.googleAuthLogin = async (req, res) => {
     const { credential } = req.body;
@@ -62,7 +85,6 @@ exports.googleAuthLogin = async (req, res) => {
             return res.status(401).json({ success: false, message: "Google account email is not verified." });
         }
 
-        // Find user by googleId or email
         let user = await User.findOne({
             where: {
                 [Op.or]: [
@@ -104,7 +126,10 @@ exports.googleAuthLogin = async (req, res) => {
         }
 
         const accessToken = generateToken(user, JWT_ACCESS_EXPIRY);
-        const refreshToken = generateToken(user, JWT_REFRESH_EXPIRY);
+        const refreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"]);
+
+        // Set HttpOnly Cookie
+        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, userId: user.id, role: user.role }, "Google authentication successful");
 
@@ -112,7 +137,6 @@ exports.googleAuthLogin = async (req, res) => {
             success: true,
             message: "Authentication successful!",
             accessToken,
-            refreshToken,
             user: {
                 id: user.id,
                 fullName: user.fullName,
@@ -121,7 +145,6 @@ exports.googleAuthLogin = async (req, res) => {
                 avatar: user.avatar,
                 status: user.status,
                 role: user.role,
-
             }
         });
 
@@ -159,15 +182,11 @@ exports.adminSignup = async (req, res) => {
             verificationCode,
         });
 
-        const masterNumber = "+917722923842";
-        const message = `Titan Core Gateway: Verification request from ${email}. Code: ${verificationCode}`;
-        console.log(`🔑 Admin Registration Verification Code for ${email}: ${verificationCode} (Gateway: WhatsApp removed)`);
-
         logger.info({ traceId: req.id, adminId: admin.id, email: admin.email }, "New admin registered, awaiting verification");
 
         res.status(202).json({
             success: true,
-            message: "✅ Admin registration successful. Awaiting WhatsApp verification.",
+            message: "✅ Admin registration successful. Awaiting verification.",
             user: {
                 id: admin.id,
                 email: admin.email,
@@ -184,38 +203,55 @@ exports.adminSignup = async (req, res) => {
 };
 
 // ============================================================
-// 3. REFRESH TOKEN (Automated)
+// 3. REFRESH TOKEN (Automated User Rotation & Reuse Detection)
 // ============================================================
 exports.refreshToken = async (req, res) => {
-    const authHeader = req.headers.authorization;
+    const rawToken = req.cookies?.refreshToken;
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return res.status(401).json({ success: false, message: "Authorization token not provided." });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    if (!token) {
-        return res.status(401).json({ success: false, message: "Token not found." });
+    if (!rawToken) {
+        return res.status(401).json({ success: false, message: "Refresh token not provided in cookie." });
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET, { expiresIn: JWT_REFRESH_EXPIRY });
-        const user = await User.findByPk(decoded.id);
+        const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+        const tokenRecord = await RefreshToken.findOne({ where: { tokenHash, userType: "USER" } });
 
+        if (!tokenRecord) {
+            logger.warn({ traceId: req.id }, "Refresh token not found in DB");
+            return res.status(401).json({ success: false, message: "Invalid or expired refresh token." });
+        }
+
+        if (tokenRecord.expiresAt < new Date()) {
+            await tokenRecord.update({ revokedAt: new Date() });
+            return res.status(401).json({ success: false, message: "Refresh token expired." });
+        }
+
+        // Reuse Detection: If already revoked, compromise suspected! Revoke all user tokens.
+        if (tokenRecord.revokedAt) {
+            logger.error({ traceId: req.id, userId: tokenRecord.userId }, "🚨 Refresh Token Reuse Detected! Revoking all sessions.");
+            await RefreshToken.update(
+                { revokedAt: new Date() },
+                { where: { userId: tokenRecord.userId, userType: "USER", revokedAt: null } }
+            );
+            res.clearCookie("refreshToken", COOKIE_OPTIONS);
+            return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All sessions revoked." });
+        }
+
+        const user = await User.findByPk(tokenRecord.userId);
         if (!user) {
-            logger.warn({ traceId: req.id, token }, "Refresh token failed: User not found");
             return res.status(404).json({ success: false, message: "User not found." });
         }
 
-        if (user.role === "ADMIN" && !user.isApproved) {
-            logger.warn({ traceId: req.id, userId: user.id }, "Refresh attempt: Admin account not approved");
-            return res.status(403).json({ success: false, message: "🚫 Access Denied: Your admin account is pending approval." });
-        }
+        // Rotate: Revoke current token
+        await tokenRecord.update({ revokedAt: new Date() });
 
+        // Issue new access token and new opaque refresh token
         const newAccessToken = generateToken(user, JWT_ACCESS_EXPIRY);
+        const newRefreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"]);
 
-        logger.info({ traceId: req.id, userId: user.id }, "Access token refreshed successfully");
+        res.cookie("refreshToken", newRefreshTokenVal, COOKIE_OPTIONS);
+
+        logger.info({ traceId: req.id, userId: user.id }, "User access token refreshed successfully with rotation");
 
         res.json({
             success: true,
@@ -228,13 +264,97 @@ exports.refreshToken = async (req, res) => {
                 rcmId: user.rcmId,
                 status: user.status,
                 role: user.role,
-
             },
         });
 
     } catch (error) {
         logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Refresh Token Error");
         return res.status(403).json({ success: false, message: "Invalid or expired token.", error: error.message });
+    }
+};
+
+// ============================================================
+// 3.1. ADMIN REFRESH TOKEN (Automated Admin Rotation & Reuse Detection)
+// ============================================================
+exports.adminRefresh = async (req, res) => {
+    const rawToken = req.cookies?.refreshToken;
+
+    if (!rawToken) {
+        return res.status(401).json({ success: false, message: "Admin refresh token not provided in cookie." });
+    }
+
+    try {
+        const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+        const tokenRecord = await RefreshToken.findOne({ where: { tokenHash, userType: "ADMIN" } });
+
+        if (!tokenRecord) {
+            return res.status(401).json({ success: false, message: "Invalid or expired admin refresh token." });
+        }
+
+        if (tokenRecord.expiresAt < new Date()) {
+            await tokenRecord.update({ revokedAt: new Date() });
+            return res.status(401).json({ success: false, message: "Admin refresh token expired." });
+        }
+
+        if (tokenRecord.revokedAt) {
+            logger.error({ traceId: req.id, adminId: tokenRecord.adminId }, "🚨 Admin Refresh Token Reuse Detected! Revoking all sessions.");
+            await RefreshToken.update(
+                { revokedAt: new Date() },
+                { where: { adminId: tokenRecord.adminId, userType: "ADMIN", revokedAt: null } }
+            );
+            res.clearCookie("refreshToken", COOKIE_OPTIONS);
+            return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All admin sessions revoked." });
+        }
+
+        const admin = await Admin.findByPk(tokenRecord.adminId);
+        if (!admin || !admin.isApproved || admin.status !== "active") {
+            return res.status(403).json({ success: false, message: "Admin account not active or approved." });
+        }
+
+        await tokenRecord.update({ revokedAt: new Date() });
+
+        const newAccessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
+        const newRefreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
+
+        res.cookie("refreshToken", newRefreshTokenVal, COOKIE_OPTIONS);
+
+        logger.info({ traceId: req.id, adminId: admin.id }, "Admin access token refreshed successfully");
+
+        res.json({
+            success: true,
+            message: "Admin access token refreshed.",
+            accessToken: newAccessToken,
+            user: {
+                id: admin.id,
+                fullName: admin.name,
+                email: admin.email,
+                role: admin.role,
+                status: admin.status,
+                isApproved: admin.isApproved
+            }
+        });
+
+    } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Admin Refresh Error");
+        return res.status(403).json({ success: false, message: "Invalid or expired admin token.", error: error.message });
+    }
+};
+
+// ============================================================
+// 3.2. LOGOUT (Revoke DB token + Clear Cookie)
+// ============================================================
+exports.logout = async (req, res) => {
+    try {
+        const rawToken = req.cookies?.refreshToken;
+        if (rawToken) {
+            const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+            await RefreshToken.update({ revokedAt: new Date() }, { where: { tokenHash } });
+        }
+        res.clearCookie("refreshToken", COOKIE_OPTIONS);
+        res.json({ success: true, message: "Logged out successfully." });
+    } catch (error) {
+        res.clearCookie("refreshToken", COOKIE_OPTIONS);
+        res.json({ success: true, message: "Logged out successfully." });
     }
 };
 
@@ -265,7 +385,9 @@ exports.adminVerify = async (req, res) => {
         await admin.save();
 
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
-        const refreshToken = generateToken(admin, JWT_REFRESH_EXPIRY);
+        const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
+
+        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, adminId: admin.id, email: admin.email }, "Admin account verified and activated");
 
@@ -273,7 +395,6 @@ exports.adminVerify = async (req, res) => {
             success: true,
             message: "✅ Admin account verified and activated.",
             accessToken,
-            refreshToken,
             user: {
                 id: admin.id,
                 fullName: admin.fullName,
@@ -307,7 +428,6 @@ exports.adminGooglePhaseOne = async (req, res) => {
         });
 
         const payload = ticket.getPayload();
-        console.log("DEBUG - Email from Google:", JSON.stringify(payload.email));
         const { email, email_verified } = payload;
 
         if (!email_verified) {
@@ -390,7 +510,9 @@ exports.adminMasterPasswordPhaseTwo = async (req, res) => {
         }
 
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
-        const refreshToken = generateToken(admin, JWT_REFRESH_EXPIRY);
+        const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
+
+        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin authenticated successfully via 2-step verification");
 
@@ -398,7 +520,6 @@ exports.adminMasterPasswordPhaseTwo = async (req, res) => {
             success: true,
             message: "Admin authentication successful!",
             accessToken,
-            refreshToken,
             admin: {
                 id: admin.id,
                 name: admin.name,
@@ -415,3 +536,59 @@ exports.adminMasterPasswordPhaseTwo = async (req, res) => {
     }
 };
 
+// ============================================================
+// 6. ADMIN DIRECT LOGIN (Email & Password)
+// ============================================================
+exports.adminLogin = async (req, res) => {
+    const { loginId, password } = req.body;
+
+    if (!loginId || !password) {
+        return res.status(400).json({ success: false, message: "Login ID and password are required." });
+    }
+
+    try {
+        const admin = await Admin.findOne({
+            where: { email: loginId.toLowerCase().trim() }
+        });
+
+        if (!admin) {
+            logger.warn({ traceId: req.id, loginId }, "Admin login failed: Admin not found");
+            return res.status(401).json({ success: false, message: "Invalid credentials." });
+        }
+
+        if (!admin.isApproved || admin.status !== 'active') {
+            logger.warn({ traceId: req.id, adminId: admin.id }, "Admin login failed: Account not active or approved");
+            return res.status(403).json({ success: false, message: "🚫 Access Denied: Admin account not active or approved." });
+        }
+
+        const isMatch = await bcrypt.compare(password, admin.masterPassword);
+        if (!isMatch) {
+            logger.warn({ traceId: req.id, adminId: admin.id }, "Admin login failed: Invalid password");
+            return res.status(401).json({ success: false, message: "Invalid credentials." });
+        }
+
+        const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
+        const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
+
+        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
+
+        logger.info({ traceId: req.id, adminId: admin.id }, "Admin logged in successfully via direct credentials");
+
+        res.json({
+            success: true,
+            message: "Admin login successful!",
+            accessToken,
+            user: {
+                id: admin.id,
+                fullName: admin.name,
+                email: admin.email,
+                role: admin.role,
+                status: admin.status,
+                isApproved: admin.isApproved
+            }
+        });
+    } catch (error) {
+        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Admin Direct Login Error");
+        res.status(500).json({ success: false, message: "Internal server error during login.", error: error.message });
+    }
+};
