@@ -226,7 +226,7 @@ exports.getChannels = asyncHandler(async (req, res) => {
     const json = ch.toJSON();
     return {
       ...json,
-      channelId: json.youtubeChannelId || json.youtube_channel_id,
+      channelId: json.youtubeChannelId || json.youtube_channel_id || json.id,
       youtubeChannelId: json.youtubeChannelId || json.youtube_channel_id,
       subscriberCount: json.subscriberCount ?? json.subscriber_count ?? 0,
       subscriber_count: json.subscriberCount ?? json.subscriber_count ?? 0,
@@ -240,8 +240,14 @@ exports.getChannels = asyncHandler(async (req, res) => {
       logo_url: json.logoUrl || json.logo_url || '',
       joinedDate: json.joinedDate || json.joined_date || null,
       joined_date: json.joinedDate || json.joined_date || null,
+      description: json.description || '',
+      handle: json.handle || '',
     };
   });
+
+  if (formattedChannels.length > 0) {
+    console.log("Sample Channel API Response:", formattedChannels[0]);
+  }
 
   res.status(200).json({
     success: true,
