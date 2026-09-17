@@ -7,6 +7,7 @@ const {
   getAdminChannels,
   getChannelVideos,
   toggleChannelActive,
+  toggleLiveStatus,
   syncChannelOnDemand,
   deleteChannel,
 } = require('../controllers/channelController');
@@ -21,6 +22,7 @@ router.post('/resolve', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN',
 router.post('/', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'), createChannel);
 router.get('/admin/all', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'), getAdminChannels);
 router.patch('/:id/toggle', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'), toggleChannelActive);
+router.patch('/:id/toggle-live', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'), toggleLiveStatus);
 router.post('/:id/sync', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'), syncChannelOnDemand);
 router.delete('/:id', isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'), deleteChannel);
 

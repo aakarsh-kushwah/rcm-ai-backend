@@ -39,6 +39,21 @@ module.exports = (sequelize) => {
         allowNull: true,
         field: 'published_at',
       },
+      isAvailable: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: true,
+        field: 'is_available',
+      },
+      liveBroadcastContent: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        field: 'live_broadcast_content',
+      },
+      scheduledStartTime: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        field: 'scheduled_start_time',
+      },
       createdAt: {
         type: DataTypes.DATE,
         defaultValue: DataTypes.NOW,

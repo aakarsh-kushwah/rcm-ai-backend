@@ -34,6 +34,18 @@ const {
 // 🛡️ SECURITY CONFIGURATION
 // ============================================================
 
+// 🌐 PUBLIC ADMIN LOGIN ROUTES (Defined BEFORE global authentication guard)
+const { adminLogin } = require("../controllers/authController");
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 Minutes
+    max: 20, 
+    message: { success: false, message: "Too many attempts. Please try again after 15 minutes." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+router.post("/login", authLimiter, adminLogin);
+router.post("/admin/login", authLimiter, adminLogin);
+
 // 1. GLOBAL GUARD: Protect ALL routes in this file
 router.use(isAuthenticated, isActiveUser);
 

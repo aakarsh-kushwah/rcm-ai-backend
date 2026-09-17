@@ -1,7 +1,7 @@
 const axios = require('axios');
 const asyncHandler = require('express-async-handler');
 const { Channel, ChannelVideo } = require('../models');
-const { syncChannel } = require('../services/channelSyncService');
+const { syncChannel, refreshChannelMetadata } = require('../services/channelSyncService');
 const logger = require('../utils/logger');
 
 /**
@@ -73,7 +73,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, message: 'Could not parse channel input.' });
   }
 
-  let ytUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics&key=${apiKey}`;
+  let ytUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics,brandingSettings&key=${apiKey}`;
   if (parsed.type === 'id') {
     ytUrl += `&id=${parsed.value}`;
   } else {
@@ -95,7 +95,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
       const searchItems = searchRes.data.items || [];
       if (searchItems.length > 0) {
         const channelId = searchItems[0].snippet.channelId;
-        const detailsUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics&id=${channelId}&key=${apiKey}`;
+        const detailsUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics,brandingSettings&id=${channelId}&key=${apiKey}`;
         const detailsRes = await axios.get(detailsUrl, { timeout: 10000 });
         if (detailsRes.data.items && detailsRes.data.items.length > 0) {
           items.push(detailsRes.data.items[0]);
@@ -112,6 +112,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
     const snippet = channelData.snippet || {};
     const contentDetails = channelData.contentDetails || {};
     const statistics = channelData.statistics || {};
+    const brandingSettings = channelData.brandingSettings || {};
 
     const name = snippet.title || 'Unknown Channel';
     const handle = snippet.customUrl || `@${parsed.value}`;
@@ -120,8 +121,15 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
       snippet.thumbnails?.medium?.url ||
       snippet.thumbnails?.default?.url ||
       '';
+    const bannerUrl = brandingSettings.image?.bannerExternalUrl || '';
+    const description = snippet.description || '';
     const uploadsPlaylistId = contentDetails.relatedPlaylists?.uploads || '';
-    const itemCount = statistics.videoCount ? parseInt(statistics.videoCount, 10) : 0;
+    const subscriberCount = statistics.subscriberCount ? parseInt(statistics.subscriberCount, 10) : 0;
+    const videoCount = statistics.videoCount ? parseInt(statistics.videoCount, 10) : 0;
+    const viewCount = statistics.viewCount ? parseInt(statistics.viewCount, 10) : 0;
+    const joinedDate = snippet.publishedAt ? new Date(snippet.publishedAt) : null;
+    const country = snippet.country || null;
+    const itemCount = videoCount; // For consistency, though we're now storing videoCount directly
 
     if (!uploadsPlaylistId) {
       return res.status(400).json({ success: false, message: 'Could not retrieve uploads playlist for this YouTube channel.' });
@@ -134,8 +142,15 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
         handle,
         name,
         logoUrl,
+        bannerUrl,
+        description,
+        subscriberCount,
+        videoCount,
+        viewCount,
+        joinedDate,
+        country,
         uploadsPlaylistId,
-        itemCount,
+        itemCount, // Still include for existing frontend logic that might use it
       },
     });
   } catch (err) {
@@ -154,7 +169,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
  * @access  Admin
  */
 exports.createChannel = asyncHandler(async (req, res) => {
-  const { youtubeChannelId, handle, name, logoUrl, uploadsPlaylistId } = req.body;
+  const { youtubeChannelId, handle, name, logoUrl, bannerUrl, description, subscriberCount, videoCount, viewCount, joinedDate, country, uploadsPlaylistId } = req.body;
 
   if (!youtubeChannelId || !name || !uploadsPlaylistId) {
     return res.status(400).json({ success: false, message: 'Missing required channel parameters.' });
@@ -171,6 +186,13 @@ exports.createChannel = asyncHandler(async (req, res) => {
     handle: handle || '',
     name,
     logoUrl: logoUrl || '',
+    bannerUrl: bannerUrl || '',
+    description: description || '',
+    subscriberCount: subscriberCount || 0,
+    videoCount: videoCount || 0,
+    viewCount: viewCount || 0,
+    joinedDate: joinedDate || null,
+    country: country || null,
     uploadsPlaylistId,
     isActive: true,
   });
@@ -197,14 +219,34 @@ exports.createChannel = asyncHandler(async (req, res) => {
 exports.getChannels = asyncHandler(async (req, res) => {
   const channels = await Channel.findAll({
     where: { isActive: true },
-    attributes: ['id', 'name', 'logoUrl', 'handle', 'uploadsPlaylistId'],
-    order: [['name', 'ASC']],
+    order: [['isPinned', 'DESC'], ['name', 'ASC']],
+  });
+
+  const formattedChannels = channels.map(ch => {
+    const json = ch.toJSON();
+    return {
+      ...json,
+      channelId: json.youtubeChannelId || json.youtube_channel_id,
+      youtubeChannelId: json.youtubeChannelId || json.youtube_channel_id,
+      subscriberCount: json.subscriberCount ?? json.subscriber_count ?? 0,
+      subscriber_count: json.subscriberCount ?? json.subscriber_count ?? 0,
+      videoCount: json.videoCount ?? json.video_count ?? 0,
+      video_count: json.videoCount ?? json.video_count ?? 0,
+      viewCount: json.viewCount ?? json.view_count ?? 0,
+      view_count: json.viewCount ?? json.view_count ?? 0,
+      bannerUrl: json.bannerUrl || json.banner_url || '',
+      banner_url: json.bannerUrl || json.banner_url || '',
+      logoUrl: json.logoUrl || json.logo_url || '',
+      logo_url: json.logoUrl || json.logo_url || '',
+      joinedDate: json.joinedDate || json.joined_date || null,
+      joined_date: json.joinedDate || json.joined_date || null,
+    };
   });
 
   res.status(200).json({
     success: true,
-    count: channels.length,
-    data: channels,
+    count: formattedChannels.length,
+    data: formattedChannels,
   });
 });
 
@@ -215,25 +257,55 @@ exports.getChannels = asyncHandler(async (req, res) => {
  */
 exports.getAdminChannels = asyncHandler(async (req, res) => {
   const channels = await Channel.findAll({
-    attributes: ['id', 'youtubeChannelId', 'handle', 'name', 'logoUrl', 'isActive', 'lastSyncedAt', 'createdAt'],
+    attributes: [
+      'id',
+      'youtubeChannelId',
+      'handle',
+      'name',
+      'logoUrl',
+      'bannerUrl',
+      'description',
+      'subscriberCount',
+      'videoCount',
+      'viewCount',
+      'joinedDate',
+      'country',
+      'isActive',
+      'lastSyncedAt',
+      'lastSyncStatus',
+      'lastSyncError',
+      'checkLiveStatus',
+      'isLiveNow',
+      'upcomingPremiereAt',
+      'upcomingVideoId',
+      'scheduledStartTime',
+      'discoveredAt',
+      'isCurrentlyLive',
+      'liveVideoId',
+      'liveStartedAt',
+      'lastLiveCheckAt',
+      'lastNotifiedVideoId',
+      'createdAt',
+    ],
     order: [['createdAt', 'DESC']],
   });
 
-  // Attach video counts
-  const channelsWithCounts = await Promise.all(
-    channels.map(async (ch) => {
-      const videoCount = await ChannelVideo.count({ where: { channelId: ch.id } });
-      return {
-        ...ch.toJSON(),
-        videoCount,
-      };
-    })
-  );
+  // Note: videoCount is now a direct field on the Channel model
+  // No need to attach video counts dynamically here unless it's for ChannelVideo count specifically
+  // const channelsWithCounts = await Promise.all(
+  //   channels.map(async (ch) => {
+  //     const videoCount = await ChannelVideo.count({ where: { channelId: ch.id } });
+  //     return {
+  //       ...ch.toJSON(),
+  //       videoCount,
+  //     };
+  //   })
+  // );
 
   res.status(200).json({
     success: true,
-    count: channelsWithCounts.length,
-    data: channelsWithCounts,
+    count: channels.length,
+    data: channels,
   });
 });
 
@@ -254,7 +326,8 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
   }
 
   const { count, rows: videos } = await ChannelVideo.findAndCountAll({
-    where: { channelId },
+    where: { channelId, isAvailable: true },
+    attributes: ['id', 'youtubeVideoId', 'title', 'thumbnailUrl', 'publishedAt', 'isAvailable', 'liveBroadcastContent', 'scheduledStartTime'],
     order: [['publishedAt', 'DESC']],
     limit,
     offset,
@@ -266,6 +339,36 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
     totalPages: Math.ceil(count / limit) || 1,
     totalVideos: count,
     count: videos.length,
+    channel: {
+      id: channel.id,
+      channelId: channel.youtubeChannelId || channel.youtube_channel_id,
+      youtubeChannelId: channel.youtubeChannelId || channel.youtube_channel_id,
+      name: channel.name,
+      logoUrl: channel.logoUrl || channel.logo_url,
+      logo_url: channel.logoUrl || channel.logo_url,
+      bannerUrl: channel.bannerUrl || channel.banner_url,
+      banner_url: channel.bannerUrl || channel.banner_url,
+      description: channel.description,
+      handle: channel.handle,
+      subscriberCount: channel.subscriberCount ?? channel.subscriber_count ?? 0,
+      subscriber_count: channel.subscriberCount ?? channel.subscriber_count ?? 0,
+      videoCount: channel.videoCount ?? channel.video_count ?? 0,
+      video_count: channel.videoCount ?? channel.video_count ?? 0,
+      viewCount: channel.viewCount ?? channel.view_count ?? 0,
+      view_count: channel.viewCount ?? channel.view_count ?? 0,
+      joinedDate: channel.joinedDate || channel.joined_date,
+      joined_date: channel.joinedDate || channel.joined_date,
+      country: channel.country,
+      // These fields are primarily for displaying the channel's overall live status, not individual videos
+      // Individual video cards will now use their own liveBroadcastContent and scheduledStartTime
+      isCurrentlyLive: channel.isCurrentlyLive,
+      upcomingVideoId: channel.upcomingVideoId,
+      scheduledStartTime: channel.scheduledStartTime, // This is for the channel's next upcoming, not video's
+      liveVideoId: channel.liveVideoId,
+      liveStartedAt: channel.liveStartedAt,
+      lastKnownLiveStartTime: channel.lastKnownLiveStartTime,
+      isPinned: channel.isPinned,
+    },
     data: videos,
   });
 });
@@ -338,5 +441,27 @@ exports.deleteChannel = asyncHandler(async (req, res) => {
   res.status(200).json({
     success: true,
     message: 'Channel and its videos deleted successfully.',
+  });
+});
+
+/**
+ * @desc    Toggle channel live check status (Priority 4)
+ * @route   PATCH /api/channels/:id/toggle-live
+ * @access  Admin
+ */
+exports.toggleLiveStatus = asyncHandler(async (req, res) => {
+  const channelId = req.params.id;
+  const channel = await Channel.findByPk(channelId);
+  if (!channel) {
+    return res.status(404).json({ success: false, message: 'Channel not found.' });
+  }
+
+  channel.checkLiveStatus = !channel.checkLiveStatus;
+  await channel.save();
+
+  res.status(200).json({
+    success: true,
+    message: `Live checking for channel ${channel.name} is now ${channel.checkLiveStatus ? 'Enabled' : 'Disabled'}.`,
+    data: channel,
   });
 });

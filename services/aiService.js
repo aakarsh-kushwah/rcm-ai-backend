@@ -20,8 +20,25 @@ const { Op } = require('sequelize');
 // Env Config
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
-// Cache Setup
-const aiCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); 
+// Cache Setup (24 hours TTL)
+const aiCache = new NodeCache({ stdTTL: 86400, checkperiod: 60 }); 
+
+// Invalidation Helper
+function invalidateProductCache(productId) {
+    if (!productId) return;
+    const targetId = parseInt(productId, 10);
+    const keys = aiCache.keys();
+    let count = 0;
+    for (const key of keys) {
+        const cached = aiCache.get(key);
+        if (cached && Array.isArray(cached.referencedProductIds) && cached.referencedProductIds.includes(targetId)) {
+            aiCache.del(key);
+            count++;
+            console.log(`🗑️ [AI CACHE] Invalidated cache key "${key}" for Product ID: ${targetId}`);
+        }
+    }
+    return count;
+}
 
 // Initialize Groq Neural Engine
 let groqClient = null;
@@ -36,9 +53,9 @@ try {
     }
 } catch (err) { console.error("❌ AI Init Failed:", err.message); }
 
-// Models
-const TEXT_MODEL = 'llama-3.3-70b-versatile';
-const VISION_MODEL = 'llama-3.2-11b-vision-preview';
+// Models (Configurable via environment variables with fallback to Groq supported models)
+const TEXT_MODEL = process.env.GROQ_TEXT_MODEL || 'openai/gpt-oss-120b';
+const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'qwen/qwen3.6-27b';
 
 let globalLastMatchedImageUrl = null;
 const getLastMatchedImageUrl = () => globalLastMatchedImageUrl;
@@ -56,14 +73,14 @@ function formatBusinessKnowledgeResponse(item, userName = "Leader") {
 }
 
 async function fetchBusinessKnowledge(query, options = {}) {
-    if (!query) return { textContext: "", rawMatch: null, isSingleTopic: false };
+    if (!query) return { textContext: "", rawMatch: null, isSingleTopic: false, productIds: [] };
 
     try {
         const cleanQuery = query.toLowerCase().replace(/[^\w\s]/g, '').trim();
         const stopWords = ['what', 'is', 'batao', 'kya', 'hai', 'tell', 'me', 'about', 'kitna', 'details', 'ka', 'ki', 'ke', 'ko', 'mein', 'this', 'that', 'for', 'of', 'bonus', 'rcm'];
         const keywords = cleanQuery.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
 
-        if (!db || !db.BusinessKnowledge) return { textContext: "", rawMatch: null, isSingleTopic: false };
+        if (!db || !db.BusinessKnowledge) return { textContext: "", rawMatch: null, isSingleTopic: false, productIds: [] };
 
         let items = [];
         let fetchedByPrimaryCategory = false;
@@ -145,7 +162,7 @@ async function fetchBusinessKnowledge(query, options = {}) {
         }
 
         if (items.length === 0) {
-            return { textContext: "", rawMatch: null, isSingleTopic: false };
+            return { textContext: "", rawMatch: null, isSingleTopic: false, productIds: [] };
         }
 
         const textContext = items.map(item => `📌 [BUSINESS RULE: ${item.title} (${item.category})]\n${item.content}`).join("\n\n");
@@ -153,17 +170,18 @@ async function fetchBusinessKnowledge(query, options = {}) {
         return {
             textContext,
             rawMatch: items[0],
-            isSingleTopic
+            isSingleTopic,
+            productIds: []
         };
     } catch (error) {
         console.error("⚠️ Business Knowledge Context Error:", error.message);
-        return { textContext: "", rawMatch: null, isSingleTopic: false };
+        return { textContext: "", rawMatch: null, isSingleTopic: false, productIds: [] };
     }
 }
 
 function cleanIncompleteSentence(text) {
     if (!text) return "";
-    let clean = text.trim();
+    let clean = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     if (!clean.endsWith('.') && !clean.endsWith('!') && !clean.endsWith('?') && !clean.endsWith('|') && !clean.endsWith('।')) {
         return clean + "..."; 
     }
@@ -174,7 +192,7 @@ function cleanIncompleteSentence(text) {
 // 🔍 RAG SYSTEM: SUPER EXPERT RANKING (V44)
 // ============================================================
 async function fetchLiveContext(query) {
-    if (!query) return "";
+    if (!query) return { textContext: "", productIds: [] };
     
     try {
         const weightRegex = /(\d+\s*[g|kg|ml|l|gm]+)/gi;
@@ -182,26 +200,34 @@ async function fetchLiveContext(query) {
         
         const cleanQuery = query.toLowerCase().replace(/[^\w\s]/g, '').trim();
         const stopWords = [
-            'what', 'is', 'price', 'rate', 'batao', 'kya', 'hai', 'tell', 'me', 'about', 
-            'kaisa', 'cost', 'kitna', 'details', 'show', 'product', 'ka', 'ki', 'ke', 'ko', 'mein', 'he', 'this', 'that', 'it', 'for', 'of'
+            'what', 'is', 'price', 'rate', 'batao', 'kya', 'hai', 'tell', 'me', 'about',
+            'kaisa', 'cost', 'kitna', 'details', 'show', 'product', 'ka', 'ki', 'ke', 'ko', 'mein', 'he', 'this', 'that', 'it', 'for', 'of',
+            // Removed 'fayde' from stopWords list as it is a relevant keyword for health products.
         ];
         
         const keywords = cleanQuery.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
 
-        if (keywords.length === 0) return "";
-        if (!db || !db.Product) return "";
+        if (keywords.length === 0) return { textContext: "", productIds: [] };
+        if (!db || !db.Product) return { textContext: "", productIds: [] };
 
         const products = await db.Product.findAll({
             where: {
-                [Op.or]: [
-                    ...keywords.map(k => ({ name: { [Op.like]: `%${k}%` } })),
-                    ...keywords.map(k => ({ category: { [Op.like]: `%${k}%` } })),
-                    ...keywords.map(k => ({ aiTags: { [Op.like]: `%${k}%` } }))
+                [Op.and]: [
+                    ...keywords.map(k => ({ // Each keyword must be present in at least one field
+                        [Op.or]: [
+                            { name: { [Op.like]: `%${k}%` } },
+                            { category: { [Op.like]: `%${k}%` } },
+                            { aiTags: { [Op.like]: `%${k}%` } },
+                            { description: { [Op.like]: `%${k}%` } },
+                            { healthBenefits: { [Op.like]: `%${k}%` } },
+                            { usageInfo: { [Op.like]: `%${k}%` } }
+                        ]
+                    }))
                 ]
             },
             limit: 15,
             attributes: [
-                'name', 'mrp', 'dp', 'pv', 'category', 
+                'id', 'name', 'mrp', 'dp', 'pv', 'category', 
                 'description', 'ingredients', 'healthBenefits', 'usageInfo', 'imageUrl'
             ],
             raw: true 
@@ -209,7 +235,7 @@ async function fetchLiveContext(query) {
 
         if (products.length === 0) {
             globalLastMatchedImageUrl = null;
-            return "";
+            return { textContext: "", productIds: [] };
         }
 
         const rankedProducts = products.map(p => {
@@ -239,7 +265,9 @@ async function fetchLiveContext(query) {
         const topProducts = rankedProducts.slice(0, 3).map(rp => rp.product);
         globalLastMatchedImageUrl = topProducts[0]?.imageUrl || null;
 
-        return topProducts.map((p, index) => {
+        const productIds = topProducts.map(p => p.id);
+
+        const textContext = topProducts.map((p, index) => {
             const isBestMatch = index === 0 ? "🔥🔥 [BEST MATCH]" : "[RELATED]";
             
             const parseList = (val) => {
@@ -273,10 +301,12 @@ async function fetchLiveContext(query) {
 `;
         }).join("\n===================================\n");
 
+        return { textContext, productIds };
+
     } catch (error) {
         console.error("⚠️ Expert Context Error:", error.message);
         globalLastMatchedImageUrl = null;
-        return "";
+        return { textContext: "", productIds: [] };
     }
 }
 
@@ -284,32 +314,49 @@ async function fetchLiveContext(query) {
 // 🧠 TEXT GENERATION (TITAN ASI)
 // ============================================================
 async function generateTitanResponse(user, message, history = []) {
-    if (!groqClient) return "System maintenance par hai. Jai RCM.";
+    if (!groqClient) return { response: "System maintenance par hai. Jai RCM.", productIds: [] };
+
+    const cacheKey = message.toLowerCase();
+    const cachedResponse = aiCache.get(cacheKey);
+    if (cachedResponse) {
+        console.log(`✅ [AI CACHE] Cache Hit for query: "${message}"`);
+        return cachedResponse;
+    }
     
     try {
         const userName = user?.fullName || "Leader";
 
-        const liveData = await fetchLiveContext(message);
+        const { textContext: liveData, productIds: liveProductIds } = await fetchLiveContext(message);
         const ragResult = await fetchBusinessKnowledge(message);
 
         if (ragResult.isSingleTopic && ragResult.rawMatch) {
             console.log(`⚡ [RULE-BASED EXTRACTION] Intercepted single-topic query for category: ${ragResult.rawMatch.category}`);
             globalLastMatchedImageUrl = null;
-            return formatBusinessKnowledgeResponse(ragResult.rawMatch, userName);
+            const response = {
+                response: formatBusinessKnowledgeResponse(ragResult.rawMatch, "{{userName}}"),
+                productIds: ragResult.productIds || []
+            };
+            // Cache single-topic rule-based responses if they have content
+            if (response.response && response.response.length > 0) {
+                 aiCache.set(cacheKey, response);
+                 console.log(`➕ [AI CACHE] Cached single-topic rule-based response for: "${message}"`);
+            }
+            return response;
         }
 
         const businessKnowledgeData = ragResult.textContext || "";
         const combinedLiveData = [liveData, businessKnowledgeData].filter(Boolean).join("\n\n===================================\n\n");
+        const combinedProductIds = [...new Set([...liveProductIds, ...(ragResult.productIds || [])])];
 
         const systemPrompt = GET_ASI_PROMPT({
             userName: userName,
             userPin: user?.pinLevel || "Associate Buyer",
-            liveData: combinedLiveData 
+            liveData: combinedLiveData
         });
 
         const conversationChain = [
             { role: "system", content: systemPrompt },
-            ...history, 
+            ...history,
             { role: "user", content: message }
         ];
 
@@ -321,8 +368,8 @@ async function generateTitanResponse(user, message, history = []) {
             try {
                 completion = await groqClient.chat.completions.create({
                     model: TEXT_MODEL,
-                    messages: conversationChain, 
-                    temperature: 0.3, 
+                    messages: conversationChain,
+                    temperature: 0.3,
                     max_tokens: 800,
                     top_p: 0.85,
                 });
@@ -340,15 +387,34 @@ async function generateTitanResponse(user, message, history = []) {
         }
 
         let aiResponse = completion.choices[0]?.message?.content || "";
-        return cleanIncompleteSentence(aiResponse);
+        let finalResponse = cleanIncompleteSentence(aiResponse);
+
+        // Replace actual userName with placeholder for cross-user caching
+        if (userName && userName !== "Leader") {
+            const escapedName = userName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            finalResponse = finalResponse.replace(new RegExp(escapedName, 'gi'), '{{userName}}');
+        }
+
+        const responseToCache = { response: finalResponse, productIds: combinedProductIds, liveDataUsed: combinedLiveData };
+
+        // Only cache responses that had real referencedProductIds (Issue 2 fix)
+        // Or if it's a rule-based response with content, it would have been cached above
+        if (combinedProductIds && combinedProductIds.length > 0) {
+            aiCache.set(cacheKey, responseToCache);
+            console.log(`➕ [AI CACHE] Cached response for: "${message}" with ${combinedProductIds.length} product(s)`);
+        } else {
+            console.log(`➖ [AI CACHE] Skipping cache for query: "${message}" (no products found)`);
+        }
+
+        return responseToCache;
 
     } catch (error) {
         console.error("🔥 Titan Engine Error:", error.status || error.message);
         const isRateLimit = error.status === 429 || (error.message && error.message.includes('429')) || (error.message && error.message.includes('rate_limit'));
         if (isRateLimit) {
-            return "Thoda busy hoon, ek pal rukiye. Dobara koshish kar rahe hain...";
+            return { response: "Thoda busy hoon, ek pal rukiye. Dobara koshish kar rahe hain...", productIds: [], liveDataUsed: "" }; // Ensure liveDataUsed is always returned
         }
-        return "Network weak hai. Kripya dobara message karein.";
+        return { response: "Network weak hai. Kripya dobara message karein.", productIds: [], liveDataUsed: "" }; // Ensure liveDataUsed is always returned
     }
 }
 
@@ -356,7 +422,7 @@ async function generateTitanResponse(user, message, history = []) {
 // 👁️ VISION ANALYSIS
 // ============================================================
 async function analyzeImageWithAI(base64Image) {
-    if (!groqClient) return "Vision system abhi uplabdh nahi hai.";
+    if (!groqClient || !VISION_MODEL) return "Vision system abhi uplabdh nahi hai.";
     
     try {
         const imageContent = base64Image.includes('base64,') ? base64Image.split('base64,')[1] : base64Image;
@@ -376,7 +442,7 @@ async function analyzeImageWithAI(base64Image) {
             ],
             model: VISION_MODEL,
             temperature: 0.2, 
-            max_tokens: 400,
+            max_tokens: 600,
         });
 
         return cleanIncompleteSentence(chatCompletion.choices[0]?.message?.content || "Main is chitra ko samajh nahi paa raha.");
@@ -438,5 +504,7 @@ module.exports = {
     analyzeImageWithAI,     
     getOrGenerateVoice,
     fetchBusinessKnowledge,
-    getLastMatchedImageUrl
+    getLastMatchedImageUrl,
+    aiCache,
+    invalidateProductCache
 };

@@ -13,13 +13,13 @@ const { logger } = require("../utils/logger");
 const crypto = require("crypto");
 
 // ⚙️ CONFIGURATION
-const JWT_ACCESS_EXPIRY = "1h";
+const JWT_ACCESS_EXPIRY = "15m";
 const SALT_ROUNDS = 10;
 const COOKIE_OPTIONS = {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "strict",
-    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
+    maxAge: 90 * 24 * 60 * 60 * 1000 // 90 days sliding session
 };
 
 // Helper: Token Generator (Access Token JWT)
@@ -38,11 +38,13 @@ const generateToken = (user, expiresIn) => {
     );
 };
 
-// Helper: Generate Opaque Refresh Token & Store Hash in DB
-const generateOpaqueRefreshToken = async (userId, adminId, userType, userAgent) => {
+// Helper: Generate Opaque Refresh Token & Store Hash in DB (with Sliding Expiration & Audit field firstIssuedAt)
+const generateOpaqueRefreshToken = async (userId, adminId, userType, userAgent, existingFirstIssuedAt) => {
     const rawToken = crypto.randomBytes(40).toString("hex");
     const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+    const now = Date.now();
+    const expiresAt = new Date(now + 90 * 24 * 60 * 60 * 1000); // 90 days sliding expiry
+    const firstIssuedAt = existingFirstIssuedAt ? new Date(existingFirstIssuedAt) : new Date(now);
 
     await RefreshToken.create({
         userId: userId || null,
@@ -50,6 +52,7 @@ const generateOpaqueRefreshToken = async (userId, adminId, userType, userAgent) 
         userType: userType || "USER",
         tokenHash,
         expiresAt,
+        firstIssuedAt,
         userAgent: userAgent || null
     });
 
@@ -245,9 +248,9 @@ exports.refreshToken = async (req, res) => {
         // Rotate: Revoke current token
         await tokenRecord.update({ revokedAt: new Date() });
 
-        // Issue new access token and new opaque refresh token
+        // Issue new access token and new opaque refresh token (carrying over firstIssued)
         const newAccessToken = generateToken(user, JWT_ACCESS_EXPIRY);
-        const newRefreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"]);
+        const newRefreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"], tokenRecord.firstIssuedAt || tokenRecord.createdAt);
 
         res.cookie("refreshToken", newRefreshTokenVal, COOKIE_OPTIONS);
 
@@ -314,7 +317,7 @@ exports.adminRefresh = async (req, res) => {
         await tokenRecord.update({ revokedAt: new Date() });
 
         const newAccessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
-        const newRefreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
+        const newRefreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"], tokenRecord.firstIssuedAt || tokenRecord.createdAt);
 
         res.cookie("refreshToken", newRefreshTokenVal, COOKIE_OPTIONS);
 

@@ -7,6 +7,7 @@
 const { Product, Sequelize } = require("../models");
 const { scrapeAndSave } = require("../services/rcmScraper"); // Real Scraper Service
 const { uploadProductImage } = require("../services/cloudinaryService"); // Cloudinary Service
+const { invalidateProductCache } = require("../services/aiService");
 const Op = Sequelize.Op;
 const { logger } = require("../utils/logger"); // Import logger from common utility
 
@@ -111,6 +112,13 @@ exports.updateProduct = async (req, res) => {
         };
 
         await product.update(updatedFields);
+
+        // Invalidate cached AI responses that reference this product
+        try {
+            invalidateProductCache(product.id);
+        } catch (cacheErr) {
+            logger.warn({ traceId: req.id, error: cacheErr.message }, "Failed to invalidate product cache");
+        }
 
         logger.info({ traceId: req.id, productId: product.id, productName: product.name }, "Product updated successfully");
         return res.status(200).json({ success: true, message: "Product updated successfully.", data: product });

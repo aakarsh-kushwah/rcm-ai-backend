@@ -5,7 +5,7 @@ const Admin = require("../models/admin.model")(sequelize);
 
 async function resetAdminPassword() {
     const superAdminEmail = "rcmaiasistant@gmail.com";
-    const newHashedPassword = "$2a$10$jF1n70xexS9.CpvJJAGK..sRy17wnPREdpyhbwM2TkyQg9VpRJc8m"; // Hash for "Titan@123"
+    const newHashedPassword = "$2a$10$4p3G15D792rUyK9uf1jrV.x7EAidYNvg4KyTyPpkO.4bNBGpCJidi"; // Hash for "Sayog@kushwah3810"
 
     try {
         await sequelize.authenticate();

@@ -8,7 +8,6 @@ const { NotificationToken, sequelize } = require("../models");
 const { Op } = require('sequelize');
 
 // 🛡️ SAFE FIREBASE LOADER (Prevents Server Crash on Boot)
-// Ye function tabhi Firebase load karega jab zaroorat hogi.
 const getFirebase = () => {
     try {
         const { admin } = require("../config/firebase"); // Lazy Import
@@ -19,6 +18,74 @@ const getFirebase = () => {
         return null;
     }
 };
+
+/**
+ * Core Broadcast Helper function for background and event-driven pushes
+ */
+const broadcastNotification = async ({ title, body, imageUrl, actionUrl, dataPayload }) => {
+    const admin = getFirebase();
+    if (!admin) {
+        console.warn("⚠️ [TITAN PUSH WARNING]: Firebase not configured. Skipping broadcast.");
+        return { successCount: 0, failureCount: 0 };
+    }
+
+    let successCount = 0;
+    let failureCount = 0;
+    let lastId = 0;
+    const batchSize = 500;
+
+    console.log(`📡 [TITAN LAUNCH] Starting Hyper-Scale Broadcast...`);
+
+    while (true) {
+        try {
+            const tokens = await NotificationToken.findAll({
+                where: {
+                    id: { [Op.gt]: lastId },
+                    status: 'ACTIVE'
+                },
+                limit: batchSize,
+                attributes: ['id', 'token'],
+                raw: true,
+                order: [['id', 'ASC']]
+            });
+
+            if (tokens.length === 0) break;
+            lastId = tokens[tokens.length - 1].id;
+
+            const deviceTokens = tokens.map(t => t.token);
+            if (deviceTokens.length === 0) continue;
+
+            const message = {
+                notification: { title, body },
+                data: {
+                    url: actionUrl || '/',
+                    ...Object.fromEntries(Object.entries(dataPayload || {}).map(([k, v]) => [k, String(v)]))
+                },
+                tokens: deviceTokens
+            };
+
+            const response = await admin.messaging().sendEachForMulticast(message);
+            successCount += response.successCount;
+            failureCount += response.failureCount;
+
+            if (response.failureCount > 0) {
+                response.responses.forEach((resp) => {
+                    if (!resp.success) {
+                        console.warn(`Failed token delivery: ${resp.error?.message || 'Unknown error'}`);
+                    }
+                });
+            }
+        } catch (err) {
+            console.error(`Error in broadcast batch: ${err.message}`);
+            break;
+        }
+    }
+
+    console.log(`✅ [TITAN BROADCAST FINISHED] Success: ${successCount}, Failures: ${failureCount}`);
+    return { successCount, failureCount };
+};
+
+exports.broadcastNotification = broadcastNotification;
 
 // ============================================================
 // 1. 🛰️ NEURAL SYNC (Device Registration)
@@ -77,9 +144,7 @@ exports.sendTitanBroadcast = async (req, res) => {
 
     // 2. Background Processing
     setImmediate(async () => {
-        console.log(`📡 [TITAN LAUNCH] Starting Hyper-Scale Broadcast...`);
-        // ... (Existing cursor logic omitted for brevity, logic remains same)
-        // Ensure you use the 'admin' variable defined above
+        await broadcastNotification({ title, body, imageUrl, actionUrl, dataPayload });
     });
 };
 

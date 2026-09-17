@@ -40,6 +40,11 @@ module.exports = (sequelize) => {
                 allowNull: false,
                 field: 'expires_at',
             },
+            firstIssuedAt: {
+                type: DataTypes.DATE,
+                allowNull: true,
+                field: 'first_issued_at',
+            },
             revokedAt: {
                 type: DataTypes.DATE,
                 allowNull: true,

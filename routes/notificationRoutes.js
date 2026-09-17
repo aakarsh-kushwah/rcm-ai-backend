@@ -68,8 +68,12 @@ router.post(
     asyncHandler(notificationController.sendTitanBroadcast)
 );
 
-router.get('/health', (req, res) => {
-    res.status(200).json({ status: 'active', subsystem: 'Titan Notification Gateway' });
+router.get('/send/health', (req, res) => {
+    res.status(200).json({ status: 'active', subsystem: 'Titan Notification Gateway - Send Endpoint' });
+});
+
+router.get('/test-health', (req, res) => {
+    res.status(200).json({ status: 'active', subsystem: 'Titan Notification Gateway - Test Health' });
 });
 
 module.exports = router;

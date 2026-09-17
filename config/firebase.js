@@ -26,18 +26,27 @@ if (!admin.apps.length) {
         
         // SCENARIO 2: Individual Variables (Fallback)
         if (!serviceAccount && process.env.FIREBASE_PROJECT_ID) {
+            let privateKeyFromEnv = process.env.FIREBASE_PRIVATE_KEY;
+            if (privateKeyFromEnv) {
+                // Replace escaped newlines if they exist and trim
+                privateKeyFromEnv = privateKeyFromEnv.replace(/\\n/g, '\n').trim();
+            }
+
             serviceAccount = {
                 projectId: process.env.FIREBASE_PROJECT_ID,
                 clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-                privateKey: process.env.FIREBASE_PRIVATE_KEY 
-                    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') 
-                    : undefined
+                privateKey: privateKeyFromEnv || undefined
             };
         }
 
+        // If serviceAccount was loaded from JSON string, ensure private_key inside it is also processed
+        if (serviceAccount && serviceAccount.private_key && typeof serviceAccount.private_key === 'string') {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n').trim();
+        }
+
         // Final Check
-        if (!serviceAccount) {
-            throw new Error("No valid Firebase Keys found in .env (FIREBASE_SERVICE_ACCOUNT is missing or invalid).");
+        if (!serviceAccount || (!serviceAccount.privateKey && !serviceAccount.private_key)) {
+            throw new Error("No valid Firebase Keys found in .env (FIREBASE_SERVICE_ACCOUNT is missing or invalid, or individual keys are incomplete/invalid).");
         }
 
         // Initialize App
