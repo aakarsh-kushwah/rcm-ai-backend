@@ -29,7 +29,7 @@ const userIdParamSchema = z.object({
 
 const adminApprovalSchema = z.object({
     params: z.object({
-        adminId: z.preprocess((val) => Number(val), z.number().min(1, "Invalid Admin ID"))
+        adminId: z.string().min(1, "Invalid Admin ID")
     })
 });
 

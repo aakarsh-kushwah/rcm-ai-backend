@@ -53,6 +53,32 @@ function parseYouTubeInput(input) {
 }
 
 /**
+ * Helper to calculate next 6:30 AM IST Gurukul session for RCM World (id: 2)
+ */
+function getNextGurukulSchedule() {
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
+  const istTime = new Date(utcTime + istOffset);
+
+  const year = istTime.getFullYear();
+  const month = istTime.getMonth();
+  const day = istTime.getDate();
+  const hour = istTime.getHours();
+  const minute = istTime.getMinutes();
+  const totalMins = hour * 60 + minute;
+
+  // Gurukul is daily at 6:30 AM IST (390 mins). Concludes at 7:30 AM IST (450 mins).
+  // If current IST time is past 7:30 AM IST (> 450 mins), next session is tomorrow 6:30 AM IST.
+  // Otherwise, today 6:30 AM IST.
+  const istTargetDate = new Date(Date.UTC(year, month, day, 1, 0, 0, 0)); // 01:00 UTC = 6:30 AM IST
+  if (totalMins > 450) {
+    istTargetDate.setDate(istTargetDate.getDate() + 1);
+  }
+  return istTargetDate;
+}
+
+/**
  * @desc    Resolve YouTube channel from input (Preview step)
  * @route   POST /api/channels/resolve
  * @access  Admin
@@ -339,44 +365,144 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
     offset,
   });
 
-  res.status(200).json({
-    success: true,
-    currentPage: page,
-    totalPages: Math.ceil(count / limit) || 1,
-    totalVideos: count,
-    count: videos.length,
-    channel: {
-      id: channel.id,
-      channelId: channel.youtubeChannelId || channel.youtube_channel_id,
-      youtubeChannelId: channel.youtubeChannelId || channel.youtube_channel_id,
-      name: channel.name,
-      logoUrl: channel.logoUrl || channel.logo_url,
-      logo_url: channel.logoUrl || channel.logo_url,
-      bannerUrl: channel.bannerUrl || channel.banner_url,
-      banner_url: channel.bannerUrl || channel.banner_url,
-      description: channel.description,
-      handle: channel.handle,
-      subscriberCount: channel.subscriberCount ?? channel.subscriber_count ?? 0,
-      subscriber_count: channel.subscriberCount ?? channel.subscriber_count ?? 0,
-      videoCount: channel.videoCount ?? channel.video_count ?? 0,
-      video_count: channel.videoCount ?? channel.video_count ?? 0,
-      viewCount: channel.viewCount ?? channel.view_count ?? 0,
-      view_count: channel.viewCount ?? channel.view_count ?? 0,
-      joinedDate: channel.joinedDate || channel.joined_date,
-      joined_date: channel.joinedDate || channel.joined_date,
-      country: channel.country,
-      // These fields are primarily for displaying the channel's overall live status, not individual videos
-      // Individual video cards will now use their own liveBroadcastContent and scheduledStartTime
-      isCurrentlyLive: channel.isCurrentlyLive,
-      upcomingVideoId: channel.upcomingVideoId,
-      scheduledStartTime: channel.scheduledStartTime, // This is for the channel's next upcoming, not video's
-      liveVideoId: channel.liveVideoId,
-      liveStartedAt: channel.liveStartedAt,
-      lastKnownLiveStartTime: channel.lastKnownLiveStartTime,
-      isPinned: channel.isPinned,
-    },
-    data: videos,
-  });
+  if (channelId == 2) { // RCM World Channel
+    const nextGurukulTime = getNextGurukulSchedule();
+    const now = new Date();
+
+    let actualLiveVideo = null;
+    let actualUpcomingVideo = null;
+
+    // Check if there's an actual live or upcoming video from YouTube
+    for (const video of videos) {
+      if (video.liveBroadcastContent === 'live') {
+        actualLiveVideo = video;
+        break;
+      }
+      if (video.liveBroadcastContent === 'upcoming' && video.scheduledStartTime) {
+        const scheduled = new Date(video.scheduledStartTime);
+        // Consider it an actual upcoming if within the next 24 hours of gurukul time
+        if (scheduled.getTime() >= nextGurukulTime.getTime() - 24 * 60 * 60 * 1000 && scheduled.getTime() <= nextGurukulTime.getTime() + 60 * 60 * 1000) {
+          actualUpcomingVideo = video;
+          break;
+        }
+      }
+    }
+
+    let gurukulCard = null;
+
+    // If no actual live video exists, check for upcoming or create synthetic
+    if (!actualLiveVideo) {
+      // Current time in IST
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
+      const currentIstTime = new Date(utcTime + istOffset);
+      
+      // Gurukul ends at 7:30 AM IST (1:00 UTC on the same day)
+      const gurukulEndTimeIST = new Date(Date.UTC(nextGurukulTime.getFullYear(), nextGurukulTime.getMonth(), nextGurukulTime.getDate(), 2, 0, 0)); // 2:00 UTC = 7:30 AM IST
+
+      if (currentIstTime < gurukulEndTimeIST) { // Only show synthetic if before 7:30 AM IST of the gurukul day
+        gurukulCard = {
+          id: `gurukul-upcoming-${nextGurukulTime.toISOString().split('T')[0]}`,
+          youtubeVideoId: '_Gurukul_Synthetic_Video_ID_', // Placeholder
+          title: `RCM World Gurukul: Daily Session with TC Sir`,
+          thumbnailUrl: 'https://yt3.ggpht.com/i8k5hB_C2h3_x2fN0R3-Z7-0-5-0-0-0-0/hqdefault.jpg', // Placeholder thumbnail
+          publishedAt: nextGurukulTime,
+          isAvailable: true,
+          liveBroadcastContent: 'upcoming',
+          scheduledStartTime: nextGurukulTime,
+          isSynthetic: true, // Custom flag to identify synthetic card
+        };
+      }
+    }
+
+    let finalVideos = [...videos];
+    // If there's an actual live video, it takes top priority
+    if (actualLiveVideo) {
+      finalVideos = finalVideos.filter(v => v.id !== actualLiveVideo.id);
+      finalVideos.unshift(actualLiveVideo);
+    } else if (actualUpcomingVideo) { // If no live, but actual upcoming exists, it takes priority
+      finalVideos = finalVideos.filter(v => v.id !== actualUpcomingVideo.id);
+      finalVideos.unshift(actualUpcomingVideo);
+    } else if (gurukulCard) { // If neither, and synthetic card is generated, use it
+      finalVideos.unshift(gurukulCard);
+    }
+
+    return res.status(200).json({
+      success: true,
+      currentPage: page,
+      totalPages: Math.ceil((count + (gurukulCard ? 1 : 0)) / limit) || 1,
+      totalVideos: count + (gurukulCard ? 1 : 0),
+      count: finalVideos.length,
+      channel: {
+        id: channel.id,
+        channelId: channel.youtubeChannelId || channel.youtube_channel_id,
+        youtubeChannelId: channel.youtubeChannelId || channel.youtube_channel_id,
+        name: channel.name,
+        logoUrl: channel.logoUrl || channel.logo_url,
+        logo_url: channel.logoUrl || channel.logo_url,
+        bannerUrl: channel.bannerUrl || channel.banner_url,
+        banner_url: channel.bannerUrl || channel.banner_url,
+        description: channel.description,
+        handle: channel.handle,
+        subscriberCount: channel.subscriberCount ?? channel.subscriber_count ?? 0,
+        subscriber_count: channel.subscriberCount ?? channel.subscriber_count ?? 0,
+        videoCount: channel.videoCount ?? channel.video_count ?? 0,
+        video_count: channel.videoCount ?? channel.video_count ?? 0,
+        viewCount: channel.viewCount ?? channel.view_count ?? 0,
+        view_count: channel.viewCount ?? channel.view_count ?? 0,
+        joinedDate: channel.joinedDate || channel.joined_date,
+        joined_date: channel.joinedDate || channel.joined_date,
+        country: channel.country,
+        isCurrentlyLive: channel.isCurrentlyLive,
+        upcomingVideoId: channel.upcomingVideoId,
+        scheduledStartTime: channel.scheduledStartTime,
+        liveVideoId: channel.liveVideoId,
+        liveStartedAt: channel.liveStartedAt,
+        lastKnownLiveStartTime: channel.lastKnownLiveStartTime,
+        isPinned: channel.isPinned,
+      },
+      data: finalVideos,
+    });
+  } else {
+    return res.status(200).json({
+      success: true,
+      currentPage: page,
+      totalPages: Math.ceil(count / limit) || 1,
+      totalVideos: count,
+      count: videos.length,
+      channel: {
+        id: channel.id,
+        channelId: channel.youtubeChannelId || channel.youtube_channel_id,
+        youtubeChannelId: channel.youtubeChannelId || channel.youtube_channel_id,
+        name: channel.name,
+        logoUrl: channel.logoUrl || channel.logo_url,
+        logo_url: channel.logoUrl || channel.logo_url,
+        bannerUrl: channel.bannerUrl || channel.banner_url,
+        banner_url: channel.bannerUrl || channel.banner_url,
+        description: channel.description,
+        handle: channel.handle,
+        subscriberCount: channel.subscriberCount ?? channel.subscriber_count ?? 0,
+        subscriber_count: channel.subscriberCount ?? channel.subscriber_count ?? 0,
+        videoCount: channel.videoCount ?? channel.video_count ?? 0,
+        video_count: channel.videoCount ?? channel.video_count ?? 0,
+        viewCount: channel.viewCount ?? channel.view_count ?? 0,
+        view_count: channel.viewCount ?? channel.view_count ?? 0,
+        joinedDate: channel.joinedDate || channel.joined_date,
+        joined_date: channel.joinedDate || channel.joined_date,
+        country: channel.country,
+        // These fields are primarily for displaying the channel's overall live status, not individual videos
+        // Individual video cards will now use their own liveBroadcastContent and scheduledStartTime
+        isCurrentlyLive: channel.isCurrentlyLive,
+        upcomingVideoId: channel.upcomingVideoId,
+        scheduledStartTime: channel.scheduledStartTime,
+        liveVideoId: channel.liveVideoId,
+        liveStartedAt: channel.liveStartedAt,
+        lastKnownLiveStartTime: channel.lastKnownLiveStartTime,
+        isPinned: channel.isPinned,
+      },
+      data: videos,
+    });
+  }
 });
 
 /**

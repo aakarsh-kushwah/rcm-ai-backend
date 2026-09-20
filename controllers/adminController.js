@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file controllers/adminController.js
  * @description TITAN ADMIN BRAIN (Gen-6)
  * @capabilities Transactional Deletion, Mass Notification Batching, High-Speed Queries
@@ -8,16 +8,16 @@ const { sequelize } = require('../config/db'); // Imported sequelize instance di
 const { Op } = require('sequelize');
 const admin = require('../config/firebase'); // Firebase Admin SDK
 
-// ✅ CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
-const { User, Admin, ChatMessage, NotificationToken } = require('../models'); 
+// âœ… CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
+const { User, Admin, ChatMessage, NotificationToken, PaymentLog } = require('../models');
 
-// 📊 Optimized Selection: Sirf wahi data mangaayein jo dashboard par dikhana hai
+// ðŸ“Š Optimized Selection: Sirf wahi data mangaayein jo dashboard par dikhana hai
 const userSelectFields = [
     'id', 'fullName', 'googleId', 'email', 'phone', 'role', 'status', 'autoPayStatus', 'createdAt'
 ];
 
 // =======================================================
-// 1️⃣ GET REGULAR USERS (Optimized for Dashboard)
+// 1ï¸âƒ£ GET REGULAR USERS (Optimized for Dashboard)
 // =======================================================
 const getRegularUsers = async (req, res) => {
     try {
@@ -28,13 +28,13 @@ const getRegularUsers = async (req, res) => {
         
         res.status(200).json({ success: true, count: users.length, data: users });
     } catch (error) {
-        console.error('❌ Fetch Users Error:', error.message);
+        console.error('âŒ Fetch Users Error:', error.message);
         res.status(500).json({ success: false, message: 'Failed to retrieve user registry.' });
     }
 };
 
 // =======================================================
-// 2️⃣ GET ALL ADMINS (Team View - From Separate Admin Model)
+// 2ï¸âƒ£ GET ALL ADMINS (Team View - From Separate Admin Model)
 // =======================================================
 const getAllAdmins = async (req, res) => {
     try {
@@ -44,18 +44,18 @@ const getAllAdmins = async (req, res) => {
         });
         res.status(200).json({ success: true, data: admins });
     } catch (error) {
-        console.error('❌ Fetch Admins Error:', error.message);
+        console.error('âŒ Fetch Admins Error:', error.message);
         res.status(500).json({ success: false, message: 'Failed to retrieve admin registry.' });
     }
 };
 
 // =======================================================
-// 3️⃣ DELETE USER (Atomic Transaction - ASI Level) 🛡️
+// 3ï¸âƒ£ DELETE USER (Atomic Transaction - ASI Level) ðŸ›¡ï¸
 // =======================================================
 const deleteUser = async (req, res) => {
     const { userId } = req.params;
     
-    // 🚦 Start Transaction: Sab kuch delete hoga, ya kuch bhi nahi.
+    // ðŸš¦ Start Transaction: Sab kuch delete hoga, ya kuch bhi nahi.
     const t = await sequelize.transaction(); // Using imported sequelize instance directly
 
     try {
@@ -67,7 +67,7 @@ const deleteUser = async (req, res) => {
             return res.status(403).json({ success: false, message: "Security Alert: Cannot delete yourself." });
         }
 
-        console.log(`🗑️ [DELETE] Initiating wipe for User ID: ${userId}`);
+        console.log(`ðŸ—‘ï¸ [DELETE] Initiating wipe for User ID: ${userId}`);
 
         // Step 1: Delete Chat History
         await ChatMessage.destroy({ where: { userId }, transaction: t });
@@ -80,26 +80,26 @@ const deleteUser = async (req, res) => {
         // Step 3: Delete the User Account
         const deletedCount = await User.destroy({ where: { id: userId }, transaction: t });
 
-        // ✅ Commit Changes
+        // âœ… Commit Changes
         await t.commit();
 
         if (deletedCount === 0) {
             return res.status(404).json({ success: false, message: "User not found." });
         }
 
-        console.log(`✅ [DELETE] User ${userId} wiped successfully.`);
+        console.log(`âœ… [DELETE] User ${userId} wiped successfully.`);
         res.status(200).json({ success: true, message: "User and all associated data wiped." });
 
     } catch (error) {
-        // ↩️ Rollback: Undo everything if error occurs
+        // â†©ï¸ Rollback: Undo everything if error occurs
         await t.rollback();
-        console.error("❌ User Wipe Error:", error);
+        console.error("âŒ User Wipe Error:", error);
         res.status(500).json({ success: false, message: "Deletion failed due to system lock." });
     }
 };
 
 // =======================================================
-// 4️⃣ UPDATE USER DATA (CRM Operations)
+// 4ï¸âƒ£ UPDATE USER DATA (CRM Operations)
 // =======================================================
 const updateUserData = async (req, res) => {
     const { userId } = req.params;
@@ -139,13 +139,13 @@ const updateUserData = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("❌ Update Error:", error);
+        console.error("âŒ Update Error:", error);
         res.status(500).json({ success: false, message: "Update failed." });
     }
 };
 
 // =======================================================
-// 5️⃣ ✨ TITAN NOTIFICATION BLAST (The Broadcast Engine) 🚀
+// 5ï¸âƒ£ âœ¨ TITAN NOTIFICATION BLAST (The Broadcast Engine) ðŸš€
 // =======================================================
 const pushNotificationToAll = async (req, res) => {
     try {
@@ -169,7 +169,7 @@ const pushNotificationToAll = async (req, res) => {
             return res.status(404).json({ success: false, message: "No active devices found in Titan Grid." });
         }
 
-        console.log(`📣 [TITAN BLAST] Targeting ${tokens.length} devices...`);
+        console.log(`ðŸ“£ [TITAN BLAST] Targeting ${tokens.length} devices...`);
 
         // 2. SMART BATCHING (500 per chunk - Firebase Limit)
         const chunks = [];
@@ -206,7 +206,7 @@ const pushNotificationToAll = async (req, res) => {
             failureCount += r.failureCount;
         });
 
-        console.log(`✅ [BLAST COMPLETE] Success: ${successCount}, Failed: ${failureCount}`);
+        console.log(`âœ… [BLAST COMPLETE] Success: ${successCount}, Failed: ${failureCount}`);
 
         res.status(200).json({ 
             success: true, 
@@ -215,36 +215,141 @@ const pushNotificationToAll = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("🔥 Broadcast System Error:", error);
+        console.error("ðŸ”¥ Broadcast System Error:", error);
         res.status(500).json({ success: false, message: "Broadcast interrupted." });
+    }
+};
+
+// =======================================================
+// 6ï¸âƒ£ GET ADMIN METRICS OVERVIEW
+// =======================================================
+const getMetricsOverview = async (req, res) => {
+    try {
+        const totalUsers = await User.count();
+        const activePaidUsers = await User.count({ where: { status: 'PREMIUM', autoPayStatus: true } });
+        const pendingOrFreeUsers = await User.count({ where: { [Op.or]: [{ status: 'pending' }, { status: 'INACTIVE' }, { status: 'active', autoPayStatus: false }] } });
+        
+        const totalRevenueResult = await PaymentLog.sum('amount', { where: { status: { [Op.in]: ['SUCCESS', 'WEBHOOK_SUCCESS', 'MANDATE_VERIFIED'] } } });
+        const totalRevenue = totalRevenueResult || 0;
+
+        const totalSuccessfulTransactions = await PaymentLog.count({ where: { status: { [Op.in]: ['SUCCESS', 'WEBHOOK_SUCCESS', 'MANDATE_VERIFIED'] } } });
+
+        res.status(200).json({
+            success: true,
+            data: {
+                totalUsers,
+                activePaidUsers,
+                pendingOrFreeUsers,
+                totalRevenue: parseFloat(totalRevenue).toFixed(2),
+                totalSuccessfulTransactions,
+            }
+        });
+    } catch (error) {
+        console.error('âŒ Get Metrics Overview Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to retrieve metrics overview.' });
+    }
+};
+
+// =======================================================
+// 7ï¸âƒ£ GET PAGINATED PAYMENT LOGS
+// =======================================================
+const getPaymentLogs = async (req, res) => {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 10;
+    const offset = (page - 1) * limit;
+    const statusFilter = req.query.status; // e.g., 'SUCCESS', 'PENDING', 'FAILED'
+
+    let whereClause = {};
+    if (statusFilter === 'Completed / Paid') {
+        whereClause.status = { [Op.in]: ['SUCCESS', 'WEBHOOK_SUCCESS', 'MANDATE_VERIFIED'] };
+    } else if (statusFilter === 'Pending / Failed') {
+        whereClause.status = { [Op.in]: ['INITIATED', 'FAILED', 'CANCELLED', 'HALTED'] };
+    }
+    // For 'All', no specific status filter is applied
+
+    try {
+        const { count, rows: paymentLogs } = await PaymentLog.findAndCountAll({
+            where: whereClause,
+            include: [{
+                model: User,
+                as: 'User',
+                attributes: ['id', 'fullName', 'email', 'rcmId', 'phone'],
+            }],
+            order: [['createdAt', 'DESC']],
+            limit,
+            offset,
+        });
+
+        const formattedLogs = paymentLogs.map(log => ({
+            id: log.id,
+            userId: log.userId,
+            userName: log.User ? log.User.fullName : 'N/A',
+            userEmail: log.User ? log.User.email : 'N/A',
+            userRcmId: log.User ? log.User.rcmId : 'N/A',
+            paymentId: log.paymentId,
+            subscriptionId: log.subscriptionId,
+            amount: parseFloat(log.amount).toFixed(2),
+            status: log.status,
+            method: log.method,
+            date: log.createdAt,
+        }));
+
+        res.status(200).json({
+            success: true,
+            currentPage: page,
+            totalPages: Math.ceil(count / limit) || 1,
+            totalItems: count,
+            data: formattedLogs,
+        });
+
+    } catch (error) {
+        console.error('âŒ Get Payment Logs Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to retrieve payment logs.' });
+    }
+};
+
+// =======================================================
+// 8️⃣ APPROVE ADMIN (IAM)
+// =======================================================
+const approveAdmin = async (req, res) => {
+    const { adminId } = req.params;
+    try {
+        const targetAdmin = await Admin.findByPk(adminId);
+        if (!targetAdmin) {
+            return res.status(404).json({ success: false, message: "Admin not found." });
+        }
+
+        await targetAdmin.update({
+            isApproved: true,
+            status: 'active'
+        });
+
+        res.status(200).json({
+            success: true,
+            message: "Admin approved successfully.",
+            data: {
+                id: targetAdmin.id,
+                email: targetAdmin.email,
+                isApproved: targetAdmin.isApproved,
+                status: targetAdmin.status
+            }
+        });
+    } catch (error) {
+        console.error("❌ Approve Admin Error:", error);
+        res.status(500).json({ success: false, message: "Failed to approve admin." });
     }
 };
 
 // =======================================================
 // ✅ MODULE EXPORTS
 // =======================================================
-const approveAdmin = async (req, res) => {
-    const { adminId } = req.params;
-    try {
-        const adminRec = await Admin.findByPk(adminId);
-        if (!adminRec) {
-            return res.status(404).json({ success: false, message: "Admin candidate not found." });
-        }
-        adminRec.status = 'active';
-        adminRec.isApproved = true;
-        await adminRec.save();
-        res.status(200).json({ success: true, message: `Admin ${adminRec.email} approved.` });
-    } catch (error) {
-        console.error("❌ Approval Error:", error);
-        res.status(500).json({ success: false, message: "Approval failed." });
-    }
-};
-
-module.exports = { 
+module.exports = {
     getRegularUsers,
     getAllAdmins,
-    deleteUser, 
+    deleteUser,
     updateUserData,
     pushNotificationToAll,
-    approveAdmin
+    approveAdmin,
+    getMetricsOverview,
+    getPaymentLogs,
 };

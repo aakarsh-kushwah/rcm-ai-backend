@@ -152,6 +152,16 @@ module.exports = (sequelize) => {
         type: DataTypes.STRING(10),
         allowNull: true,
       },
+      isShortsOnly: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: false,
+        field: 'is_shorts_only',
+      },
+      shortsCount: {
+        type: DataTypes.INTEGER,
+        defaultValue: 0,
+        field: 'shorts_count',
+      },
       createdAt: {
         type: DataTypes.DATE,
         defaultValue: DataTypes.NOW,

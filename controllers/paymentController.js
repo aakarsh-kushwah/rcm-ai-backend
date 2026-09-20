@@ -6,7 +6,8 @@
 
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
-const { User, PaymentLog, sequelize } = require("../models"); 
+const { User, PaymentLog, sequelize } = require("../models");
+const { sendPaymentAlert } = require("../utils/emailService");
 require('dotenv').config();
 
 // Initialize Razorpay
@@ -149,11 +150,21 @@ const verifyPayment = async (req, res) => {
             paymentId: razorpay_payment_id,
             subscriptionId: razorpay_subscription_id,
             status: 'SUCCESS',
-            amount: 0.00, // Mandate Auth Amount
+            amount: 49.00, // Mandate Auth / Subscription Amount
             method: 'MANDATE_VERIFIED'
         }, { transaction: t });
 
         await t.commit();
+
+        // Send payment alert email in background
+        await sendPaymentAlert({
+            payerName: user.fullName,
+            email: user.email,
+            paymentId: razorpay_payment_id,
+            planName: '₹49 Commander Pro',
+            amount: 49,
+            expiryDate: user.nextBillingDate
+        });
 
         console.log(`✅ [FRONTEND VERIFY] User ${userId} activated via Mandate.`);
         res.status(200).json({ success: true, message: "Mandate Verified. Premium Active." });
@@ -242,6 +253,14 @@ const handleWebhook = async (req, res) => {
                         status: 'WEBHOOK_SUCCESS',
                         amount: amount,
                         method: 'AUTO_DEBIT'
+                    });
+                    await sendPaymentAlert({
+                        payerName: user.fullName,
+                        email: user.email,
+                        paymentId: paymentId,
+                        planName: '₹49 Commander Pro',
+                        amount: amount,
+                        expiryDate: user.nextBillingDate
                     });
                 }
                 console.log(`💰 [RECURRING CHARGE] ₹${amount} Processed for User ${user.id}`);

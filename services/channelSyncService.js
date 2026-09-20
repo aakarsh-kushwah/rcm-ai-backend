@@ -3,6 +3,7 @@ const cron = require('node-cron');
 const EventEmitter = require('events');
 const { Channel, ChannelVideo } = require('../models');
 const logger = require('../utils/logger');
+const { sendNewVideoAlert } = require('../utils/emailService');
 
 // Event emitter for live transitions (Part 3 attaches here)
 class LiveEventEmitter extends EventEmitter {}
@@ -207,6 +208,12 @@ async function syncChannel(channel) {
           });
         } else {
           newVideosCount++;
+          // Send email alert for new video
+          await sendNewVideoAlert({
+            title,
+            youtubeVideoId,
+            publishedAt,
+          }, channel.name);
         }
       }
 

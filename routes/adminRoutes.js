@@ -8,6 +8,8 @@ const express = require("express");
 const router = express.Router();
 const rateLimit = require("express-rate-limit");
 
+const { adminGetShorts, adminToggleChannelShortsOnly, adminToggleVideoShort, adminDeleteShort } = require("../controllers/shortsController");
+
 // ✅ Import Controller Functions
 const {
   getRegularUsers,
@@ -15,7 +17,9 @@ const {
   deleteUser,
   updateUserData,
   pushNotificationToAll,
-  approveAdmin // ✨ New Feature
+  approveAdmin, // ✨ New Feature
+  getMetricsOverview, // New Metrics Overview Endpoint
+  getPaymentLogs // New Payment Logs Endpoint
 } = require("../controllers/adminController");
 
 // ✅ Import Middleware
@@ -96,5 +100,21 @@ router.post(
 
 // 6. Approve Admin (IAM)
 router.post("/approve/:adminId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(adminApprovalSchema), approveAdmin);
+
+// ============================================================
+// 📊 MODULE C: ANALYTICS & REPORTING
+// ============================================================
+
+// 1. Get Metrics Overview (KPI Cards)
+router.get("/metrics/overview", restrictTo("SUPER_ADMIN", "ADMIN"), getMetricsOverview);
+
+// 2. Get Paginated Payment Logs
+router.get("/payments", restrictTo("SUPER_ADMIN", "ADMIN"), getPaymentLogs);
+
+// 3. Shorts Management (Admin Isolation)
+router.get("/shorts", restrictTo("SUPER_ADMIN", "ADMIN"), adminGetShorts);
+router.patch("/channels/:id/toggle-shorts-only", restrictTo("SUPER_ADMIN", "ADMIN"), adminToggleChannelShortsOnly);
+router.patch("/videos/:id/toggle-short", restrictTo("SUPER_ADMIN", "ADMIN"), adminToggleVideoShort);
+router.delete("/shorts/:id", restrictTo("SUPER_ADMIN", "ADMIN"), adminDeleteShort);
 
 module.exports = router;

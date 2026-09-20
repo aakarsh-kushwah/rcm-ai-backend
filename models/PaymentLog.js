@@ -8,6 +8,14 @@ module.exports = (sequelize, DataTypes) => {
         method: DataTypes.STRING, // 'card', 'upi', etc.
         ipAddress: DataTypes.STRING,
         errorDetails: DataTypes.TEXT
+    }, {
+        tableName: 'payment_logs',
+        timestamps: true
     });
+
+    PaymentLog.associate = (models) => {
+        PaymentLog.belongsTo(models.User, { foreignKey: 'userId', as: 'User' });
+    };
+
     return PaymentLog;
 };

@@ -168,13 +168,18 @@ apiV1.use("/utils", require("./routes/utilsRoutes"));
 apiV1.use("/videos", require("./routes/videoRoutes"));
 apiV1.use("/channels", require("./routes/channelRoutes"));
 apiV1.use("/calculator", require("./routes/calculatorRoutes"));
+apiV1.use("/shorts", require("./routes/shortsRoutes"));
 
 // Mount under both /api and /api/v1 for compatibility
 app.use("/api/v1", apiV1);
 app.use("/api", apiV1);
+app.use('/shorts', require('./routes/shortsRoutes'));
 
 // ⚠️ GLOBAL ERROR HANDLER (Environment Aware)
 app.use((err, req, res, next) => {
+    if (res.headersSent) {
+        return next(err); // Express standard safeguard
+    }
     const isProd = process.env.NODE_ENV === "production";
     logger.error({ 
         traceId: req.id, 

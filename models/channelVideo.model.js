@@ -54,6 +54,21 @@ module.exports = (sequelize) => {
         allowNull: true,
         field: 'scheduled_start_time',
       },
+      isShort: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: false,
+        field: 'is_short',
+      },
+      likesCount: {
+        type: DataTypes.INTEGER,
+        defaultValue: 0,
+        field: 'likes_count',
+      },
+      commentsCount: {
+        type: DataTypes.INTEGER,
+        defaultValue: 0,
+        field: 'comments_count',
+      },
       createdAt: {
         type: DataTypes.DATE,
         defaultValue: DataTypes.NOW,
@@ -67,6 +82,7 @@ module.exports = (sequelize) => {
         { fields: ['youtube_video_id'], unique: true },
         { fields: ['channel_id'] },
         { fields: ['published_at'] },
+        { fields: ['is_short'] },
       ],
     }
   );
@@ -75,6 +91,16 @@ module.exports = (sequelize) => {
     ChannelVideo.belongsTo(models.Channel, {
       foreignKey: 'channelId',
       as: 'channel',
+    });
+    ChannelVideo.hasMany(models.ShortInteraction, {
+      foreignKey: 'channelVideoId',
+      as: 'interactions',
+      onDelete: 'CASCADE',
+    });
+    ChannelVideo.hasMany(models.ShortComment, {
+      foreignKey: 'channelVideoId',
+      as: 'comments',
+      onDelete: 'CASCADE',
     });
   };
 

@@ -11,6 +11,7 @@ const { User, Admin, RefreshToken } = require("../models");
 const { Op } = require("sequelize");
 const { logger } = require("../utils/logger");
 const crypto = require("crypto");
+const { sendNewUserAlert } = require("../utils/emailService");
 
 // ⚙️ CONFIGURATION
 const JWT_ACCESS_EXPIRY = "15m";
@@ -121,6 +122,13 @@ exports.googleAuthLogin = async (req, res) => {
                 nextBillingDate: null
             });
             logger.info({ traceId: req.id, userId: user.id }, "New user registered via Google OAuth");
+            await sendNewUserAlert({
+                fullName: user.fullName,
+                email: user.email,
+                phone: user.phone, // Assuming phone might be added later or not present for Google OAuth
+                role: user.role,
+                registrationTimestamp: user.createdAt,
+            });
         }
 
         if (user.status === "banned" || user.status === "suspended") {
@@ -186,6 +194,13 @@ exports.adminSignup = async (req, res) => {
         });
 
         logger.info({ traceId: req.id, adminId: admin.id, email: admin.email }, "New admin registered, awaiting verification");
+        await sendNewUserAlert({
+            fullName: admin.fullName,
+            email: admin.email,
+            phone: admin.phone,
+            role: admin.role,
+            registrationTimestamp: admin.createdAt,
+        });
 
         res.status(202).json({
             success: true,
