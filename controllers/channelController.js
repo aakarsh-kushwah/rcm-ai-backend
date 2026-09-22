@@ -244,7 +244,7 @@ exports.createChannel = asyncHandler(async (req, res) => {
  */
 exports.getChannels = asyncHandler(async (req, res) => {
   const channels = await Channel.findAll({
-    where: { isActive: true },
+    where: { isActive: true, isShortsOnly: false },
     order: [['isPinned', 'DESC'], ['name', 'ASC']],
   });
 
@@ -358,7 +358,7 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
   }
 
   const { count, rows: videos } = await ChannelVideo.findAndCountAll({
-    where: { channelId, isAvailable: true },
+    where: { channelId, isAvailable: true, isShort: false },
     attributes: ['id', 'youtubeVideoId', 'title', 'thumbnailUrl', 'publishedAt', 'isAvailable', 'liveBroadcastContent', 'scheduledStartTime'],
     order: [['publishedAt', 'DESC']],
     limit,

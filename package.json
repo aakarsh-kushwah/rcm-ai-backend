@@ -46,6 +46,7 @@
     "helmet": "^7.2.0",
     "hpp": "^0.2.3",
     "ioredis": "^5.9.2",
+    "iso8601-duration": "^2.1.4",
     "jsonwebtoken": "^9.0.2",
     "lru-cache": "^10.2.0",
     "morgan": "^1.10.0",

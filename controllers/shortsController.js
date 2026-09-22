@@ -254,6 +254,15 @@ exports.adminToggleChannelShortsOnly = asyncHandler(async (req, res) => {
   channel.isShortsOnly = !channel.isShortsOnly;
   await channel.save();
 
+  if (channel.isShortsOnly) {
+    // If enabled, mark all existing videos of this channel as isShort = true
+    await ChannelVideo.update({ isShort: true }, { where: { channelId } });
+  }
+
+  // Recalculate shorts_count for channel
+  const shortsCount = await ChannelVideo.count({ where: { channelId, isShort: true } });
+  await Channel.update({ shortsCount }, { where: { id: channelId } });
+
   res.status(200).json({
     success: true,
     message: `Channel ${channel.name} is now ${channel.isShortsOnly ? 'Shorts Only' : 'Standard'}.`,

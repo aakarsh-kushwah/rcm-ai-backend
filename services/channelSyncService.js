@@ -2,6 +2,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 const EventEmitter = require('events');
 const { Channel, ChannelVideo } = require('../models');
+const { parse } = require('iso8601-duration'); // Import the library
 const logger = require('../utils/logger');
 const { sendNewVideoAlert } = require('../utils/emailService');
 
@@ -148,7 +149,7 @@ async function syncChannel(channel) {
         continue;
       }
 
-      const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
+      const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
       trackQuota(videoIds.length > 0 ? 1 : 0); // Each videos.list call costs 1 unit.
 
       const videoDetailsMap = new Map();
@@ -182,6 +183,26 @@ async function syncChannel(channel) {
           break;
         }
 
+        // Calculate isShort accurately
+        let isShort = false;
+        if (videoData?.contentDetails?.duration) {
+          try {
+            const durationObj = parse(videoData.contentDetails.duration);
+            const totalSeconds = (durationObj.hours || 0) * 3600 + (durationObj.minutes || 0) * 60 + (durationObj.seconds || 0);
+            if (totalSeconds > 0 && totalSeconds <= 60) {
+              isShort = true;
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+        if (!isShort) {
+          const lowerTitle = title.toLowerCase();
+          if (lowerTitle.includes('#shorts') || lowerTitle.includes('#short') || channel.isShortsOnly) {
+            isShort = true;
+          }
+        }
+
         // Upsert or findOrCreate into ChannelVideo
         const [video, created] = await ChannelVideo.findOrCreate({
           where: { youtubeVideoId },
@@ -193,11 +214,12 @@ async function syncChannel(channel) {
             isAvailable: true,
             liveBroadcastContent,
             scheduledStartTime,
+            isShort,
           },
         });
 
         if (!created) {
-          // If video exists, update its details in case live status or title changed
+          // If video exists, update its details in case live status, title, or isShort status changed
           await video.update({
             title,
             thumbnailUrl,
@@ -205,6 +227,7 @@ async function syncChannel(channel) {
             isAvailable: true,
             liveBroadcastContent,
             scheduledStartTime,
+            isShort,
           });
         } else {
           newVideosCount++;
@@ -541,6 +564,7 @@ async function processLiveChannelState(channel) {
             thumbnailUrl: status.thumbnailUrl,
             publishedAt: status.actualStartTime || now,
             isAvailable: true,
+            isShort: false,
           },
         });
         await ChannelVideo.update(
@@ -682,59 +706,63 @@ async function checkLiveAndUpcomingStatus() {
 }
 
 // Register cron jobs
-try {
-  // Priority 3: Hourly sync for new videos
-  cron.schedule('0 * * * *', () => {
-    syncAllActiveChannels();
-  });
-  logger.info('YouTube channel sync cron job scheduled successfully (hourly - Priority 3).');
+if (process.env.DISABLE_CRONS !== 'true') {
+  try {
+    // Priority 3: Hourly sync for new videos
+    cron.schedule('0 * * * *', () => {
+      syncAllActiveChannels();
+    });
+    logger.info('YouTube channel sync cron job scheduled successfully (hourly - Priority 3).');
 
-  // Channel metadata & statistics refresh every 6 hours
-  cron.schedule('0 */6 * * *', () => {
-    refreshMetadataForAllChannels();
-  });
-  logger.info('YouTube channel metadata refresh cron job scheduled successfully (every 6 hours).');
+    // Channel metadata & statistics refresh every 6 hours
+    cron.schedule('0 */6 * * *', () => {
+      refreshMetadataForAllChannels();
+    });
+    logger.info('YouTube channel metadata refresh cron job scheduled successfully (every 6 hours).');
 
-  // Priority 1: Daily video health check (e.g. 3:00 AM)
-  cron.schedule('0 3 * * *', () => {
-    checkVideoHealth();
-  });
-  logger.info('YouTube video health check cron job scheduled successfully (daily at 03:00).');
+    // Priority 1: Daily video health check (e.g. 3:00 AM)
+    cron.schedule('0 3 * * *', () => {
+      checkVideoHealth();
+    });
+    logger.info('YouTube video health check cron job scheduled successfully (daily at 03:00).');
 
-  // Priority 4 / Live Detection: Run every 1 minute to support Phase A, B, and C polling intervals
-  cron.schedule('* * * * *', () => {
-    checkLiveAndUpcomingStatus();
-  });
-  logger.info('YouTube live detection cron job scheduled successfully (every 1 minute for Phase A/B/C polling).');
+    // Priority 4 / Live Detection: Run every 1 minute to support Phase A, B, and C polling intervals
+    cron.schedule('* * * * *', () => {
+      checkLiveAndUpcomingStatus();
+    });
+    logger.info('YouTube live detection cron job scheduled successfully (every 1 minute for Phase A/B/C polling).');
 
-  // TC Sir Gurukul Morning Live Notification (Targeted Cron running every minute between 6:15 AM - 7:00 AM IST)
-  cron.schedule('*/1 6-7 * * *', async () => {
-    const now = new Date();
-    const istTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Calcutta' }));
-    const istHour = istTime.getHours();
-    const istMinute = istTime.getMinutes();
+    // TC Sir Gurukul Morning Live Notification (Targeted Cron running every minute between 6:15 AM - 7:00 AM IST)
+    cron.schedule('*/1 6-7 * * *', async () => {
+      const now = new Date();
+      const istTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Calcutta' }));
+      const istHour = istTime.getHours();
+      const istMinute = istTime.getMinutes();
 
-    // Target window: 6:15 AM to 7:00 AM IST
-    if (istHour === 6 && istMinute >= 15 && istMinute <= 59) {
-      try {
-        const rcmWorldChannel = await Channel.findOne({
-          where: {
-            isActive: true,
+      // Target window: 6:15 AM to 7:00 AM IST
+      if (istHour === 6 && istMinute >= 15 && istMinute <= 59) {
+        try {
+          const rcmWorldChannel = await Channel.findOne({
+            where: {
+              isActive: true,
+            }
+          });
+
+          if (rcmWorldChannel) {
+            logger.info(`[Gurukul Morning Cron] Checking RCM World for live status at ${istHour}:${istMinute} IST...`);
+            await processLiveChannelState(rcmWorldChannel);
           }
-        });
-
-        if (rcmWorldChannel) {
-          logger.info(`[Gurukul Morning Cron] Checking RCM World for live status at ${istHour}:${istMinute} IST...`);
-          await processLiveChannelState(rcmWorldChannel);
+        } catch (cronErr) {
+          logger.error(`Error in Gurukul Morning Live Cron: ${cronErr.message}`);
         }
-      } catch (cronErr) {
-        logger.error(`Error in Gurukul Morning Live Cron: ${cronErr.message}`);
       }
-    }
-  });
-  logger.info('TC Sir Gurukul Morning Live Notification cron scheduled successfully (6:15 AM - 7:00 AM IST window).');
-} catch (err) {
-  logger.error(`Failed to schedule channel sync cron jobs: ${err.message}`);
+    });
+    logger.info('TC Sir Gurukul Morning Live Notification cron scheduled successfully (6:15 AM - 7:00 AM IST window).');
+  } catch (err) {
+    logger.error(`Failed to schedule channel sync cron jobs: ${err.message}`);
+  }
+} else {
+  logger.info('Cron jobs disabled via DISABLE_CRONS=true environment variable.');
 }
 
 module.exports = {
