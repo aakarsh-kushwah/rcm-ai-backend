@@ -74,7 +74,7 @@ const allowedOrigins = [
     "https://rcmai.in",
     "https://www.rcmai.in",
     "https://rcm-ai-admin-ui.vercel.app",
-    "http://localhost:3000", // For local development
+    "http://localhost:3000", "http://localhost:3002", // For local development
     "http://localhost:3001", // For local development
     "http://localhost:5173"  // For local development
 ];
