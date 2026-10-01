@@ -19,7 +19,6 @@ const { logger } = require("./utils/logger");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const client = require("prom-client");
 const { rateLimit } = require("express-rate-limit");
-const { RedisStore } = require("rate-limit-redis");
 
 // Internal Modules
 const bcrypt = require("bcryptjs");
@@ -74,8 +73,9 @@ const allowedOrigins = [
     "https://rcmai.in",
     "https://www.rcmai.in",
     "https://rcm-ai-admin-ui.vercel.app",
-    "http://localhost:3000", "http://localhost:3002", // For local development
+    "http://localhost:3000", // For local development
     "http://localhost:3001", // For local development
+    "http://localhost:3002", // For Admin UI local development
     "http://localhost:5173"  // For local development
 ];
 app.use(cors({
@@ -86,17 +86,16 @@ app.use(cors({
             callback(new Error("🚫 Titan Firewall: CORS Violation"), false);
         }
     },
-    credentials: true
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Trace-Id"]
 }));
+app.options('*', cors());
 
 // 5. Distributed Rate Limiting (Redis Optimized)
 const globalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 1000,
-    store: new RedisStore({
-        sendCommand: (...args) => redisClient.call(...args),
-        prefix: "titan_rl:",
-    }),
 });
 app.use(globalLimiter);
 
@@ -173,13 +172,9 @@ apiV1.use("/shorts", require("./routes/shortsRoutes"));
 // Mount under both /api and /api/v1 for compatibility
 app.use("/api/v1", apiV1);
 app.use("/api", apiV1);
-app.use('/shorts', require('./routes/shortsRoutes'));
 
 // ⚠️ GLOBAL ERROR HANDLER (Environment Aware)
 app.use((err, req, res, next) => {
-    if (res.headersSent) {
-        return next(err); // Express standard safeguard
-    }
     const isProd = process.env.NODE_ENV === "production";
     logger.error({ 
         traceId: req.id, 

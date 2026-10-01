@@ -4,15 +4,6 @@ module.exports = {
   up: async (queryInterface, Sequelize) => {
     // Add columns to channels
     try {
-      await queryInterface.addColumn('channels', 'is_shorts_only', {
-        type: Sequelize.BOOLEAN,
-        defaultValue: false,
-      });
-    } catch (e) {
-      console.log('Column is_shorts_only might already exist:', e.message);
-    }
-
-    try {
       await queryInterface.addColumn('channels', 'shorts_count', {
         type: Sequelize.INTEGER,
         defaultValue: 0,
@@ -21,11 +12,22 @@ module.exports = {
       console.log('Column shorts_count might already exist:', e.message);
     }
 
+    try {
+      await queryInterface.addColumn('channels', 'source', {
+        type: Sequelize.ENUM('channel', 'shorts-only'),
+        allowNull: false,
+        defaultValue: 'channel',
+      });
+    } catch (e) {
+      console.log('Column source might already exist:', e.message);
+    }
+
     // Add columns to channel_videos
     try {
       await queryInterface.addColumn('channel_videos', 'is_short', {
         type: Sequelize.BOOLEAN,
-        defaultValue: false,
+        allowNull: true,
+        defaultValue: null,
       });
     } catch (e) {
       console.log('Column is_short might already exist:', e.message);
@@ -162,6 +164,6 @@ module.exports = {
     await queryInterface.removeColumn('channel_videos', 'likes_count');
     await queryInterface.removeColumn('channel_videos', 'is_short');
     await queryInterface.removeColumn('channels', 'shorts_count');
-    await queryInterface.removeColumn('channels', 'is_shorts_only');
+    await queryInterface.removeColumn('channels', 'source');
   },
 };

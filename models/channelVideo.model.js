@@ -56,8 +56,26 @@ module.exports = (sequelize) => {
       },
       isShort: {
         type: DataTypes.BOOLEAN,
-        defaultValue: false,
+        allowNull: true,
+        defaultValue: null,
         field: 'is_short',
+      },
+      totalSeconds: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+        defaultValue: 0,
+        field: 'total_seconds',
+      },
+      durationStr: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        defaultValue: '',
+        field: 'duration_str',
+      },
+      viewCount: {
+        type: DataTypes.BIGINT,
+        defaultValue: 0,
+        field: 'view_count',
       },
       likesCount: {
         type: DataTypes.INTEGER,
@@ -83,6 +101,8 @@ module.exports = (sequelize) => {
         { fields: ['channel_id'] },
         { fields: ['published_at'] },
         { fields: ['is_short'] },
+        { fields: ['total_seconds'] },
+        { fields: ['view_count'] },
       ],
     }
   );

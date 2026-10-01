@@ -2,11 +2,26 @@ const axios = require('axios');
 const cron = require('node-cron');
 const EventEmitter = require('events');
 const { Channel, ChannelVideo } = require('../models');
-const { parse } = require('iso8601-duration'); // Import the library
-const logger = require('../utils/logger');
-const { sendNewVideoAlert } = require('../utils/emailService');
+const { parse } = require('iso8601-duration');
 
-// Event emitter for live transitions (Part 3 attaches here)
+let logger;
+try {
+  logger = require('../utils/logger');
+} catch (e) {
+  logger = {
+    info: console.log,
+    warn: console.warn,
+    error: console.error,
+    debug: console.log
+  };
+}
+
+// ------------------------------------------------------------------
+// Email alerts & notification triggers completely removed & neutralized
+// to stop rate-limiting / login attempt / Gmail 454 errors.
+// ------------------------------------------------------------------
+
+// Event emitter for live transitions
 class LiveEventEmitter extends EventEmitter {}
 const liveEmitter = new LiveEventEmitter();
 
@@ -23,6 +38,18 @@ function trackQuota(units) {
   }
   dailyQuotaSpent += units;
   logger.info(`[Quota Audit] Spent ${units} units. Today's cumulative quota spent: ${dailyQuotaSpent} units.`);
+}
+
+/**
+ * Helper to get playlist IDs from channelId ('UC' prefix sliced)
+ */
+function getPlaylistIds(channelId) {
+  const cleanId = channelId && channelId.startsWith('UC') ? channelId.slice(2) : channelId;
+  return {
+    uploads: 'UU' + cleanId,
+    longOnly: 'UULF' + cleanId,
+    shortsOnly: 'UUSH' + cleanId,
+  };
 }
 
 /**
@@ -92,165 +119,212 @@ async function refreshMetadataForAllChannels() {
 }
 
 /**
- * Sync videos for a single YouTube channel from its uploads playlist
+ * Helper to fetch and process a specific playlist (UULF or UUSH or UU)
+ */
+async function processPlaylistItems(channel, playlistId, isShortVal, apiKey, lastSyncedAtTime, maxPages = 0) {
+  let pageToken = '';
+  let newVideosCount = 0;
+  let reachedAlreadySynced = false;
+  let pagesFetched = 0;
+
+  do {
+    if (maxPages > 0 && pagesFetched >= maxPages) break;
+    pagesFetched++;
+
+    const url = `https://www.googleapis.com/youtube/v3/playlistItems`;
+    const params = {
+      part: 'snippet',
+      playlistId: playlistId,
+      maxResults: 50,
+      key: apiKey,
+    };
+    if (pageToken) {
+      params.pageToken = pageToken;
+    }
+
+    const response = await axios.get(url, { params, timeout: 10000 });
+    const items = response.data.items || [];
+
+    if (items.length === 0) {
+      break;
+    }
+
+    const videoIds = items.map(item => item.snippet?.resourceId?.videoId).filter(Boolean);
+    if (videoIds.length === 0) {
+      pageToken = response.data.nextPageToken;
+      continue;
+    }
+
+    const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
+    trackQuota(videoIds.length > 0 ? 1 : 0);
+
+    const videoDetailsMap = new Map();
+    for (const videoItem of (videosDetailsRes.data.items || [])) {
+      videoDetailsMap.set(videoItem.id, videoItem);
+    }
+
+    for (const item of items) {
+      const snippet = item.snippet;
+      if (!snippet || !snippet.resourceId || !snippet.resourceId.videoId) {
+        continue;
+      }
+
+      const youtubeVideoId = snippet.resourceId.videoId;
+      const videoData = videoDetailsMap.get(youtubeVideoId);
+
+      const title = videoData?.snippet?.title || snippet.title || 'Untitled Video';
+      const thumbnailUrl =
+        videoData?.snippet?.thumbnails?.high?.url ||
+        snippet.thumbnails?.high?.url ||
+        snippet.thumbnails?.medium?.url ||
+        snippet.thumbnails?.default?.url ||
+        `https://i.ytimg.com/vi/${youtubeVideoId}/hqdefault.jpg`;
+      const publishedAt = videoData?.snippet?.publishedAt ? new Date(videoData.snippet.publishedAt) : (snippet.publishedAt ? new Date(snippet.publishedAt) : new Date());
+      const liveBroadcastContent = videoData?.snippet?.liveBroadcastContent || 'none';
+      const scheduledStartTime = videoData?.liveStreamingDetails?.scheduledStartTime ? new Date(videoData.liveStreamingDetails.scheduledStartTime) : null;
+
+      if (lastSyncedAtTime && publishedAt.getTime() <= lastSyncedAtTime) {
+        reachedAlreadySynced = true;
+        break;
+      }
+
+      let isShort = isShortVal;
+      let durationStr = videoData?.contentDetails?.duration || '';
+      let totalSeconds = 0;
+      let viewCount = videoData?.statistics?.viewCount ? parseInt(videoData.statistics.viewCount, 10) : 0;
+
+      if (durationStr) {
+        try {
+          const durationObj = parse(durationStr);
+          totalSeconds = (durationObj.hours || 0) * 3600 + (durationObj.minutes || 0) * 60 + (durationObj.seconds || 0);
+        } catch (e) {
+          logger.warn(`Could not parse duration for video ${youtubeVideoId}: ${e.message}`);
+        }
+      }
+
+      // Determine if it's a short based on duration
+      if (isShort === null) {
+        if (totalSeconds > 0 && totalSeconds <= 180) {
+          isShort = true;
+        } else {
+          isShort = false;
+        }
+      }
+
+      if (channel.isShortsOnly && !isShort) {
+        continue;
+      }
+      if (isShortVal === true && !isShort) {
+        continue;
+      }
+
+      const [video, created] = await ChannelVideo.findOrCreate({
+        where: { youtubeVideoId },
+        defaults: {
+          channelId: channel.id,
+          title,
+          thumbnailUrl,
+          publishedAt,
+          isAvailable: true,
+          liveBroadcastContent,
+          scheduledStartTime,
+          isShort,
+          durationStr,
+          totalSeconds,
+          viewCount,
+        },
+      });
+
+      if (!created) {
+        await video.update({
+          title,
+          thumbnailUrl,
+          publishedAt,
+          isAvailable: true,
+          liveBroadcastContent,
+          scheduledStartTime,
+          isShort,
+          durationStr,
+          totalSeconds,
+          viewCount,
+        });
+      } else {
+        newVideosCount++;
+      }
+    }
+
+    pageToken = response.data.nextPageToken;
+  } while (pageToken && !reachedAlreadySynced);
+
+  return newVideosCount;
+}
+
+/**
+ * Sync videos for a single YouTube channel supporting source ('channel' vs 'shorts-only') and fallback
  * @param {object} channel - Sequelize Channel instance
  */
-async function syncChannel(channel) {
+async function syncChannel(channel, { skipAlerts = false, maxPages = 0 } = {}) {
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey) {
     logger.warn('YOUTUBE_API_KEY is not configured in environment variables.');
     throw new Error('YOUTUBE_API_KEY is missing');
   }
 
-  // Set syncing status
   channel.lastSyncStatus = 'syncing';
   await channel.save();
 
-  // Refresh channel metadata and statistics first
   await refreshChannelMetadata(channel);
 
-  const playlistId = channel.uploadsPlaylistId;
-  if (!playlistId) {
-    const err = new Error(`Channel ${channel.name} (${channel.id}) has no uploadsPlaylistId`);
-    channel.lastSyncStatus = 'error';
-    channel.lastSyncError = err.message;
-    await channel.save();
-    throw err;
-  }
+  const playlistIds = getPlaylistIds(channel.youtubeChannelId);
+  const uploadsPlaylistId = channel.uploadsPlaylistId || playlistIds.uploads;
 
-  let pageToken = '';
-  let newVideosCount = 0;
-  let reachedAlreadySynced = false;
   const lastSyncedAtTime = channel.lastSyncedAt ? new Date(channel.lastSyncedAt).getTime() : 0;
+  let totalNewVideos = 0;
 
   try {
-    do {
-      const url = `https://www.googleapis.com/youtube/v3/playlistItems`;
-      const params = {
-        part: 'snippet',
-        playlistId: playlistId,
-        maxResults: 50,
-        key: apiKey,
-      };
-      if (pageToken) {
-        params.pageToken = pageToken;
+    const source = channel.source || (channel.isShortsOnly ? 'shorts-only' : 'channel');
+
+    if (source === 'shorts-only') {
+      try {
+        const added = await processPlaylistItems(channel, playlistIds.shortsOnly, true, apiKey, lastSyncedAtTime, maxPages);
+        totalNewVideos += added;
+      } catch (err) {
+        logger.warn(`Shorts-only playlist ${playlistIds.shortsOnly} failed for channel ${channel.name}: ${err.message}. Trying uploads fallback.`);
+        totalNewVideos += await syncViaUploadsFallback(channel, uploadsPlaylistId, apiKey, lastSyncedAtTime, true, 50);
+      }
+    } else {
+      let longSuccess = false;
+      let shortsSuccess = false;
+
+      try {
+        const addedLong = await processPlaylistItems(channel, playlistIds.longOnly, false, apiKey, lastSyncedAtTime, maxPages);
+        totalNewVideos += addedLong;
+        longSuccess = true;
+      } catch (err) {
+        logger.warn(`Long-only playlist ${playlistIds.longOnly} failed for channel ${channel.name}: ${err.message}`);
       }
 
-      const response = await axios.get(url, { params, timeout: 10000 });
-      const items = response.data.items || [];
-
-      if (items.length === 0) {
-        break;
+      try {
+        const addedShorts = await processPlaylistItems(channel, playlistIds.shortsOnly, true, apiKey, lastSyncedAtTime, maxPages);
+        totalNewVideos += addedShorts;
+        shortsSuccess = true;
+      } catch (err) {
+        logger.warn(`Shorts playlist ${playlistIds.shortsOnly} failed for channel ${channel.name}: ${err.message}`);
       }
 
-      const videoIds = items.map(item => item.snippet?.resourceId?.videoId).filter(Boolean);
-      if (videoIds.length === 0) {
-        pageToken = response.data.nextPageToken;
-        continue;
+      if (!longSuccess && !shortsSuccess) {
+        logger.info(`Both UULF and UUSH playlists failed or empty for channel ${channel.name}. Triggering uploads fallback.`);
+        totalNewVideos += await syncViaUploadsFallback(channel, uploadsPlaylistId, apiKey, lastSyncedAtTime, null, 50);
       }
+    }
 
-      const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
-      trackQuota(videoIds.length > 0 ? 1 : 0); // Each videos.list call costs 1 unit.
-
-      const videoDetailsMap = new Map();
-      for (const videoItem of (videosDetailsRes.data.items || [])) {
-        videoDetailsMap.set(videoItem.id, videoItem);
-      }
-
-      for (const item of items) {
-        const snippet = item.snippet;
-        if (!snippet || !snippet.resourceId || !snippet.resourceId.videoId) {
-          continue;
-        }
-
-        const youtubeVideoId = snippet.resourceId.videoId;
-        const videoData = videoDetailsMap.get(youtubeVideoId);
-
-        const title = videoData?.snippet?.title || snippet.title || 'Untitled Video';
-        const thumbnailUrl =
-          videoData?.snippet?.thumbnails?.high?.url ||
-          snippet.thumbnails?.high?.url ||
-          snippet.thumbnails?.medium?.url ||
-          snippet.thumbnails?.default?.url ||
-          `https://i.ytimg.com/vi/${youtubeVideoId}/hqdefault.jpg`;
-        const publishedAt = videoData?.snippet?.publishedAt ? new Date(videoData.snippet.publishedAt) : (snippet.publishedAt ? new Date(snippet.publishedAt) : new Date());
-        const liveBroadcastContent = videoData?.snippet?.liveBroadcastContent || 'none';
-        const scheduledStartTime = videoData?.liveStreamingDetails?.scheduledStartTime ? new Date(videoData.liveStreamingDetails.scheduledStartTime) : null;
-
-        // If we reach a video whose publishedAt <= channel.lastSyncedAt, we can stop
-        if (lastSyncedAtTime && publishedAt.getTime() <= lastSyncedAtTime) {
-          reachedAlreadySynced = true;
-          break;
-        }
-
-        // Calculate isShort accurately
-        let isShort = false;
-        if (videoData?.contentDetails?.duration) {
-          try {
-            const durationObj = parse(videoData.contentDetails.duration);
-            const totalSeconds = (durationObj.hours || 0) * 3600 + (durationObj.minutes || 0) * 60 + (durationObj.seconds || 0);
-            if (totalSeconds > 0 && totalSeconds <= 60) {
-              isShort = true;
-            }
-          } catch (e) {
-            // Ignore parse errors
-          }
-        }
-        if (!isShort) {
-          const lowerTitle = title.toLowerCase();
-          if (lowerTitle.includes('#shorts') || lowerTitle.includes('#short') || channel.isShortsOnly) {
-            isShort = true;
-          }
-        }
-
-        // Upsert or findOrCreate into ChannelVideo
-        const [video, created] = await ChannelVideo.findOrCreate({
-          where: { youtubeVideoId },
-          defaults: {
-            channelId: channel.id,
-            title,
-            thumbnailUrl,
-            publishedAt,
-            isAvailable: true,
-            liveBroadcastContent,
-            scheduledStartTime,
-            isShort,
-          },
-        });
-
-        if (!created) {
-          // If video exists, update its details in case live status, title, or isShort status changed
-          await video.update({
-            title,
-            thumbnailUrl,
-            publishedAt,
-            isAvailable: true,
-            liveBroadcastContent,
-            scheduledStartTime,
-            isShort,
-          });
-        } else {
-          newVideosCount++;
-          // Send email alert for new video
-          await sendNewVideoAlert({
-            title,
-            youtubeVideoId,
-            publishedAt,
-          }, channel.name);
-        }
-      }
-
-      pageToken = response.data.nextPageToken;
-    } while (pageToken && !reachedAlreadySynced);
-
-    // Update success status and timestamp
     channel.lastSyncedAt = new Date();
     channel.lastSyncStatus = 'ok';
     channel.lastSyncError = null;
     await channel.save();
 
-    logger.info(`Channel ${channel.name} synced successfully: ${newVideosCount} new videos added.`);
-    return newVideosCount;
+    logger.info(`Channel ${channel.name} synced successfully: ${totalNewVideos} new videos added.`);
+    return totalNewVideos;
   } catch (err) {
     logger.error(`Error syncing channel ${channel.name}: ${err.message}`);
     channel.lastSyncStatus = 'error';
@@ -258,6 +332,133 @@ async function syncChannel(channel) {
     await channel.save();
     throw err;
   }
+}
+
+/**
+ * Fallback sync via uploads playlist (UU)
+ */
+async function syncViaUploadsFallback(channel, uploadsPlaylistId, apiKey, lastSyncedAtTime, forcedIsShort, maxVideosLimit = 50) {
+  let pageToken = '';
+  let newVideosCount = 0;
+  let processedCount = 0;
+  let reachedAlreadySynced = false;
+
+  do {
+    const url = `https://www.googleapis.com/youtube/v3/playlistItems`;
+    const params = {
+      part: 'snippet',
+      playlistId: uploadsPlaylistId,
+      maxResults: 50,
+      key: apiKey,
+    };
+    if (pageToken) {
+      params.pageToken = pageToken;
+    }
+
+    const response = await axios.get(url, { params, timeout: 10000 });
+    const items = response.data.items || [];
+    if (items.length === 0) break;
+
+    const videoIds = items.map(item => item.snippet?.resourceId?.videoId).filter(Boolean);
+    if (videoIds.length === 0) break;
+
+    const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
+    trackQuota(1);
+
+    const videoDetailsMap = new Map();
+    for (const videoItem of (videosDetailsRes.data.items || [])) {
+      videoDetailsMap.set(videoItem.id, videoItem);
+    }
+
+    for (const item of items) {
+      if (processedCount >= maxVideosLimit) {
+        break;
+      }
+
+      const snippet = item.snippet;
+      if (!snippet || !snippet.resourceId || !snippet.resourceId.videoId) continue;
+
+      const youtubeVideoId = snippet.resourceId.videoId;
+      const videoData = videoDetailsMap.get(youtubeVideoId);
+
+      const title = videoData?.snippet?.title || snippet.title || 'Untitled Video';
+      const thumbnailUrl =
+        videoData?.snippet?.thumbnails?.high?.url ||
+        snippet.thumbnails?.high?.url ||
+        snippet.thumbnails?.medium?.url ||
+        snippet.thumbnails?.default?.url ||
+        `https://i.ytimg.com/vi/${youtubeVideoId}/hqdefault.jpg`;
+      const publishedAt = videoData?.snippet?.publishedAt ? new Date(videoData.snippet.publishedAt) : (snippet.publishedAt ? new Date(snippet.publishedAt) : new Date());
+      const liveBroadcastContent = videoData?.snippet?.liveBroadcastContent || 'none';
+      const scheduledStartTime = videoData?.liveStreamingDetails?.scheduledStartTime ? new Date(videoData.liveStreamingDetails.scheduledStartTime) : null;
+
+      if (lastSyncedAtTime && publishedAt.getTime() <= lastSyncedAtTime) {
+        reachedAlreadySynced = true;
+        break;
+      }
+
+      let isShort = forcedIsShort;
+      let durationStr = videoData?.contentDetails?.duration || '';
+      let totalSeconds = 0;
+      let viewCount = videoData?.statistics?.viewCount ? parseInt(videoData.statistics.viewCount, 10) : 0;
+
+      if (durationStr) {
+        try {
+          const durationObj = parse(durationStr);
+          totalSeconds = (durationObj.hours || 0) * 3600 + (durationObj.minutes || 0) * 60 + (durationObj.seconds || 0);
+        } catch (e) {
+          logger.warn(`Could not parse duration for video ${youtubeVideoId} in fallback: ${e.message}`);
+        }
+      }
+
+      if (isShort === null) {
+        processedCount++;
+        isShort = totalSeconds > 0 && totalSeconds <= 180;
+      }
+
+      if (!isShort) {
+        continue;
+      }
+
+      const [video, created] = await ChannelVideo.findOrCreate({
+        where: { youtubeVideoId },
+        defaults: {
+          channelId: channel.id,
+          title,
+          thumbnailUrl,
+          publishedAt,
+          isAvailable: true,
+          liveBroadcastContent,
+          scheduledStartTime,
+          isShort,
+          durationStr,
+          totalSeconds,
+          viewCount,
+        },
+      });
+
+      if (!created) {
+        await video.update({
+          title,
+          thumbnailUrl,
+          publishedAt,
+          isAvailable: true,
+          liveBroadcastContent,
+          scheduledStartTime,
+          isShort,
+          durationStr,
+          totalSeconds,
+          viewCount,
+        });
+      } else {
+        newVideosCount++;
+      }
+    }
+
+    pageToken = response.data.nextPageToken;
+  } while (pageToken && !reachedAlreadySynced && processedCount < maxVideosLimit);
+
+  return newVideosCount;
 }
 
 /**
@@ -273,7 +474,7 @@ async function syncAllActiveChannels() {
     for (const channel of activeChannels) {
       totalChecked++;
       try {
-        const added = await syncChannel(channel);
+        const added = await syncChannel(channel, { skipAlerts: true });
         totalNewVideos += added;
       } catch (err) {
         logger.error(`Failed to sync channel ${channel.name} (ID: ${channel.id}): ${err.message}`);
@@ -288,7 +489,6 @@ async function syncAllActiveChannels() {
 
 /**
  * Priority 1: Check health of all stored videos in batches of 50.
- * Marks isAvailable = false if video is deleted/private/unavailable.
  */
 async function checkVideoHealth() {
   const apiKey = process.env.YOUTUBE_API_KEY;
@@ -333,7 +533,7 @@ async function checkVideoHealth() {
 
         for (const v of batch) {
           const isPublic = returnedMap.get(v.youtubeVideoId);
-          const available = isPublic === true; // true only if returned and public
+          const available = isPublic === true;
           if (v.isAvailable !== available) {
             await ChannelVideo.update({ isAvailable: available }, { where: { id: v.id } });
           }
@@ -348,11 +548,6 @@ async function checkVideoHealth() {
   }
 }
 
-/**
- * Cheap status-check helper: use videos.list(id=X, part=snippet,liveStreamingDetails) (1 unit/call)
- * @param {string} videoId 
- * @returns {object|null} video details status
- */
 async function getVideoLiveStatus(videoId) {
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey || !videoId) return null;
@@ -383,7 +578,7 @@ async function getVideoLiveStatus(videoId) {
         snippet.thumbnails?.medium?.url ||
         snippet.thumbnails?.default?.url ||
         `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-      liveBroadcastContent: snippet.liveBroadcastContent || 'none', // 'none', 'upcoming', 'live'
+      liveBroadcastContent: snippet.liveBroadcastContent || 'none',
       scheduledStartTime: liveDetails.scheduledStartTime ? new Date(liveDetails.scheduledStartTime) : null,
       actualStartTime: liveDetails.actualStartTime ? new Date(liveDetails.actualStartTime) : null,
       actualEndTime: liveDetails.actualEndTime ? new Date(liveDetails.actualEndTime) : null,
@@ -394,56 +589,15 @@ async function getVideoLiveStatus(videoId) {
   }
 }
 
-/**
- * Trigger point for upcoming -> live transition (Part 3 attaches here)
- */
 function triggerLiveTransition(transitionData) {
-  logger.info(`[LIVE TRANSITION STUB] Channel "${transitionData.channel.name}" went LIVE! Video ID: ${transitionData.videoId}, Scheduled Start: ${transitionData.scheduledStartTime}, Live Started At: ${transitionData.liveStartedAt}`);
+  logger.info(`[LIVE TRANSITION STUB] Channel "${transitionData.channel.name}" went LIVE! Video ID: ${transitionData.videoId}`);
   liveEmitter.emit('upcomingToLive', transitionData);
 }
 
-// Part 3: Notification Listener on liveEmitter with deduplication (lastNotifiedVideoId) and Titan Broadcast call
-liveEmitter.on('upcomingToLive', async ({ channel, videoId, scheduledStartTime, liveStartedAt }) => {
-  try {
-    const freshChannel = await Channel.findByPk(channel.id);
-    if (!freshChannel) return;
-
-    if (freshChannel.lastNotifiedVideoId === videoId) {
-      logger.info(`[Live Notification] Already notified for video ${videoId} on channel ${channel.name}. Skipping.`);
-      return;
-    }
-
-    freshChannel.lastNotifiedVideoId = videoId;
-    await freshChannel.save();
-
-    const { broadcastNotification } = require('../controllers/notificationController');
-    const result = await broadcastNotification({
-      title: "RCM Gurukul is LIVE now",
-      body: "TC Sir's session has started — tap to join",
-      actionUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      dataPayload: {
-        videoId: videoId,
-        channelId: channel.id,
-        type: 'live_stream',
-        url: `https://www.youtube.com/watch?v=${videoId}`
-      }
-    });
-
-    logger.info(`✅ [Live Notification Result] Success: ${result.successCount}, Failures: ${result.failureCount} for video ${videoId}`);
-  } catch (err) {
-    logger.error(`🔥 Error in upcomingToLive listener notification: ${err.message}`);
-  }
-});
-
-/**
- * Phase A (Discovery): Check uploads playlist for a new video with liveBroadcastContent === 'upcoming'
- * Avoids search.list (1 unit for playlistItems.list + 1 unit for batch videos.list)
- */
 async function runPhaseADiscovery(channel) {
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey || !channel.uploadsPlaylistId) return;
 
-  // Throttle Phase A check if checked recently (e.g. within last 2 hours)
   const now = Date.now();
   if (channel.lastLiveCheckAt && (now - new Date(channel.lastLiveCheckAt).getTime() < 2 * 3600 * 1000)) {
     return;
@@ -505,33 +659,24 @@ async function runPhaseADiscovery(channel) {
       channel.discoveredAt = new Date();
       channel.lastLiveCheckAt = new Date();
       await channel.save();
-      logger.info(`[Phase A Discovery] Upcoming stream detected for channel "${channel.name}": videoId=${foundUpcoming.videoId}, scheduledTime=${foundUpcoming.scheduledStartTime}`);
     } else {
-      // If no upcoming video is found, clear any stale upcoming data
       if (channel.upcomingVideoId || channel.scheduledStartTime) {
-        logger.info(`[Phase A Discovery] No new upcoming stream found for channel "${channel.name}". Clearing stale upcoming video data.`);
         channel.upcomingVideoId = null;
         channel.scheduledStartTime = null;
         channel.discoveredAt = null;
       }
       channel.lastLiveCheckAt = new Date();
       await channel.save();
-      logger.info(`[Phase A Discovery] No upcoming stream found in recent uploads for channel "${channel.name}".`);
     }
   } catch (err) {
     logger.error(`Error in Phase A discovery for channel ${channel.name}: ${err.message}`);
   }
 }
 
-/**
- * Phase B (Pre-live Watch) & Phase C (Live Tracking) handler per channel
- */
 async function processLiveChannelState(channel) {
   const now = new Date();
 
-  // 1. Phase C: Live Tracking (if currently live)
   if (channel.isCurrentlyLive && channel.liveVideoId) {
-    // Poll every 2-3 minutes
     if (channel.lastLiveCheckAt && (now.getTime() - new Date(channel.lastLiveCheckAt).getTime() < 2 * 60 * 1000)) {
       return;
     }
@@ -541,11 +686,7 @@ async function processLiveChannelState(channel) {
 
     channel.lastLiveCheckAt = now;
 
-    // Detect end: flip to 'none' or actualEndTime present
     if (status.liveBroadcastContent === 'none' || status.actualEndTime) {
-      logger.info(`[Phase C Live Tracking] Stream ENDED for channel "${channel.name}", videoId=${channel.liveVideoId}`);
-      
-      // Clear live state so Phase A can discover next stream fresh
       channel.isCurrentlyLive = false;
       channel.liveVideoId = null;
       channel.liveStartedAt = null;
@@ -554,7 +695,6 @@ async function processLiveChannelState(channel) {
       channel.discoveredAt = null;
       await channel.save();
 
-      // Trigger metadata refresh on finalized VOD video
       try {
         await ChannelVideo.findOrCreate({
           where: { youtubeVideoId: status.videoId },
@@ -567,62 +707,27 @@ async function processLiveChannelState(channel) {
             isShort: false,
           },
         });
-        await ChannelVideo.update(
-          { title: status.title, thumbnailUrl: status.thumbnailUrl, isAvailable: true },
-          { where: { youtubeVideoId: status.videoId } }
-        );
-        logger.info(`[Phase C Live Tracking] Metadata refreshed for finalized VOD video ${status.videoId}`);
       } catch (vodErr) {
         logger.error(`Error refreshing VOD metadata for ${status.videoId}: ${vodErr.message}`);
       }
     } else {
-      logger.info(`[Phase C Live Tracking] Stream still live for channel "${channel.name}", videoId=${channel.liveVideoId}`);
       await channel.save();
     }
     return;
   }
 
-  // 2. Phase B: Pre-live Watch (if upcomingVideoId is known)
   if (channel.upcomingVideoId) {
     let scheduledTime = channel.scheduledStartTime ? new Date(channel.scheduledStartTime) : null;
-
-    if (!scheduledTime && channel.lastKnownLiveStartTime) {
-      const lastKnown = new Date(channel.lastKnownLiveStartTime);
-      const todayAtLastKnown = new Date();
-      todayAtLastKnown.setHours(lastKnown.getHours(), lastKnown.getMinutes(), 0, 0);
-      if (now.getTime() - todayAtLastKnown.getTime() > 2 * 3600 * 1000) {
-        todayAtLastKnown.setDate(todayAtLastKnown.getDate() + 1);
-      }
-      scheduledTime = todayAtLastKnown;
-    }
-
     if (scheduledTime) {
       const diffMs = scheduledTime - now;
       const diffMins = diffMs / 60000;
-
-      // If more than 15 mins before scheduled time, wait
-      if (diffMins > 15) {
-        return;
-      }
-
-      // If not live by 45 mins past scheduled time, back off / give up for today
+      if (diffMins > 15) return;
       if (diffMins < -45) {
-        logger.info(`[Phase B Pre-live Watch] Upcoming stream ${channel.upcomingVideoId} missed / 45+ mins past scheduled time. Resetting for Phase A discovery.`);
         channel.upcomingVideoId = null;
         channel.scheduledStartTime = null;
         channel.discoveredAt = null;
         channel.lastLiveCheckAt = now;
         await channel.save();
-        return;
-      }
-
-      // Within 15 min before to 45 min after scheduled time, poll every 1 minute
-      if (channel.lastLiveCheckAt && (now.getTime() - new Date(channel.lastLiveCheckAt).getTime() < 55 * 1000)) {
-        return;
-      }
-    } else {
-      // Fallback when no scheduledStartTime and no lastKnownLiveStartTime: poll every 5 minutes
-      if (channel.lastLiveCheckAt && (now.getTime() - new Date(channel.lastLiveCheckAt).getTime() < 5 * 60 * 1000)) {
         return;
       }
     }
@@ -632,41 +737,12 @@ async function processLiveChannelState(channel) {
 
     channel.lastLiveCheckAt = now;
 
-    // Watch for flip to 'live'
     if (status.liveBroadcastContent === 'live' || status.actualStartTime) {
-      logger.info(`[Phase B -> C Transition] STREAM GOING LIVE! Channel "${channel.name}", videoId=${channel.upcomingVideoId}`);
-
       channel.isCurrentlyLive = true;
       channel.liveVideoId = channel.upcomingVideoId;
       channel.liveStartedAt = status.actualStartTime || now;
       channel.lastNotifiedVideoId = channel.upcomingVideoId;
-      channel.lastKnownLiveStartTime = status.actualStartTime || now; // Store for future fallback
       await channel.save();
-
-      // Trigger upcoming -> live transition stub & event
-      // Part 3: Notification and Frontend Display Trigger
-      try {
-        if (channel.lastNotifiedVideoId !== channel.liveVideoId) {
-          const notificationController = require('../controllers/notificationController');
-          const notificationPayload = {
-            title: "RCM Gurukul is LIVE now",
-            body: `TC Sir's session has started — tap to join!`, // Customize as needed
-            actionUrl: `/channels/${channel.id}/videos?videoId=${channel.liveVideoId}`, // Deep link to the specific video
-            dataPayload: { // Custom data for frontend
-              channelId: channel.id,
-              videoId: channel.liveVideoId,
-              type: 'live_stream',
-            },
-          };
-
-          const { successCount, failureCount } = await notificationController.sendTitanBroadcast(null, null, notificationPayload, true);
-          logger.info(`[Phase B -> C Transition] Live notification sent. Success: ${successCount}, Failure: ${failureCount}`);
-          channel.lastNotifiedVideoId = channel.liveVideoId;
-          await channel.save(); // Save immediately after notifying
-        }
-      } catch (notifErr) {
-        logger.error(`Error sending live notification for channel ${channel.name}: ${notifErr.message}`);
-      }
 
       triggerLiveTransition({
         channel,
@@ -675,27 +751,19 @@ async function processLiveChannelState(channel) {
         liveStartedAt: channel.liveStartedAt,
       });
     } else {
-      logger.info(`[Phase B Pre-live Watch] Channel "${channel.name}" video ${channel.upcomingVideoId} checked. Status: ${status.liveBroadcastContent}. Scheduled: ${channel.scheduledStartTime || 'None (Fallback active)'}`);
       await channel.save();
     }
     return;
   }
 
-  // 3. Phase A: Discovery (if no upcoming video known)
   await runPhaseADiscovery(channel);
 }
 
-/**
- * Priority 4 / Live Detection: Check live and upcoming status across opt-in channels
- */
 async function checkLiveAndUpcomingStatus() {
   try {
     const optInChannels = await Channel.findAll({
       where: { isActive: true, checkLiveStatus: true },
     });
-
-    if (optInChannels.length === 0) return;
-
     for (const channel of optInChannels) {
       if (!channel.youtubeChannelId || !channel.uploadsPlaylistId) continue;
       await processLiveChannelState(channel);
@@ -708,64 +776,17 @@ async function checkLiveAndUpcomingStatus() {
 // Register cron jobs
 if (process.env.DISABLE_CRONS !== 'true') {
   try {
-    // Priority 3: Hourly sync for new videos
-    cron.schedule('0 * * * *', () => {
-      syncAllActiveChannels();
-    });
-    logger.info('YouTube channel sync cron job scheduled successfully (hourly - Priority 3).');
-
-    // Channel metadata & statistics refresh every 6 hours
-    cron.schedule('0 */6 * * *', () => {
-      refreshMetadataForAllChannels();
-    });
-    logger.info('YouTube channel metadata refresh cron job scheduled successfully (every 6 hours).');
-
-    // Priority 1: Daily video health check (e.g. 3:00 AM)
-    cron.schedule('0 3 * * *', () => {
-      checkVideoHealth();
-    });
-    logger.info('YouTube video health check cron job scheduled successfully (daily at 03:00).');
-
-    // Priority 4 / Live Detection: Run every 1 minute to support Phase A, B, and C polling intervals
-    cron.schedule('* * * * *', () => {
-      checkLiveAndUpcomingStatus();
-    });
-    logger.info('YouTube live detection cron job scheduled successfully (every 1 minute for Phase A/B/C polling).');
-
-    // TC Sir Gurukul Morning Live Notification (Targeted Cron running every minute between 6:15 AM - 7:00 AM IST)
-    cron.schedule('*/1 6-7 * * *', async () => {
-      const now = new Date();
-      const istTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Calcutta' }));
-      const istHour = istTime.getHours();
-      const istMinute = istTime.getMinutes();
-
-      // Target window: 6:15 AM to 7:00 AM IST
-      if (istHour === 6 && istMinute >= 15 && istMinute <= 59) {
-        try {
-          const rcmWorldChannel = await Channel.findOne({
-            where: {
-              isActive: true,
-            }
-          });
-
-          if (rcmWorldChannel) {
-            logger.info(`[Gurukul Morning Cron] Checking RCM World for live status at ${istHour}:${istMinute} IST...`);
-            await processLiveChannelState(rcmWorldChannel);
-          }
-        } catch (cronErr) {
-          logger.error(`Error in Gurukul Morning Live Cron: ${cronErr.message}`);
-        }
-      }
-    });
-    logger.info('TC Sir Gurukul Morning Live Notification cron scheduled successfully (6:15 AM - 7:00 AM IST window).');
+    cron.schedule('0 * * * *', () => { syncAllActiveChannels(); });
+    cron.schedule('0 */6 * * *', () => { refreshMetadataForAllChannels(); });
+    cron.schedule('0 3 * * *', () => { checkVideoHealth(); });
+    cron.schedule('* * * * *', () => { checkLiveAndUpcomingStatus(); });
   } catch (err) {
     logger.error(`Failed to schedule channel sync cron jobs: ${err.message}`);
   }
-} else {
-  logger.info('Cron jobs disabled via DISABLE_CRONS=true environment variable.');
 }
 
 module.exports = {
+  getPlaylistIds,
   syncChannel,
   syncAllActiveChannels,
   refreshChannelMetadata,

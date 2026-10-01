@@ -3,53 +3,60 @@ const asyncHandler = require('express-async-handler');
 const { Channel, ChannelVideo } = require('../models');
 const { syncChannel, refreshChannelMetadata } = require('../services/channelSyncService');
 const logger = require('../utils/logger');
+const { Op } = require('sequelize'); // Import Op for OR conditions
 
 /**
  * Helper to parse YouTube input into handle or channel ID
  */
 function parseYouTubeInput(input) {
-  if (!input || typeof input !== 'string') return { type: null, value: null };
+  if (!input || typeof input !== 'string') return { type: null, value: null, isShortsOnly: false };
   const trimmed = input.trim();
+  let isShortsOnly = false;
 
   // If starts with UC... (channel ID)
   if (trimmed.startsWith('UC') && trimmed.length === 24) {
-    return { type: 'id', value: trimmed };
+    return { type: 'id', value: trimmed, isShortsOnly: false };
   }
 
   // If handle like @RCMIndia
   if (trimmed.startsWith('@')) {
-    return { type: 'handle', value: trimmed.substring(1) };
+    return { type: 'handle', value: trimmed.substring(1), isShortsOnly: false };
   }
 
   // URL parsing
   try {
     const url = new URL(trimmed);
-    const pathname = url.pathname;
+    let pathname = url.pathname;
+
+    if (pathname.includes('/shorts')) {
+      isShortsOnly = true;
+      pathname = pathname.replace('/shorts', '').replace(/\/$/, ''); // Remove /shorts and trailing slash
+    }
 
     if (pathname.startsWith('/@')) {
       const handle = pathname.split('/')[1].substring(1);
-      return { type: 'handle', value: handle };
+      return { type: 'handle', value: handle, isShortsOnly };
     }
 
     if (pathname.startsWith('/channel/')) {
       const id = pathname.split('/')[2];
-      return { type: 'id', value: id };
+      return { type: 'id', value: id, isShortsOnly };
     }
 
     if (pathname.startsWith('/c/') || pathname.startsWith('/user/')) {
       // Custom name / user
       const name = pathname.split('/')[2];
-      return { type: 'handle', value: name };
+      return { type: 'handle', value: name, isShortsOnly };
     }
   } catch (e) {
     // Not a valid URL, treat as handle or search term if needed
     if (!trimmed.includes(' ')) {
       const handle = trimmed.startsWith('@') ? trimmed.substring(1) : trimmed;
-      return { type: 'handle', value: handle };
+      return { type: 'handle', value: handle, isShortsOnly: false };
     }
   }
 
-  return { type: 'handle', value: trimmed.startsWith('@') ? trimmed.substring(1) : trimmed };
+  return { type: 'handle', value: trimmed.startsWith('@') ? trimmed.substring(1) : trimmed, isShortsOnly: false };
 }
 
 /**
@@ -177,6 +184,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
         country,
         uploadsPlaylistId,
         itemCount, // Still include for existing frontend logic that might use it
+        isShortsOnly: parsed.isShortsOnly,
       },
     });
   } catch (err) {
@@ -190,12 +198,12 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
 });
 
 /**
- * @desc    Create Channel and trigger initial sync
+ * @desc    Create Channel and trigger initial sync (source: 'channel')
  * @route   POST /api/channels
  * @access  Admin
  */
 exports.createChannel = asyncHandler(async (req, res) => {
-  const { youtubeChannelId, handle, name, logoUrl, bannerUrl, description, subscriberCount, videoCount, viewCount, joinedDate, country, uploadsPlaylistId } = req.body;
+  const { youtubeChannelId, handle, name, logoUrl, bannerUrl, description, subscriberCount, videoCount, viewCount, joinedDate, country, uploadsPlaylistId, isShortsOnly = false } = req.body;
 
   if (!youtubeChannelId || !name || !uploadsPlaylistId) {
     return res.status(400).json({ success: false, message: 'Missing required channel parameters.' });
@@ -221,6 +229,8 @@ exports.createChannel = asyncHandler(async (req, res) => {
     country: country || null,
     uploadsPlaylistId,
     isActive: true,
+    source: isShortsOnly ? 'shorts-only' : 'channel',
+    isShortsOnly,
   });
 
   // Immediately trigger initial sync
@@ -237,6 +247,8 @@ exports.createChannel = asyncHandler(async (req, res) => {
   });
 });
 
+
+
 /**
  * @desc    Get active channels for public sidebar
  * @route   GET /api/channels
@@ -244,7 +256,11 @@ exports.createChannel = asyncHandler(async (req, res) => {
  */
 exports.getChannels = asyncHandler(async (req, res) => {
   const channels = await Channel.findAll({
-    where: { isActive: true, isShortsOnly: false },
+    where: { 
+      isActive: true, 
+      source: 'channel', 
+      [Op.or]: [{ isShortsOnly: false }, { isShortsOnly: null }] 
+    }, // Filter by source: 'channel' and exclude shorts-only channels
     order: [['isPinned', 'DESC'], ['name', 'ASC']],
   });
 
@@ -318,21 +334,12 @@ exports.getAdminChannels = asyncHandler(async (req, res) => {
       'lastLiveCheckAt',
       'lastNotifiedVideoId',
       'createdAt',
+      'source', // Include source in admin view
+      'isShortsOnly',
+      'shortsCount',
     ],
     order: [['createdAt', 'DESC']],
   });
-
-  // Note: videoCount is now a direct field on the Channel model
-  // No need to attach video counts dynamically here unless it's for ChannelVideo count specifically
-  // const channelsWithCounts = await Promise.all(
-  //   channels.map(async (ch) => {
-  //     const videoCount = await ChannelVideo.count({ where: { channelId: ch.id } });
-  //     return {
-  //       ...ch.toJSON(),
-  //       videoCount,
-  //     };
-  //   })
-  // );
 
   res.status(200).json({
     success: true,
@@ -347,23 +354,39 @@ exports.getAdminChannels = asyncHandler(async (req, res) => {
  * @access  Public
  */
 exports.getChannelVideos = asyncHandler(async (req, res) => {
-  const channelId = req.params.id;
+  const channelParam = req.params.id;
+  const parsedId = parseInt(channelParam, 10);
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 12;
   const offset = (page - 1) * limit;
 
-  const channel = await Channel.findByPk(channelId);
+  const channel = await Channel.findOne({
+    where: {
+      [Op.or]: [
+        ...(isNaN(parsedId) ? [] : [{ id: parsedId }]),
+        { youtubeChannelId: channelParam }
+      ]
+    }
+  });
   if (!channel) {
     return res.status(404).json({ success: false, message: 'Channel not found.' });
   }
+  const channelId = channel.id;
 
+  // For getChannelVideos(), filter strictly isShort: false (so shorts never show up on channel profile)
   const { count, rows: videos } = await ChannelVideo.findAndCountAll({
-    where: { channelId, isAvailable: true, isShort: false },
+    where: {
+      channelId,
+      isAvailable: true,
+      isShort: false,
+    },
     attributes: ['id', 'youtubeVideoId', 'title', 'thumbnailUrl', 'publishedAt', 'isAvailable', 'liveBroadcastContent', 'scheduledStartTime'],
     order: [['publishedAt', 'DESC']],
     limit,
     offset,
   });
+
+  // ... (rest of the getChannelVideos method)
 
   if (channelId == 2) { // RCM World Channel
     const nextGurukulTime = getNextGurukulSchedule();
@@ -372,7 +395,6 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
     let actualLiveVideo = null;
     let actualUpcomingVideo = null;
 
-    // Check if there's an actual live or upcoming video from YouTube
     for (const video of videos) {
       if (video.liveBroadcastContent === 'live') {
         actualLiveVideo = video;
@@ -380,7 +402,6 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
       }
       if (video.liveBroadcastContent === 'upcoming' && video.scheduledStartTime) {
         const scheduled = new Date(video.scheduledStartTime);
-        // Consider it an actual upcoming if within the next 24 hours of gurukul time
         if (scheduled.getTime() >= nextGurukulTime.getTime() - 24 * 60 * 60 * 1000 && scheduled.getTime() <= nextGurukulTime.getTime() + 60 * 60 * 1000) {
           actualUpcomingVideo = video;
           break;
@@ -390,40 +411,36 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
 
     let gurukulCard = null;
 
-    // If no actual live video exists, check for upcoming or create synthetic
     if (!actualLiveVideo) {
-      // Current time in IST
       const istOffset = 5.5 * 60 * 60 * 1000;
       const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
       const currentIstTime = new Date(utcTime + istOffset);
       
-      // Gurukul ends at 7:30 AM IST (1:00 UTC on the same day)
-      const gurukulEndTimeIST = new Date(Date.UTC(nextGurukulTime.getFullYear(), nextGurukulTime.getMonth(), nextGurukulTime.getDate(), 2, 0, 0)); // 2:00 UTC = 7:30 AM IST
+      const gurukulEndTimeIST = new Date(Date.UTC(nextGurukulTime.getFullYear(), nextGurukulTime.getMonth(), nextGurukulTime.getDate(), 2, 0, 0));
 
-      if (currentIstTime < gurukulEndTimeIST) { // Only show synthetic if before 7:30 AM IST of the gurukul day
+      if (currentIstTime < gurukulEndTimeIST) {
         gurukulCard = {
           id: `gurukul-upcoming-${nextGurukulTime.toISOString().split('T')[0]}`,
-          youtubeVideoId: '_Gurukul_Synthetic_Video_ID_', // Placeholder
+          youtubeVideoId: '_Gurukul_Synthetic_Video_ID_',
           title: `RCM World Gurukul: Daily Session with TC Sir`,
-          thumbnailUrl: 'https://yt3.ggpht.com/i8k5hB_C2h3_x2fN0R3-Z7-0-5-0-0-0-0/hqdefault.jpg', // Placeholder thumbnail
+          thumbnailUrl: 'https://yt3.ggpht.com/i8k5hB_C2h3_x2fN0R3-Z7-0-5-0-0-0-0/hqdefault.jpg',
           publishedAt: nextGurukulTime,
           isAvailable: true,
           liveBroadcastContent: 'upcoming',
           scheduledStartTime: nextGurukulTime,
-          isSynthetic: true, // Custom flag to identify synthetic card
+          isSynthetic: true,
         };
       }
     }
 
     let finalVideos = [...videos];
-    // If there's an actual live video, it takes top priority
     if (actualLiveVideo) {
       finalVideos = finalVideos.filter(v => v.id !== actualLiveVideo.id);
       finalVideos.unshift(actualLiveVideo);
-    } else if (actualUpcomingVideo) { // If no live, but actual upcoming exists, it takes priority
+    } else if (actualUpcomingVideo) {
       finalVideos = finalVideos.filter(v => v.id !== actualUpcomingVideo.id);
       finalVideos.unshift(actualUpcomingVideo);
-    } else if (gurukulCard) { // If neither, and synthetic card is generated, use it
+    } else if (gurukulCard) {
       finalVideos.unshift(gurukulCard);
     }
 
@@ -490,8 +507,6 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
         joinedDate: channel.joinedDate || channel.joined_date,
         joined_date: channel.joinedDate || channel.joined_date,
         country: channel.country,
-        // These fields are primarily for displaying the channel's overall live status, not individual videos
-        // Individual video cards will now use their own liveBroadcastContent and scheduledStartTime
         isCurrentlyLive: channel.isCurrentlyLive,
         upcomingVideoId: channel.upcomingVideoId,
         scheduledStartTime: channel.scheduledStartTime,
@@ -597,3 +612,114 @@ exports.toggleLiveStatus = asyncHandler(async (req, res) => {
     data: channel,
   });
 });
+
+/**
+ * @desc    Create Shorts-Only Channel and trigger initial sync
+ * @route   POST /api/channels/shorts-only
+ * @access  Admin
+ */
+exports.createShortsOnlyChannel = asyncHandler(async (req, res) => {
+  const { youtubeChannelId, handle, name, logoUrl, bannerUrl, description, subscriberCount, videoCount, viewCount, joinedDate, country, uploadsPlaylistId } = req.body;
+
+  if (!youtubeChannelId || !name || !uploadsPlaylistId) {
+    return res.status(400).json({ success: false, message: 'Missing required channel parameters.' });
+  }
+
+  let channel = await Channel.findOne({ where: { youtubeChannelId } });
+  if (channel) {
+    return res.status(400).json({ success: false, message: 'Channel already added to database.' });
+  }
+
+  channel = await Channel.create({
+    youtubeChannelId,
+    handle: handle || '',
+    name,
+    logoUrl: logoUrl || '',
+    bannerUrl: bannerUrl || '',
+    description: description || '',
+    subscriberCount: subscriberCount || 0,
+    videoCount: videoCount || 0,
+    viewCount: viewCount || 0,
+    joinedDate: joinedDate || null,
+    country: country || null,
+    uploadsPlaylistId,
+    isActive: true,
+    source: 'shorts-only',
+    isShortsOnly: true,
+  });
+
+  try {
+    await syncChannel(channel);
+  } catch (err) {
+    logger.warn(`Initial sync failed for newly added shorts-only channel ${name}: ${err.message}`);
+  }
+
+  res.status(201).json({
+    success: true,
+    message: 'Shorts-only channel added successfully and initial sync triggered.',
+    data: channel,
+  });
+});
+
+/**
+ * @desc    Get single channel details by id or youtubeChannelId
+ * @route   GET /api/channels/:id
+ * @access  Public
+ */
+exports.getChannelById = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  console.log("[getChannelById] Request received for param:", id);
+  const whereClause = !isNaN(id) 
+    ? { [Op.or]: [{ id: parseInt(id, 10) }, { youtubeChannelId: id }] }
+    : { youtubeChannelId: id };
+
+  const channel = await Channel.findOne({ where: whereClause });
+  if (!channel) {
+    console.warn("[getChannelById] Channel not found in DB for:", id);
+    return res.status(404).json({ success: false, message: "Channel not found" });
+  }
+  return res.status(200).json({ success: true, channel, data: channel });
+});
+
+/**
+ * @desc    Sync channel shorts on demand
+ * @route   POST /api/channels/:id/sync-shorts
+ * @access  Admin
+ */
+exports.syncChannelShortsNow = asyncHandler(async (req, res) => {
+  const channelParam = req.params.id;
+  const parsedId = parseInt(channelParam, 10);
+
+  const channel = await Channel.findOne({
+    where: {
+      [Op.or]: [
+        ...(isNaN(parsedId) ? [] : [{ id: parsedId }]),
+        { youtubeChannelId: channelParam }
+      ]
+    }
+  });
+
+  if (!channel) {
+    return res.status(404).json({ success: false, message: 'Channel not found.' });
+  }
+
+  try {
+    const newVideosCount = await syncChannel(channel);
+    const shortsCount = await ChannelVideo.count({ where: { channelId: channel.id, isShort: true } });
+    await Channel.update({ shortsCount }, { where: { id: channel.id } });
+
+    res.status(200).json({
+      success: true,
+      count: newVideosCount,
+      shortsCount,
+      message: "Channel shorts synced successfully",
+    });
+  } catch (err) {
+    logger.error(`Failed to sync shorts for channel ${channel.name}: ${err.message}`);
+    res.status(500).json({
+      success: false,
+      message: `Failed to sync channel shorts: ${err.message}`,
+    });
+  }
+});
+

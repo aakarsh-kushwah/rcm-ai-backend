@@ -8,7 +8,7 @@ const express = require("express");
 const router = express.Router();
 const rateLimit = require("express-rate-limit");
 
-const { adminGetShorts, adminToggleChannelShortsOnly, adminToggleVideoShort, adminDeleteShort } = require("../controllers/shortsController");
+const { adminGetShorts, adminToggleChannelShortsOnly, adminToggleVideoShort, adminDeleteShort, adminImportSingleShort } = require("../controllers/shortsController");
 
 // ✅ Import Controller Functions
 const {
@@ -17,10 +17,12 @@ const {
   deleteUser,
   updateUserData,
   pushNotificationToAll,
-  approveAdmin, // ✨ New Feature
-  getMetricsOverview, // New Metrics Overview Endpoint
-  getPaymentLogs // New Payment Logs Endpoint
+  approveAdmin,
+  getMetricsOverview,
+  getPaymentLogs,
+  // createShortsOnlyChannel removed from adminController import
 } = require("../controllers/adminController");
+const { createChannel, createShortsOnlyChannel } = require("../controllers/channelController");
 
 // ✅ Import Middleware
 const { isAuthenticated, isActiveUser, isAdmin, restrictTo } = require("../middleware/authMiddleware");
@@ -113,8 +115,12 @@ router.get("/payments", restrictTo("SUPER_ADMIN", "ADMIN"), getPaymentLogs);
 
 // 3. Shorts Management (Admin Isolation)
 router.get("/shorts", restrictTo("SUPER_ADMIN", "ADMIN"), adminGetShorts);
+router.post("/shorts/import-single", restrictTo("SUPER_ADMIN", "ADMIN"), adminImportSingleShort);
 router.patch("/channels/:id/toggle-shorts-only", restrictTo("SUPER_ADMIN", "ADMIN"), adminToggleChannelShortsOnly);
 router.patch("/videos/:id/toggle-short", restrictTo("SUPER_ADMIN", "ADMIN"), adminToggleVideoShort);
 router.delete("/shorts/:id", restrictTo("SUPER_ADMIN", "ADMIN"), adminDeleteShort);
+
+// 4. Create Shorts-Only Channel
+router.post("/channels/shorts-only", restrictTo("SUPER_ADMIN", "ADMIN"), createShortsOnlyChannel);
 
 module.exports = router;

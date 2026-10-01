@@ -7,6 +7,31 @@
 const admin = require("firebase-admin");
 require("dotenv").config();
 
+const formatPrivateKey = (key) => {
+    if (!key) return undefined;
+    let cleaned = key.trim();
+    
+    // Remove wrapping single or double quotes
+    if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || 
+        (cleaned.startsWith('\'') && cleaned.endsWith('\''))) {
+      cleaned = cleaned.slice(1, -1);
+    }
+    
+    // Remove carriage returns (\r) and convert literal '\n' string to actual newline characters
+    cleaned = cleaned.replace(/\r/g, '').replace(/\\n/g, '\n').trim();
+    
+    // Ensure header and footer are clean
+    if (!cleaned.startsWith('-----BEGIN PRIVATE KEY-----')) {
+      cleaned = `-----BEGIN PRIVATE KEY-----\n${cleaned}`;
+    }
+    if (!cleaned.endsWith('-----END PRIVATE KEY-----')) {
+      cleaned = `${cleaned}\n-----END PRIVATE KEY-----`;
+    }
+    
+    return cleaned;
+};
+
+
 if (!admin.apps.length) {
     try {
         console.log("🔌 [TITAN FIREBASE]: Connecting...");
@@ -28,8 +53,7 @@ if (!admin.apps.length) {
         if (!serviceAccount && process.env.FIREBASE_PROJECT_ID) {
             let privateKeyFromEnv = process.env.FIREBASE_PRIVATE_KEY;
             if (privateKeyFromEnv) {
-                // Replace escaped newlines if they exist and trim
-                privateKeyFromEnv = privateKeyFromEnv.replace(/\\n/g, '\n').trim();
+                privateKeyFromEnv = formatPrivateKey(privateKeyFromEnv);
             }
 
             serviceAccount = {
@@ -41,7 +65,7 @@ if (!admin.apps.length) {
 
         // If serviceAccount was loaded from JSON string, ensure private_key inside it is also processed
         if (serviceAccount && serviceAccount.private_key && typeof serviceAccount.private_key === 'string') {
-            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n').trim();
+            serviceAccount.private_key = formatPrivateKey(serviceAccount.private_key);
         }
 
         // Final Check
@@ -59,7 +83,7 @@ if (!admin.apps.length) {
         console.log("✅ [TITAN FIREBASE]: System Online.");
 
     } catch (error) {
-        console.error("❌ [TITAN FIREBASE INIT FAILED]:", error.message);
+        console.warn("❌ [TITAN FIREBASE INIT FAILED]:", error.message);
         // Hum yahan process.exit() nahi karenge taaki server baaki kaam karta rahe.
     }
 }

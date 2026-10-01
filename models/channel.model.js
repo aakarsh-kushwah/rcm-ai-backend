@@ -152,9 +152,15 @@ module.exports = (sequelize) => {
         type: DataTypes.STRING(10),
         allowNull: true,
       },
+      source: {
+        type: DataTypes.ENUM('channel', 'shorts-only'),
+        allowNull: false,
+        defaultValue: 'channel'
+      },
       isShortsOnly: {
         type: DataTypes.BOOLEAN,
         defaultValue: false,
+        allowNull: false,
         field: 'is_shorts_only',
       },
       shortsCount: {

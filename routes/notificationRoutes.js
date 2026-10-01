@@ -10,25 +10,10 @@ const { isAuthenticated } = require('../middleware/authMiddleware');
 const rateLimit = require('express-rate-limit');
 const asyncHandler = require('express-async-handler');
 
-// ✅ Safe Redis Loader
-let redisStore;
-let redisClient;
-try {
-    const { connection } = require('../config/redis');
-    const RedisStore = require('rate-limit-redis').default;
-    redisClient = connection;
-    redisStore = new RedisStore({
-        sendCommand: (...args) => connection.call(...args),
-    });
-} catch (e) {
-    console.warn("⚠️ [ROUTE WARNING]: Redis not found for Rate Limiting. Using Memory Fallback.");
-}
-
 // ============================================================
 // 🛡️ SECURITY: TITAN SYNC LIMITER
 // ============================================================
 const syncLimiter = rateLimit({
-    store: redisStore || undefined, // Fallback to MemoryStore if Redis fails
     windowMs: 60 * 60 * 1000, // 1 Hour
     max: 20,
     message: { 

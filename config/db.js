@@ -1,12 +1,11 @@
 /**
  * @file src/config/db.js
- * @description Titan Hyper-Scale DB: Optimized for Oracle 24GB & TiDB Cloud
+ * @description Titan DB: Safe for Local Dev, Render (512MB), and Scalable for Oracle 24GB
  */
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { Sequelize } = require('sequelize');
 
-// Priority: Use DB_HOST from .env as TiDB Cloud address
 const DB_HOST = process.env.DB_HOST || 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com';
 const DB_USER = process.env.DB_USER;
 const DB_PASS = process.env.DB_PASSWORD;
@@ -21,8 +20,9 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
     dialect: 'mysql',
     
     pool: {
-        max: isProduction ? 50 : 10, // 24GB RAM can handle 50+ paths
-        min: 5,
+        // Render 512MB me 10 connections kafi hain. Oracle 24GB par shift karte waqt ise 50 kar sakte hain
+        max: isProduction ? 10 : 5, 
+        min: 0, // Idle connections ko close hone dein taaki memory free rahe
         acquire: 60000, 
         idle: 10000, 
     },
@@ -37,16 +37,17 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
         connectTimeout: 60000,
     },
 
-    logging: console.log, // Log all SQL queries
+    // 💥 SABSE BADA FIX: SQL logging ko false karein taaki terminal buffer leak band ho
+    logging: false, 
 
-    benchmark: true,      
+    benchmark: false,      
     timezone: '+05:30',   
 
     define: {
         charset: 'utf8mb4',
         collate: 'utf8mb4_unicode_ci',
         timestamps: true,
-        underscored: false // Pro-Standard: created_at instead of createdAt
+        underscored: false
     },
 });
 
@@ -54,7 +55,7 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
 const connectDB = async () => {
     try {
         await sequelize.authenticate();
-        console.log('✅ [TITAN-DB] Hyper-Scale Connection Established.');
+        console.log('✅ [TITAN-DB] Connection Established Successfully.');
     } catch (err) {
         console.error('❌ [TITAN-DB] Connection Failed:', err.message);
         process.exit(1);
