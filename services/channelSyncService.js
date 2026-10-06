@@ -1,755 +1,692 @@
+/**
+ * channelSyncService.js  (production-hardened & foolproof)
+ *
+ * What this service does
+ *  1. Syncs a channel's videos from YouTube (Shorts + long videos) into ChannelVideo.
+ *  2. Keeps channel metadata (name, logo, subscribers ...) fresh.
+ *  3. Daily health check: marks deleted / private / non-embeddable videos as unavailable.
+ *  4. Live-stream detection (+ "LIVE now" push notification) for opt-in channels.
+ *
+ * Key design decisions
+ *  - Shorts are taken from YouTube's own Shorts playlist (UUSH...) and long videos from UULF...
+ *    If UUSH is empty or missing, it automatically falls back to uploads (UU...) with duration filtering (<= 180s).
+ *  - Existing rows keep their isShort value (admin toggles are never overwritten by a sync).
+ *  - Incremental sync: stops at the first already-synced video (24h safety margin, upserts are idempotent).
+ *  - DB writes are batched (1 SELECT + 1 bulk INSERT per page, no per-video findOrCreate).
+ *  - Per-channel / per-job error isolation + overlap guards, so one bad channel never stops the rest.
+ *  - Crons run only on PM2 instance 0 (or when NODE_APP_INSTANCE is not set) and never if DISABLE_CRONS=true.
+ */
+
 const axios = require('axios');
 const cron = require('node-cron');
 const EventEmitter = require('events');
+const { Op } = require('sequelize');
 const { Channel, ChannelVideo } = require('../models');
 const { parse } = require('iso8601-duration');
 
+/* ------------------------------------------------------------------ */
+/* Logger                                                             */
+/* ------------------------------------------------------------------ */
 let logger;
 try {
   logger = require('../utils/logger');
 } catch (e) {
-  logger = {
-    info: console.log,
-    warn: console.warn,
-    error: console.error,
-    debug: console.log
-  };
+  logger = console;
+}
+const log = {
+  info: (m) => logger.info(String(m)),
+  warn: (m) => logger.warn(String(m)),
+  error: (m) => logger.error(String(m)),
+};
+
+let sendNewVideoAlert = null;
+try {
+  ({ sendNewVideoAlert } = require('../utils/emailService'));
+} catch (e) {
+  log.warn('emailService not available - new video alerts disabled.');
 }
 
-// ------------------------------------------------------------------
-// Email alerts & notification triggers completely removed & neutralized
-// to stop rate-limiting / login attempt / Gmail 454 errors.
-// ------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* Config                                                             */
+/* ------------------------------------------------------------------ */
+const YT = 'https://www.googleapis.com/youtube/v3';
+const HTTP_TIMEOUT_MS = 10000;
+const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
 
-// Event emitter for live transitions
+const SHORT_MAX_SECONDS = 180;             // YouTube Shorts can be up to 3 minutes
+const RESYNC_MARGIN_MS = 24 * 3600 * 1000; // re-check last 24h on every incremental sync
+const MAX_ALERTS_PER_SYNC = 5;             // never email-storm
+const CRON_MAX_PAGES = 100;                // 100 x 50 = 5000 videos per playlist per run
+const UPDATE_CHUNK = 10;
+
+// live detection
+const LIVE_RECHECK_MS = 2 * 60 * 1000;
+const DISCOVERY_INTERVAL_MS = (parseInt(process.env.LIVE_DISCOVERY_MINUTES, 10) || 120) * 60 * 1000;
+const PRELIVE_WINDOW_MIN = 15;
+const MISSED_AFTER_MIN = 45;
+const PRELIVE_POLL_MS = 55 * 1000;
+const NO_SCHEDULE_POLL_MS = 5 * 60 * 1000;
+const MAX_LIVE_MS = 14 * 3600 * 1000;     // safety: a "live" flag older than this is force-closed
+
 class LiveEventEmitter extends EventEmitter {}
 const liveEmitter = new LiveEventEmitter();
 
-// Daily quota tracking for Priority 4 / Live Detection
+/* ------------------------------------------------------------------ */
+/* Helpers                                                            */
+/* ------------------------------------------------------------------ */
 let dailyQuotaSpent = 0;
 let lastQuotaLogDate = new Date().toDateString();
 
 function trackQuota(units) {
   const today = new Date().toDateString();
   if (today !== lastQuotaLogDate) {
-    logger.info(`[Quota Audit] Previous day total quota spent on live/upcoming checks: ${dailyQuotaSpent} units.`);
+    log.info(`[Quota Audit] Previous day total quota spent by sync/live jobs: ${dailyQuotaSpent} units.`);
     dailyQuotaSpent = 0;
     lastQuotaLogDate = today;
   }
   dailyQuotaSpent += units;
-  logger.info(`[Quota Audit] Spent ${units} units. Today's cumulative quota spent: ${dailyQuotaSpent} units.`);
 }
 
-/**
- * Helper to get playlist IDs from channelId ('UC' prefix sliced)
- */
+async function ytGet(resource, params) {
+  const { data } = await axios.get(`${YT}/${resource}`, {
+    params: { ...params, key: process.env.YOUTUBE_API_KEY },
+    timeout: HTTP_TIMEOUT_MS,
+  });
+  return data;
+}
+
 function getPlaylistIds(channelId) {
   const cleanId = channelId && channelId.startsWith('UC') ? channelId.slice(2) : channelId;
   return {
-    uploads: 'UU' + cleanId,
-    longOnly: 'UULF' + cleanId,
-    shortsOnly: 'UUSH' + cleanId,
+    uploads: `UU${cleanId}`,
+    longOnly: `UULF${cleanId}`,
+    shortsOnly: `UUSH${cleanId}`,
   };
 }
 
-/**
- * Refresh channel metadata & statistics from YouTube Data API v3
- * @param {object} channel - Sequelize Channel instance
- */
-async function refreshChannelMetadata(channel) {
-  const apiKey = process.env.YOUTUBE_API_KEY;
-  if (!apiKey || !channel.youtubeChannelId) return;
+function pickThumb(thumbs) {
+  if (!thumbs) return null;
+  return (thumbs.high && thumbs.high.url) || (thumbs.medium && thumbs.medium.url) || (thumbs.default && thumbs.default.url) || null;
+}
 
+function durationSeconds(iso) {
+  if (!iso) return 0;
   try {
-    const response = await axios.get(`https://www.googleapis.com/youtube/v3/channels`, {
-      params: {
-        part: 'snippet,statistics,brandingSettings,contentDetails',
-        id: channel.youtubeChannelId,
-        key: apiKey,
-      },
-      timeout: 10000,
-    });
-    trackQuota(1);
-
-    const items = response.data.items || [];
-    if (items.length === 0) return;
-
-    const chData = items[0];
-    const snippet = chData.snippet || {};
-    const statistics = chData.statistics || {};
-    const branding = chData.brandingSettings || {};
-    const contentDetails = chData.contentDetails || {};
-
-    channel.name = snippet.title || channel.name;
-    channel.handle = snippet.customUrl || channel.handle;
-    channel.logoUrl = snippet.thumbnails?.high?.url || snippet.thumbnails?.medium?.url || snippet.thumbnails?.default?.url || channel.logoUrl;
-    channel.description = snippet.description || channel.description;
-    channel.joinedDate = snippet.publishedAt ? new Date(snippet.publishedAt) : channel.joinedDate;
-    channel.country = snippet.country || channel.country;
-    channel.subscriberCount = statistics.subscriberCount ? parseInt(statistics.subscriberCount, 10) : channel.subscriberCount;
-    channel.videoCount = statistics.videoCount ? parseInt(statistics.videoCount, 10) : channel.videoCount;
-    channel.viewCount = statistics.viewCount ? parseInt(statistics.viewCount, 10) : channel.viewCount;
-    channel.bannerUrl = branding.image?.bannerExternalUrl || channel.bannerUrl;
-
-    if (!channel.uploadsPlaylistId && contentDetails.relatedPlaylists?.uploads) {
-      channel.uploadsPlaylistId = contentDetails.relatedPlaylists.uploads;
-    }
-
-    await channel.save();
-    logger.info(`[Channel Metadata Refresh] Successfully updated stats & metadata for channel "${channel.name}"`);
-  } catch (err) {
-    logger.error(`Error refreshing metadata for channel ${channel.name}: ${err.message}`);
+    const d = parse(iso);
+    return (d.days || 0) * 86400 + (d.hours || 0) * 3600 + (d.minutes || 0) * 60 + (d.seconds || 0);
+  } catch (e) {
+    return 0;
   }
 }
 
-/**
- * Refresh metadata & statistics for all active channels
- */
-async function refreshMetadataForAllChannels() {
-  logger.info('Starting scheduled metadata & statistics refresh for all active YouTube channels...');
+function isNotFound(err) {
+  return Boolean(err && err.response && err.response.status === 404);
+}
+
+function isQuotaOrAuthError(err) {
+  const s = err && err.response && err.response.status;
+  return s === 403 || s === 429;
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Channel metadata                                                   */
+/* ------------------------------------------------------------------ */
+async function refreshChannelMetadata(channel, { save = true } = {}) {
+  if (!process.env.YOUTUBE_API_KEY || !channel.youtubeChannelId) return;
+
   try {
-    const activeChannels = await Channel.findAll({ where: { isActive: true } });
-    for (const channel of activeChannels) {
+    const data = await ytGet('channels', {
+      part: 'snippet,statistics,brandingSettings,contentDetails',
+      id: channel.youtubeChannelId,
+    });
+    trackQuota(1);
+
+    const chData = (data.items || [])[0];
+    if (!chData) return;
+
+    const sn = chData.snippet || {};
+    const st = chData.statistics || {};
+    const br = chData.brandingSettings || {};
+    const cd = chData.contentDetails || {};
+
+    channel.name = sn.title || channel.name;
+    channel.handle = sn.customUrl || channel.handle;
+    channel.logoUrl = pickThumb(sn.thumbnails) || channel.logoUrl;
+    channel.description = sn.description || channel.description;
+    channel.joinedDate = sn.publishedAt ? new Date(sn.publishedAt) : channel.joinedDate;
+    channel.country = sn.country || channel.country;
+    channel.subscriberCount = st.subscriberCount ? parseInt(st.subscriberCount, 10) : channel.subscriberCount;
+    channel.videoCount = st.videoCount ? parseInt(st.videoCount, 10) : channel.videoCount;
+    channel.viewCount = st.viewCount ? parseInt(st.viewCount, 10) : channel.viewCount;
+    channel.bannerUrl = (br.image && br.image.bannerExternalUrl) || channel.bannerUrl;
+    if (!channel.uploadsPlaylistId && cd.relatedPlaylists && cd.relatedPlaylists.uploads) {
+      channel.uploadsPlaylistId = cd.relatedPlaylists.uploads;
+    }
+
+    if (save) await channel.save();
+  } catch (err) {
+    log.error(`Error refreshing metadata for channel ${channel.name}: ${err.message}`);
+  }
+}
+
+let metadataRunning = false;
+async function refreshMetadataForAllChannels() {
+  if (metadataRunning) return;
+  metadataRunning = true;
+  try {
+    const channels = await Channel.findAll({ where: { isActive: true } });
+    for (const channel of channels) {
       await refreshChannelMetadata(channel);
     }
-    logger.info('Channel metadata & statistics refresh completed.');
+    log.info(`Channel metadata refresh completed (${channels.length} channels).`);
   } catch (err) {
-    logger.error(`Error in refreshMetadataForAllChannels: ${err.message}`);
+    log.error(`Error in refreshMetadataForAllChannels: ${err.message}`);
+  } finally {
+    metadataRunning = false;
   }
 }
 
-/**
- * Helper to fetch and process a specific playlist (UULF or UUSH or UU)
- */
-async function processPlaylistItems(channel, playlistId, isShortVal, apiKey, lastSyncedAtTime, maxPages = 0) {
+/* ------------------------------------------------------------------ */
+/* Video sync                                                         */
+/* ------------------------------------------------------------------ */
+
+function buildRow(channel, plSnippet, v, mode) {
+  const vs = v.snippet || {};
+  const live = vs.liveBroadcastContent || 'none';
+  const durationStr = (v.contentDetails && v.contentDetails.duration) || '';
+  const totalSeconds = durationSeconds(durationStr);
+
+  let isShort;
+  if (mode === 'short') isShort = true;
+  else if (mode === 'long') isShort = false;
+  else isShort = live === 'none' && totalSeconds > 0 && totalSeconds <= SHORT_MAX_SECONDS;
+
+  const privacy = v.status && v.status.privacyStatus;
+  const embeddable = v.status ? v.status.embeddable !== false : true;
+  const scheduled = v.liveStreamingDetails && v.liveStreamingDetails.scheduledStartTime;
+
+  return {
+    youtubeVideoId: v.id,
+    channelId: channel.id,
+    title: vs.title || (plSnippet && plSnippet.title) || 'Untitled Video',
+    thumbnailUrl: pickThumb(vs.thumbnails) || pickThumb(plSnippet && plSnippet.thumbnails) || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+    publishedAt: vs.publishedAt ? new Date(vs.publishedAt) : new Date(),
+    isAvailable: privacy ? privacy === 'public' && embeddable : true,
+    isShort,
+    durationStr,
+    totalSeconds,
+    viewCount: v.statistics && v.statistics.viewCount ? parseInt(v.statistics.viewCount, 10) : 0,
+    liveBroadcastContent: live,
+    scheduledStartTime: scheduled ? new Date(scheduled) : null,
+  };
+}
+
+async function persistRows(channel, rows, ctx) {
+  if (rows.length === 0) return;
+
+  const existing = await ChannelVideo.findAll({
+    where: { youtubeVideoId: { [Op.in]: rows.map((r) => r.youtubeVideoId) } },
+  });
+  const byYtId = new Map(existing.map((v) => [v.youtubeVideoId, v]));
+
+  const toCreate = [];
+  const toUpdate = [];
+  rows.forEach((row) => {
+    const ex = byYtId.get(row.youtubeVideoId);
+    if (ex) toUpdate.push([ex, row]);
+    else toCreate.push(row);
+  });
+
+  if (toCreate.length > 0) {
+    await ChannelVideo.bulkCreate(toCreate, { ignoreDuplicates: true });
+    ctx.newVideos += toCreate.length;
+    toCreate.forEach((r) => {
+      if (r.isShort) ctx.newShorts += 1;
+    });
+
+    if (!ctx.skipAlerts && ctx.lastSyncedAtTime > 0 && typeof sendNewVideoAlert === 'function') {
+      for (const r of toCreate) {
+        if (ctx.alertsSent >= MAX_ALERTS_PER_SYNC) break;
+        try {
+          await sendNewVideoAlert({ title: r.title, youtubeVideoId: r.youtubeVideoId, publishedAt: r.publishedAt }, channel.name);
+          ctx.alertsSent += 1;
+        } catch (e) {}
+      }
+    }
+  }
+
+  for (const part of chunk(toUpdate, UPDATE_CHUNK)) {
+    await Promise.all(
+      part.map(async ([video, row]) => {
+        video.set({
+          title: row.title,
+          thumbnailUrl: row.thumbnailUrl,
+          publishedAt: row.publishedAt,
+          isAvailable: row.isAvailable,
+          durationStr: row.durationStr,
+          totalSeconds: row.totalSeconds,
+          viewCount: row.viewCount,
+          liveBroadcastContent: row.liveBroadcastContent,
+          scheduledStartTime: row.scheduledStartTime,
+        });
+        if (video.changed()) await video.save();
+      })
+    );
+  }
+}
+
+async function syncPlaylist(channel, playlistId, mode, ctx) {
+  const cutoff = ctx.lastSyncedAtTime ? ctx.lastSyncedAtTime - RESYNC_MARGIN_MS : 0;
   let pageToken = '';
-  let newVideosCount = 0;
-  let reachedAlreadySynced = false;
-  let pagesFetched = 0;
+  let pages = 0;
+  let reachedSynced = false;
 
   do {
-    if (maxPages > 0 && pagesFetched >= maxPages) break;
-    pagesFetched++;
-
-    const url = `https://www.googleapis.com/youtube/v3/playlistItems`;
-    const params = {
-      part: 'snippet',
-      playlistId: playlistId,
-      maxResults: 50,
-      key: apiKey,
-    };
-    if (pageToken) {
-      params.pageToken = pageToken;
-    }
-
-    const response = await axios.get(url, { params, timeout: 10000 });
-    const items = response.data.items || [];
-
-    if (items.length === 0) {
+    if (ctx.maxPages > 0 && pages >= ctx.maxPages) {
+      ctx.truncated = true;
       break;
     }
+    pages += 1;
 
-    const videoIds = items.map(item => item.snippet?.resourceId?.videoId).filter(Boolean);
-    if (videoIds.length === 0) {
-      pageToken = response.data.nextPageToken;
-      continue;
-    }
+    const pl = await ytGet('playlistItems', {
+      part: 'snippet',
+      playlistId,
+      maxResults: 50,
+      pageToken: pageToken || undefined,
+    });
+    trackQuota(1);
 
-    const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
-    trackQuota(videoIds.length > 0 ? 1 : 0);
+    pageToken = pl.nextPageToken || '';
+    const items = pl.items || [];
+    const ids = [...new Set(items.map((i) => i.snippet && i.snippet.resourceId && i.snippet.resourceId.videoId).filter(Boolean))];
+    if (ids.length === 0) continue;
 
-    const videoDetailsMap = new Map();
-    for (const videoItem of (videosDetailsRes.data.items || [])) {
-      videoDetailsMap.set(videoItem.id, videoItem);
-    }
+    const details = await ytGet('videos', {
+      part: 'snippet,contentDetails,statistics,status,liveStreamingDetails',
+      id: ids.join(','),
+    });
+    trackQuota(1);
+    const detailMap = new Map((details.items || []).map((v) => [v.id, v]));
 
+    const rows = [];
     for (const item of items) {
-      const snippet = item.snippet;
-      if (!snippet || !snippet.resourceId || !snippet.resourceId.videoId) {
-        continue;
-      }
+      const sn = item.snippet;
+      const vid = sn && sn.resourceId && sn.resourceId.videoId;
+      const v = vid && detailMap.get(vid);
+      if (!v) continue;
 
-      const youtubeVideoId = snippet.resourceId.videoId;
-      const videoData = videoDetailsMap.get(youtubeVideoId);
-
-      const title = videoData?.snippet?.title || snippet.title || 'Untitled Video';
-      const thumbnailUrl =
-        videoData?.snippet?.thumbnails?.high?.url ||
-        snippet.thumbnails?.high?.url ||
-        snippet.thumbnails?.medium?.url ||
-        snippet.thumbnails?.default?.url ||
-        `https://i.ytimg.com/vi/${youtubeVideoId}/hqdefault.jpg`;
-      const publishedAt = videoData?.snippet?.publishedAt ? new Date(videoData.snippet.publishedAt) : (snippet.publishedAt ? new Date(snippet.publishedAt) : new Date());
-      const liveBroadcastContent = videoData?.snippet?.liveBroadcastContent || 'none';
-      const scheduledStartTime = videoData?.liveStreamingDetails?.scheduledStartTime ? new Date(videoData.liveStreamingDetails.scheduledStartTime) : null;
-
-      if (lastSyncedAtTime && publishedAt.getTime() <= lastSyncedAtTime) {
-        reachedAlreadySynced = true;
+      const row = buildRow(channel, sn, v, mode);
+      if (cutoff && row.publishedAt.getTime() <= cutoff) {
+        reachedSynced = true;
         break;
       }
-
-      let isShort = isShortVal;
-      let durationStr = videoData?.contentDetails?.duration || '';
-      let totalSeconds = 0;
-      let viewCount = videoData?.statistics?.viewCount ? parseInt(videoData.statistics.viewCount, 10) : 0;
-
-      if (durationStr) {
-        try {
-          const durationObj = parse(durationStr);
-          totalSeconds = (durationObj.hours || 0) * 3600 + (durationObj.minutes || 0) * 60 + (durationObj.seconds || 0);
-        } catch (e) {
-          logger.warn(`Could not parse duration for video ${youtubeVideoId}: ${e.message}`);
-        }
-      }
-
-      // Determine if it's a short based on duration
-      if (isShort === null) {
-        if (totalSeconds > 0 && totalSeconds <= 180) {
-          isShort = true;
-        } else {
-          isShort = false;
-        }
-      }
-
-      if (channel.isShortsOnly && !isShort) {
-        continue;
-      }
-      if (isShortVal === true && !isShort) {
-        continue;
-      }
-
-      const [video, created] = await ChannelVideo.findOrCreate({
-        where: { youtubeVideoId },
-        defaults: {
-          channelId: channel.id,
-          title,
-          thumbnailUrl,
-          publishedAt,
-          isAvailable: true,
-          liveBroadcastContent,
-          scheduledStartTime,
-          isShort,
-          durationStr,
-          totalSeconds,
-          viewCount,
-        },
-      });
-
-      if (!created) {
-        await video.update({
-          title,
-          thumbnailUrl,
-          publishedAt,
-          isAvailable: true,
-          liveBroadcastContent,
-          scheduledStartTime,
-          isShort,
-          durationStr,
-          totalSeconds,
-          viewCount,
-        });
-      } else {
-        newVideosCount++;
-      }
+      if (ctx.onlyShorts && !row.isShort) continue;
+      rows.push(row);
     }
 
-    pageToken = response.data.nextPageToken;
-  } while (pageToken && !reachedAlreadySynced);
-
-  return newVideosCount;
+    await persistRows(channel, rows, ctx);
+  } while (pageToken && !reachedSynced);
 }
 
-/**
- * Sync videos for a single YouTube channel supporting source ('channel' vs 'shorts-only') and fallback
- * @param {object} channel - Sequelize Channel instance
- */
-async function syncChannel(channel, { skipAlerts = false, maxPages = 0 } = {}) {
-  const apiKey = process.env.YOUTUBE_API_KEY;
-  if (!apiKey) {
-    logger.warn('YOUTUBE_API_KEY is not configured in environment variables.');
-    throw new Error('YOUTUBE_API_KEY is missing');
+const activeSyncs = new Set();
+
+async function syncChannel(channel, options = {}) {
+  const { skipAlerts = false, maxPages = 0, shortsOnly = false } = options;
+
+  if (!process.env.YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is missing');
+  if (!CHANNEL_ID_RE.test(channel.youtubeChannelId || '')) {
+    throw new Error(`Channel "${channel.name}" has no valid YouTube channel id (${channel.youtubeChannelId}).`);
   }
+  if (activeSyncs.has(channel.id)) return 0;
+  activeSyncs.add(channel.id);
 
-  channel.lastSyncStatus = 'syncing';
-  await channel.save();
-
-  await refreshChannelMetadata(channel);
-
-  const playlistIds = getPlaylistIds(channel.youtubeChannelId);
-  const uploadsPlaylistId = channel.uploadsPlaylistId || playlistIds.uploads;
-
-  const lastSyncedAtTime = channel.lastSyncedAt ? new Date(channel.lastSyncedAt).getTime() : 0;
-  let totalNewVideos = 0;
+  const ctx = {
+    lastSyncedAtTime: channel.lastSyncedAt ? new Date(channel.lastSyncedAt).getTime() : 0,
+    skipAlerts,
+    maxPages,
+    onlyShorts: false,
+    newVideos: 0,
+    newShorts: 0,
+    alertsSent: 0,
+    truncated: false,
+  };
 
   try {
+    channel.lastSyncStatus = 'syncing';
+    await channel.save();
+
+    if (!channel.uploadsPlaylistId) await refreshChannelMetadata(channel, { save: false });
+
+    const ids = getPlaylistIds(channel.youtubeChannelId);
+    const uploadsId = channel.uploadsPlaylistId || ids.uploads;
     const source = channel.source || (channel.isShortsOnly ? 'shorts-only' : 'channel');
+    const wantLong = source !== 'shorts-only' && !shortsOnly;
 
-    if (source === 'shorts-only') {
+    const plan = [{ id: ids.shortsOnly, mode: 'short' }];
+    if (wantLong) plan.push({ id: ids.longOnly, mode: 'long' });
+
+    let missingPlaylist = false;
+    for (const step of plan) {
       try {
-        const added = await processPlaylistItems(channel, playlistIds.shortsOnly, true, apiKey, lastSyncedAtTime, maxPages);
-        totalNewVideos += added;
+        await syncPlaylist(channel, step.id, step.mode, ctx);
       } catch (err) {
-        logger.warn(`Shorts-only playlist ${playlistIds.shortsOnly} failed for channel ${channel.name}: ${err.message}. Trying uploads fallback.`);
-        totalNewVideos += await syncViaUploadsFallback(channel, uploadsPlaylistId, apiKey, lastSyncedAtTime, true, 50);
-      }
-    } else {
-      let longSuccess = false;
-      let shortsSuccess = false;
-
-      try {
-        const addedLong = await processPlaylistItems(channel, playlistIds.longOnly, false, apiKey, lastSyncedAtTime, maxPages);
-        totalNewVideos += addedLong;
-        longSuccess = true;
-      } catch (err) {
-        logger.warn(`Long-only playlist ${playlistIds.longOnly} failed for channel ${channel.name}: ${err.message}`);
-      }
-
-      try {
-        const addedShorts = await processPlaylistItems(channel, playlistIds.shortsOnly, true, apiKey, lastSyncedAtTime, maxPages);
-        totalNewVideos += addedShorts;
-        shortsSuccess = true;
-      } catch (err) {
-        logger.warn(`Shorts playlist ${playlistIds.shortsOnly} failed for channel ${channel.name}: ${err.message}`);
-      }
-
-      if (!longSuccess && !shortsSuccess) {
-        logger.info(`Both UULF and UUSH playlists failed or empty for channel ${channel.name}. Triggering uploads fallback.`);
-        totalNewVideos += await syncViaUploadsFallback(channel, uploadsPlaylistId, apiKey, lastSyncedAtTime, null, 50);
+        if (isNotFound(err)) {
+          missingPlaylist = true;
+          log.warn(`Playlist ${step.id} not found for channel ${channel.name}; will use uploads fallback.`);
+        } else {
+          throw err;
+        }
       }
     }
 
-    channel.lastSyncedAt = new Date();
+    // ROBUSTNESS FIX: If UUSH playlist returned 0 shorts (API quirk on old channels), force uploads fallback!
+    const currentShortsCount = await ChannelVideo.count({ where: { channelId: channel.id, isShort: true } });
+    if (missingPlaylist || currentShortsCount === 0) {
+      log.info(`[Sync] Shorts playlist UUSH was empty or missing for ${channel.name}. Forcing Uploads playlist fallback scan.`);
+      ctx.onlyShorts = !wantLong;
+      await syncPlaylist(channel, uploadsId, 'auto', ctx);
+    }
+
+    const partial = ctx.truncated || (shortsOnly && source !== 'shorts-only');
+    if (!partial) channel.lastSyncedAt = new Date();
     channel.lastSyncStatus = 'ok';
     channel.lastSyncError = null;
+    channel.shortsCount = await ChannelVideo.count({ where: { channelId: channel.id, isShort: true } });
     await channel.save();
 
-    logger.info(`Channel ${channel.name} synced successfully: ${totalNewVideos} new videos added.`);
-    return totalNewVideos;
+    log.info(`[Sync] ${channel.name}: +${ctx.newVideos} new (${ctx.newShorts} shorts), total shorts ${channel.shortsCount}${partial ? ' [partial]' : ''}.`);
+    return ctx.newVideos;
   } catch (err) {
-    logger.error(`Error syncing channel ${channel.name}: ${err.message}`);
-    channel.lastSyncStatus = 'error';
-    channel.lastSyncError = err.message;
-    await channel.save();
+    log.error(`Error syncing channel ${channel.name}: ${err.message}`);
+    try {
+      channel.lastSyncStatus = 'error';
+      channel.lastSyncError = String(err.message).slice(0, 500);
+      await channel.save();
+    } catch (saveErr) {}
     throw err;
+  } finally {
+    activeSyncs.delete(channel.id);
   }
 }
 
-/**
- * Fallback sync via uploads playlist (UU)
- */
-async function syncViaUploadsFallback(channel, uploadsPlaylistId, apiKey, lastSyncedAtTime, forcedIsShort, maxVideosLimit = 50) {
-  let pageToken = '';
-  let newVideosCount = 0;
-  let processedCount = 0;
-  let reachedAlreadySynced = false;
-
-  do {
-    const url = `https://www.googleapis.com/youtube/v3/playlistItems`;
-    const params = {
-      part: 'snippet',
-      playlistId: uploadsPlaylistId,
-      maxResults: 50,
-      key: apiKey,
-    };
-    if (pageToken) {
-      params.pageToken = pageToken;
-    }
-
-    const response = await axios.get(url, { params, timeout: 10000 });
-    const items = response.data.items || [];
-    if (items.length === 0) break;
-
-    const videoIds = items.map(item => item.snippet?.resourceId?.videoId).filter(Boolean);
-    if (videoIds.length === 0) break;
-
-    const videosDetailsRes = await axios.get(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${apiKey}`, { timeout: 10000 });
-    trackQuota(1);
-
-    const videoDetailsMap = new Map();
-    for (const videoItem of (videosDetailsRes.data.items || [])) {
-      videoDetailsMap.set(videoItem.id, videoItem);
-    }
-
-    for (const item of items) {
-      if (processedCount >= maxVideosLimit) {
-        break;
-      }
-
-      const snippet = item.snippet;
-      if (!snippet || !snippet.resourceId || !snippet.resourceId.videoId) continue;
-
-      const youtubeVideoId = snippet.resourceId.videoId;
-      const videoData = videoDetailsMap.get(youtubeVideoId);
-
-      const title = videoData?.snippet?.title || snippet.title || 'Untitled Video';
-      const thumbnailUrl =
-        videoData?.snippet?.thumbnails?.high?.url ||
-        snippet.thumbnails?.high?.url ||
-        snippet.thumbnails?.medium?.url ||
-        snippet.thumbnails?.default?.url ||
-        `https://i.ytimg.com/vi/${youtubeVideoId}/hqdefault.jpg`;
-      const publishedAt = videoData?.snippet?.publishedAt ? new Date(videoData.snippet.publishedAt) : (snippet.publishedAt ? new Date(snippet.publishedAt) : new Date());
-      const liveBroadcastContent = videoData?.snippet?.liveBroadcastContent || 'none';
-      const scheduledStartTime = videoData?.liveStreamingDetails?.scheduledStartTime ? new Date(videoData.liveStreamingDetails.scheduledStartTime) : null;
-
-      if (lastSyncedAtTime && publishedAt.getTime() <= lastSyncedAtTime) {
-        reachedAlreadySynced = true;
-        break;
-      }
-
-      let isShort = forcedIsShort;
-      let durationStr = videoData?.contentDetails?.duration || '';
-      let totalSeconds = 0;
-      let viewCount = videoData?.statistics?.viewCount ? parseInt(videoData.statistics.viewCount, 10) : 0;
-
-      if (durationStr) {
-        try {
-          const durationObj = parse(durationStr);
-          totalSeconds = (durationObj.hours || 0) * 3600 + (durationObj.minutes || 0) * 60 + (durationObj.seconds || 0);
-        } catch (e) {
-          logger.warn(`Could not parse duration for video ${youtubeVideoId} in fallback: ${e.message}`);
-        }
-      }
-
-      if (isShort === null) {
-        processedCount++;
-        isShort = totalSeconds > 0 && totalSeconds <= 180;
-      }
-
-      if (!isShort) {
-        continue;
-      }
-
-      const [video, created] = await ChannelVideo.findOrCreate({
-        where: { youtubeVideoId },
-        defaults: {
-          channelId: channel.id,
-          title,
-          thumbnailUrl,
-          publishedAt,
-          isAvailable: true,
-          liveBroadcastContent,
-          scheduledStartTime,
-          isShort,
-          durationStr,
-          totalSeconds,
-          viewCount,
-        },
-      });
-
-      if (!created) {
-        await video.update({
-          title,
-          thumbnailUrl,
-          publishedAt,
-          isAvailable: true,
-          liveBroadcastContent,
-          scheduledStartTime,
-          isShort,
-          durationStr,
-          totalSeconds,
-          viewCount,
-        });
-      } else {
-        newVideosCount++;
-      }
-    }
-
-    pageToken = response.data.nextPageToken;
-  } while (pageToken && !reachedAlreadySynced && processedCount < maxVideosLimit);
-
-  return newVideosCount;
-}
-
-/**
- * Sync all active channels
- */
+let syncAllRunning = false;
 async function syncAllActiveChannels() {
-  logger.info('Starting scheduled sync for all active YouTube channels...');
+  if (syncAllRunning) return;
+  syncAllRunning = true;
   try {
-    const activeChannels = await Channel.findAll({ where: { isActive: true } });
-    let totalChecked = 0;
-    let totalNewVideos = 0;
-
-    for (const channel of activeChannels) {
-      totalChecked++;
+    const channels = await Channel.findAll({ where: { isActive: true } });
+    for (const channel of channels) {
       try {
-        const added = await syncChannel(channel, { skipAlerts: true });
-        totalNewVideos += added;
+        await syncChannel(channel, { maxPages: CRON_MAX_PAGES });
       } catch (err) {
-        logger.error(`Failed to sync channel ${channel.name} (ID: ${channel.id}): ${err.message}`);
+        if (isQuotaOrAuthError(err)) break;
       }
     }
-
-    logger.info(`Channel sync completed. Checked: ${totalChecked} channels, New Videos Added: ${totalNewVideos}`);
   } catch (err) {
-    logger.error(`Error in syncAllActiveChannels: ${err.message}`);
+  } finally {
+    syncAllRunning = false;
   }
 }
 
-/**
- * Priority 1: Check health of all stored videos in batches of 50.
- */
+/* ------------------------------------------------------------------ */
+/* Video health                                                       */
+/* ------------------------------------------------------------------ */
+let healthRunning = false;
 async function checkVideoHealth() {
-  const apiKey = process.env.YOUTUBE_API_KEY;
-  if (!apiKey) {
-    logger.warn('YOUTUBE_API_KEY is not configured for checkVideoHealth.');
-    return;
-  }
-
-  logger.info('Starting scheduled video health check...');
+  if (!process.env.YOUTUBE_API_KEY || healthRunning) return;
+  healthRunning = true;
   try {
-    const videos = await ChannelVideo.findAll({
-      attributes: ['id', 'youtubeVideoId', 'isAvailable'],
-    });
+    let lastId = null;
+    for (;;) {
+      const rows = await ChannelVideo.findAll({
+        attributes: ['id', 'youtubeVideoId', 'isAvailable'],
+        where: lastId ? { id: { [Op.gt]: lastId } } : {},
+        order: [['id', 'ASC']],
+        limit: 500,
+        raw: true,
+      });
+      if (rows.length === 0) break;
+      lastId = rows[rows.length - 1].id;
 
-    if (videos.length === 0) return;
+      for (const batch of chunk(rows, 50)) {
+        try {
+          const data = await ytGet('videos', { part: 'status', id: batch.map((v) => v.youtubeVideoId).join(',') });
+          trackQuota(1);
 
-    const batches = [];
-    for (let i = 0; i < videos.length; i += 50) {
-      batches.push(videos.slice(i, i + 50));
-    }
+          const okIds = new Set();
+          (data.items || []).forEach((item) => {
+            const st = item.status || {};
+            if (st.privacyStatus === 'public' && st.embeddable !== false) okIds.add(item.id);
+          });
 
-    for (const batch of batches) {
-      const ids = batch.map(v => v.youtubeVideoId).join(',');
-      try {
-        const url = `https://www.googleapis.com/youtube/v3/videos`;
-        const response = await axios.get(url, {
-          params: {
-            part: 'status',
-            id: ids,
-            key: apiKey,
-          },
-          timeout: 10000,
-        });
-
-        const returnedItems = response.data.items || [];
-        const returnedMap = new Map();
-        for (const item of returnedItems) {
-          const privacy = item.status?.privacyStatus;
-          const isPublic = privacy === 'public';
-          returnedMap.set(item.id, isPublic);
+          const makeAvailable = [];
+          const makeUnavailable = [];
+          batch.forEach((v) => {
+            const available = okIds.has(v.youtubeVideoId);
+            if (available && !v.isAvailable) makeAvailable.push(v.id);
+            if (!available && v.isAvailable) makeUnavailable.push(v.id);
+          });
+          if (makeAvailable.length) await ChannelVideo.update({ isAvailable: true }, { where: { id: { [Op.in]: makeAvailable } } });
+          if (makeUnavailable.length) await ChannelVideo.update({ isAvailable: false }, { where: { id: { [Op.in]: makeUnavailable } } });
+        } catch (batchErr) {
+          if (isQuotaOrAuthError(batchErr)) throw batchErr;
         }
-
-        for (const v of batch) {
-          const isPublic = returnedMap.get(v.youtubeVideoId);
-          const available = isPublic === true;
-          if (v.isAvailable !== available) {
-            await ChannelVideo.update({ isAvailable: available }, { where: { id: v.id } });
-          }
-        }
-      } catch (batchErr) {
-        logger.error(`Error checking batch video health: ${batchErr.message}`);
       }
     }
-    logger.info('Video health check completed successfully.');
   } catch (err) {
-    logger.error(`Error in checkVideoHealth: ${err.message}`);
+  } finally {
+    healthRunning = false;
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Live detection & Notifications                                     */
+/* ------------------------------------------------------------------ */
 async function getVideoLiveStatus(videoId) {
-  const apiKey = process.env.YOUTUBE_API_KEY;
-  if (!apiKey || !videoId) return null;
-
+  if (!process.env.YOUTUBE_API_KEY || !videoId) return null;
   try {
-    const response = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
-      params: {
-        part: 'snippet,liveStreamingDetails',
-        id: videoId,
-        key: apiKey,
-      },
-      timeout: 10000,
-    });
+    const data = await ytGet('videos', { part: 'snippet,liveStreamingDetails', id: videoId });
     trackQuota(1);
 
-    const items = response.data.items || [];
-    if (items.length === 0) return null;
+    const item = (data.items || [])[0];
+    if (!item) return false;
 
-    const item = items[0];
-    const snippet = item.snippet || {};
-    const liveDetails = item.liveStreamingDetails || {};
-
+    const sn = item.snippet || {};
+    const ld = item.liveStreamingDetails || {};
     return {
       videoId: item.id,
-      title: snippet.title || 'Untitled Video',
-      thumbnailUrl:
-        snippet.thumbnails?.high?.url ||
-        snippet.thumbnails?.medium?.url ||
-        snippet.thumbnails?.default?.url ||
-        `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-      liveBroadcastContent: snippet.liveBroadcastContent || 'none',
-      scheduledStartTime: liveDetails.scheduledStartTime ? new Date(liveDetails.scheduledStartTime) : null,
-      actualStartTime: liveDetails.actualStartTime ? new Date(liveDetails.actualStartTime) : null,
-      actualEndTime: liveDetails.actualEndTime ? new Date(liveDetails.actualEndTime) : null,
+      title: sn.title || 'Untitled Video',
+      thumbnailUrl: pickThumb(sn.thumbnails) || `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
+      liveBroadcastContent: sn.liveBroadcastContent || 'none',
+      scheduledStartTime: ld.scheduledStartTime ? new Date(ld.scheduledStartTime) : null,
+      actualStartTime: ld.actualStartTime ? new Date(ld.actualStartTime) : null,
+      actualEndTime: ld.actualEndTime ? new Date(ld.actualEndTime) : null,
     };
   } catch (err) {
-    logger.error(`Error in getVideoLiveStatus for video ${videoId}: ${err.message}`);
     return null;
   }
 }
 
-function triggerLiveTransition(transitionData) {
-  logger.info(`[LIVE TRANSITION STUB] Channel "${transitionData.channel.name}" went LIVE! Video ID: ${transitionData.videoId}`);
-  liveEmitter.emit('upcomingToLive', transitionData);
+function triggerLiveTransition(data) {
+  liveEmitter.emit('upcomingToLive', data);
+}
+
+liveEmitter.on('upcomingToLive', async ({ channel, videoId }) => {
+  try {
+    const [claimed] = await Channel.update(
+      { lastNotifiedVideoId: videoId },
+      {
+        where: {
+          id: channel.id,
+          [Op.or]: [{ lastNotifiedVideoId: null }, { lastNotifiedVideoId: { [Op.ne]: videoId } }],
+        },
+      }
+    );
+    if (!claimed) return;
+
+    const nc = require('../controllers/notificationController');
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const payload = {
+      title: process.env.LIVE_NOTIFY_TITLE || 'RCM Gurukul is LIVE now',
+      body: process.env.LIVE_NOTIFY_BODY || "TC Sir's session has started — tap to join",
+      actionUrl: url,
+      dataPayload: { videoId, channelId: channel.id, type: 'live_stream', url },
+    };
+
+    if (typeof nc.broadcastNotification === 'function') {
+      await nc.broadcastNotification(payload);
+    } else if (typeof nc.sendTitanBroadcast === 'function') {
+      await nc.sendTitanBroadcast(null, null, payload, true);
+    }
+  } catch (err) {}
+});
+
+function resetUpcoming(channel) {
+  channel.upcomingVideoId = null;
+  channel.scheduledStartTime = null;
+  channel.discoveredAt = null;
+}
+
+async function markChannelLive(channel, videoId, startedAt, scheduledStartTime) {
+  const started = startedAt || new Date();
+  channel.isCurrentlyLive = true;
+  channel.liveVideoId = videoId;
+  channel.upcomingVideoId = videoId;
+  channel.liveStartedAt = started;
+  channel.lastKnownLiveStartTime = started;
+  channel.lastLiveCheckAt = new Date();
+  await channel.save();
+
+  triggerLiveTransition({ channel, videoId, scheduledStartTime: scheduledStartTime || null, liveStartedAt: started });
+}
+
+async function finishLive(channel, status, now) {
+  channel.isCurrentlyLive = false;
+  channel.liveVideoId = null;
+  channel.liveStartedAt = null;
+  resetUpcoming(channel);
+  channel.lastLiveCheckAt = now;
+  await channel.save();
+
+  if (!status) return;
+  try {
+    const [, created] = await ChannelVideo.findOrCreate({
+      where: { youtubeVideoId: status.videoId },
+      defaults: {
+        channelId: channel.id,
+        title: status.title,
+        thumbnailUrl: status.thumbnailUrl,
+        publishedAt: status.actualStartTime || now,
+        isAvailable: true,
+        isShort: false,
+      },
+    });
+    if (!created) {
+      await ChannelVideo.update(
+        { title: status.title, thumbnailUrl: status.thumbnailUrl, isAvailable: true },
+        { where: { youtubeVideoId: status.videoId } }
+      );
+    }
+  } catch (vodErr) {}
 }
 
 async function runPhaseADiscovery(channel) {
-  const apiKey = process.env.YOUTUBE_API_KEY;
-  if (!apiKey || !channel.uploadsPlaylistId) return;
+  if (!process.env.YOUTUBE_API_KEY || !channel.uploadsPlaylistId) return;
 
-  const now = Date.now();
-  if (channel.lastLiveCheckAt && (now - new Date(channel.lastLiveCheckAt).getTime() < 2 * 3600 * 1000)) {
-    return;
-  }
+  const since = channel.lastLiveCheckAt ? Date.now() - new Date(channel.lastLiveCheckAt).getTime() : Infinity;
+  if (since < DISCOVERY_INTERVAL_MS) return;
 
   try {
-    const playlistRes = await axios.get('https://www.googleapis.com/youtube/v3/playlistItems', {
-      params: {
-        part: 'snippet',
-        playlistId: channel.uploadsPlaylistId,
-        maxResults: 10,
-        key: apiKey,
-      },
-      timeout: 10000,
-    });
+    const pl = await ytGet('playlistItems', { part: 'snippet', playlistId: channel.uploadsPlaylistId, maxResults: 10 });
     trackQuota(1);
 
-    const playlistItems = playlistRes.data.items || [];
-    if (playlistItems.length === 0) {
+    const ids = (pl.items || []).map((i) => i.snippet && i.snippet.resourceId && i.snippet.resourceId.videoId).filter(Boolean);
+    if (ids.length === 0) {
       channel.lastLiveCheckAt = new Date();
       await channel.save();
       return;
     }
 
-    const videoIds = playlistItems
-      .map(item => item.snippet?.resourceId?.videoId)
-      .filter(Boolean)
-      .join(',');
-
-    if (!videoIds) return;
-
-    const videosRes = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
-      params: {
-        part: 'snippet,liveStreamingDetails',
-        id: videoIds,
-        key: apiKey,
-      },
-      timeout: 10000,
-    });
+    const vids = await ytGet('videos', { part: 'snippet,liveStreamingDetails', id: ids.join(',') });
     trackQuota(1);
+    const items = vids.items || [];
 
-    const videoItems = videosRes.data.items || [];
-    let foundUpcoming = null;
-
-    for (const vItem of videoItems) {
-      const broadcastContent = vItem.snippet?.liveBroadcastContent;
-      if (broadcastContent === 'upcoming') {
-        foundUpcoming = {
-          videoId: vItem.id,
-          scheduledStartTime: vItem.liveStreamingDetails?.scheduledStartTime ? new Date(vItem.liveStreamingDetails.scheduledStartTime) : null,
-        };
-        break;
-      }
+    const liveNow = items.find((v) => v.snippet && v.snippet.liveBroadcastContent === 'live');
+    if (liveNow) {
+      const ld = liveNow.liveStreamingDetails || {};
+      await markChannelLive(channel, liveNow.id, ld.actualStartTime ? new Date(ld.actualStartTime) : new Date(), ld.scheduledStartTime ? new Date(ld.scheduledStartTime) : null);
+      return;
     }
 
-    if (foundUpcoming) {
-      channel.upcomingVideoId = foundUpcoming.videoId;
-      channel.scheduledStartTime = foundUpcoming.scheduledStartTime;
+    const upcoming = items
+      .filter((v) => v.snippet && v.snippet.liveBroadcastContent === 'upcoming')
+      .map((v) => ({ id: v.id, at: v.liveStreamingDetails && v.liveStreamingDetails.scheduledStartTime ? new Date(v.liveStreamingDetails.scheduledStartTime) : null }))
+      .sort((a, b) => (a.at ? a.at.getTime() : Infinity) - (b.at ? b.at.getTime() : Infinity))[0];
+
+    if (upcoming) {
+      channel.upcomingVideoId = upcoming.id;
+      channel.scheduledStartTime = upcoming.at;
       channel.discoveredAt = new Date();
-      channel.lastLiveCheckAt = new Date();
-      await channel.save();
-    } else {
-      if (channel.upcomingVideoId || channel.scheduledStartTime) {
-        channel.upcomingVideoId = null;
-        channel.scheduledStartTime = null;
-        channel.discoveredAt = null;
-      }
-      channel.lastLiveCheckAt = new Date();
-      await channel.save();
+    } else if (channel.upcomingVideoId || channel.scheduledStartTime) {
+      resetUpcoming(channel);
     }
-  } catch (err) {
-    logger.error(`Error in Phase A discovery for channel ${channel.name}: ${err.message}`);
-  }
+    channel.lastLiveCheckAt = new Date();
+    await channel.save();
+  } catch (err) {}
 }
 
 async function processLiveChannelState(channel) {
   const now = new Date();
+  const nowMs = now.getTime();
+  const since = (d) => (d ? nowMs - new Date(d).getTime() : Infinity);
 
   if (channel.isCurrentlyLive && channel.liveVideoId) {
-    if (channel.lastLiveCheckAt && (now.getTime() - new Date(channel.lastLiveCheckAt).getTime() < 2 * 60 * 1000)) {
-      return;
-    }
+    const tooLong = channel.liveStartedAt && since(channel.liveStartedAt) > MAX_LIVE_MS;
+    if (!tooLong && since(channel.lastLiveCheckAt) < LIVE_RECHECK_MS) return;
 
-    const status = await getVideoLiveStatus(channel.liveVideoId);
-    if (!status) return;
+    const status = tooLong ? false : await getVideoLiveStatus(channel.liveVideoId);
+    if (status === null) return;
 
-    channel.lastLiveCheckAt = now;
-
-    if (status.liveBroadcastContent === 'none' || status.actualEndTime) {
-      channel.isCurrentlyLive = false;
-      channel.liveVideoId = null;
-      channel.liveStartedAt = null;
-      channel.upcomingVideoId = null;
-      channel.scheduledStartTime = null;
-      channel.discoveredAt = null;
-      await channel.save();
-
-      try {
-        await ChannelVideo.findOrCreate({
-          where: { youtubeVideoId: status.videoId },
-          defaults: {
-            channelId: channel.id,
-            title: status.title,
-            thumbnailUrl: status.thumbnailUrl,
-            publishedAt: status.actualStartTime || now,
-            isAvailable: true,
-            isShort: false,
-          },
-        });
-      } catch (vodErr) {
-        logger.error(`Error refreshing VOD metadata for ${status.videoId}: ${vodErr.message}`);
-      }
+    if (status === false || status.liveBroadcastContent === 'none' || status.actualEndTime) {
+      await finishLive(channel, status || null, now);
     } else {
+      channel.lastLiveCheckAt = now;
       await channel.save();
     }
     return;
   }
 
   if (channel.upcomingVideoId) {
-    let scheduledTime = channel.scheduledStartTime ? new Date(channel.scheduledStartTime) : null;
-    if (scheduledTime) {
-      const diffMs = scheduledTime - now;
-      const diffMins = diffMs / 60000;
-      if (diffMins > 15) return;
-      if (diffMins < -45) {
-        channel.upcomingVideoId = null;
-        channel.scheduledStartTime = null;
-        channel.discoveredAt = null;
+    let scheduled = channel.scheduledStartTime ? new Date(channel.scheduledStartTime) : null;
+    if (scheduled) {
+      const diffMin = (scheduled.getTime() - nowMs) / 60000;
+      if (diffMin > PRELIVE_WINDOW_MIN) return;
+      if (diffMin < -MISSED_AFTER_MIN) {
+        resetUpcoming(channel);
         channel.lastLiveCheckAt = now;
         await channel.save();
         return;
       }
+      if (since(channel.lastLiveCheckAt) < PRELIVE_POLL_MS) return;
+    } else if (since(channel.lastLiveCheckAt) < NO_SCHEDULE_POLL_MS) {
+      return;
     }
 
     const status = await getVideoLiveStatus(channel.upcomingVideoId);
-    if (!status) return;
+    if (status === null) return;
 
     channel.lastLiveCheckAt = now;
-
-    if (status.liveBroadcastContent === 'live' || status.actualStartTime) {
-      channel.isCurrentlyLive = true;
-      channel.liveVideoId = channel.upcomingVideoId;
-      channel.liveStartedAt = status.actualStartTime || now;
-      channel.lastNotifiedVideoId = channel.upcomingVideoId;
+    if (status === false || (status.liveBroadcastContent === 'none' && status.actualEndTime)) {
+      resetUpcoming(channel);
       await channel.save();
-
-      triggerLiveTransition({
-        channel,
-        videoId: channel.liveVideoId,
-        scheduledStartTime: channel.scheduledStartTime,
-        liveStartedAt: channel.liveStartedAt,
-      });
+    } else if (status.liveBroadcastContent === 'live') {
+      await markChannelLive(channel, channel.upcomingVideoId, status.actualStartTime || now, channel.scheduledStartTime);
     } else {
       await channel.save();
     }
@@ -761,28 +698,32 @@ async function processLiveChannelState(channel) {
 
 async function checkLiveAndUpcomingStatus() {
   try {
-    const optInChannels = await Channel.findAll({
-      where: { isActive: true, checkLiveStatus: true },
-    });
-    for (const channel of optInChannels) {
+    const channels = await Channel.findAll({ where: { isActive: true, checkLiveStatus: true } });
+    for (const channel of channels) {
       if (!channel.youtubeChannelId || !channel.uploadsPlaylistId) continue;
-      await processLiveChannelState(channel);
+      try {
+        await processLiveChannelState(channel);
+      } catch (err) {}
     }
-  } catch (err) {
-    logger.error(`Error in checkLiveAndUpcomingStatus: ${err.message}`);
-  }
+  } catch (err) {}
 }
 
-// Register cron jobs
-if (process.env.DISABLE_CRONS !== 'true') {
+/* ------------------------------------------------------------------ */
+/* Crons                                                             */
+/* ------------------------------------------------------------------ */
+function shouldRunCrons() {
+  if (process.env.DISABLE_CRONS === 'true') return false;
+  const inst = process.env.NODE_APP_INSTANCE;
+  return inst === undefined || inst === '' || inst === '0';
+}
+
+if (shouldRunCrons()) {
   try {
     cron.schedule('0 * * * *', () => { syncAllActiveChannels(); });
     cron.schedule('0 */6 * * *', () => { refreshMetadataForAllChannels(); });
-    cron.schedule('0 3 * * *', () => { checkVideoHealth(); });
+    cron.schedule('0 3 * * *', () => { checkVideoHealth(); }, { timezone: 'Asia/Kolkata' });
     cron.schedule('* * * * *', () => { checkLiveAndUpcomingStatus(); });
-  } catch (err) {
-    logger.error(`Failed to schedule channel sync cron jobs: ${err.message}`);
-  }
+  } catch (err) {}
 }
 
 module.exports = {

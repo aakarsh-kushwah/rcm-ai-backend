@@ -18,8 +18,8 @@ const JWT_ACCESS_EXPIRY = "15m";
 const SALT_ROUNDS = 10;
 const COOKIE_OPTIONS = {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
+    secure: true,
+    sameSite: "none",
     maxAge: 90 * 24 * 60 * 60 * 1000 // 90 days sliding session
 };
 
@@ -147,7 +147,9 @@ exports.googleAuthLogin = async (req, res) => {
         res.json({
             success: true,
             message: "Authentication successful!",
+            token: accessToken,
             accessToken,
+            refreshToken: refreshTokenVal,
             user: {
                 id: user.id,
                 fullName: user.fullName,
@@ -274,7 +276,9 @@ exports.refreshToken = async (req, res) => {
         res.json({
             success: true,
             message: "Access token refreshed.",
+            token: newAccessToken,
             accessToken: newAccessToken,
+            refreshToken: newRefreshTokenVal,
             user: {
                 id: user.id,
                 fullName: user.fullName,
@@ -341,7 +345,9 @@ exports.adminRefresh = async (req, res) => {
         res.json({
             success: true,
             message: "Admin access token refreshed.",
+            token: newAccessToken,
             accessToken: newAccessToken,
+            refreshToken: newRefreshTokenVal,
             user: {
                 id: admin.id,
                 fullName: admin.name,
@@ -412,7 +418,9 @@ exports.adminVerify = async (req, res) => {
         res.json({
             success: true,
             message: "✅ Admin account verified and activated.",
+            token: accessToken,
             accessToken,
+            refreshToken: refreshTokenVal,
             user: {
                 id: admin.id,
                 fullName: admin.fullName,
@@ -537,10 +545,20 @@ exports.adminMasterPasswordPhaseTwo = async (req, res) => {
         res.json({
             success: true,
             message: "Admin authentication successful!",
+            token: accessToken,
             accessToken,
+            refreshToken: refreshTokenVal,
             admin: {
                 id: admin.id,
                 name: admin.name,
+                email: admin.email,
+                role: admin.role,
+                status: admin.status,
+                isApproved: admin.isApproved
+            },
+            user: {
+                id: admin.id,
+                fullName: admin.name,
                 email: admin.email,
                 role: admin.role,
                 status: admin.status,
@@ -595,7 +613,9 @@ exports.adminLogin = async (req, res) => {
         res.json({
             success: true,
             message: "Admin login successful!",
+            token: accessToken,
             accessToken,
+            refreshToken: refreshTokenVal,
             user: {
                 id: admin.id,
                 fullName: admin.name,

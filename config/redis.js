@@ -5,21 +5,25 @@
 require('dotenv').config();
 const IORedis = require('ioredis');
 
-const redisUrl = process.env.REDIS_URL || process.env.REDIS_CLOUD_URL;
+const redisUrl = process.env.REDIS_URL || process.env.REDIS_CLOUD_URL || 'redis://127.0.0.1:6379';
 
-if (!redisUrl) {
+if (!process.env.REDIS_URL && !process.env.REDIS_CLOUD_URL) {
     console.log("⚠️ [TITAN-REDIS] Using Localhost (Dev Mode)");
 } else {
     console.log("✅ [TITAN-REDIS] Cloud URL Detected");
 }
 
-const redisClient = new IORedis(redisUrl || 'redis://127.0.0.1:6379', {
-    enableOfflineQueue: false,
+const redisClient = new IORedis(redisUrl, {
+    enableOfflineQueue: true,
+    maxRetriesPerRequest: null,
     lazyConnect: true,
-    tls: redisUrl && redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+    tls: redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
     retryStrategy(times) {
-        if (times > 3) return null; // stop reconnecting attempts after 3 tries
-        return Math.min(times * 100, 1000); // exponential backoff
+        if (times > 3) {
+            console.warn('⚠️ [TITAN-REDIS] Max reconnect attempts reached. Continuing in offline mode.');
+            return null; // STOP infinite retrying
+        }
+        return Math.min(times * 200, 1000);
     }
 });
 
@@ -38,13 +42,7 @@ redisClient.on('connect', () => {
 });
 
 // Explicitly connect to trigger the connection process and error handling
-(async () => {
-    try {
-        await redisClient.connect();
-    } catch (e) {
-        // The error handler above will catch and log this. No need to re-log here.
-    }
-})();
+
 
 // Graceful in-memory / fallback wrapper to ensure get/set/del never throw
 const connection = redisClient;

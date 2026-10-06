@@ -20,11 +20,11 @@ const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASS, {
     dialect: 'mysql',
     
     pool: {
-        // Render 512MB me 10 connections kafi hain. Oracle 24GB par shift karte waqt ise 50 kar sakte hain
-        max: isProduction ? 10 : 5, 
-        min: 0, // Idle connections ko close hone dein taaki memory free rahe
-        acquire: 60000, 
-        idle: 10000, 
+        // Explicitly sized for TiDB tier; configurable via environment variables
+        max: parseInt(process.env.DB_POOL_MAX, 10) || (isProduction ? 25 : 10),
+        min: parseInt(process.env.DB_POOL_MIN, 10) || 0,
+        acquire: parseInt(process.env.DB_POOL_ACQUIRE, 10) || 30000,
+        idle: parseInt(process.env.DB_POOL_IDLE, 10) || 10000,
     },
 
     dialectOptions: {

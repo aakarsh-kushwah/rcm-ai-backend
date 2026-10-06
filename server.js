@@ -1,158 +1,286 @@
 /**
  * @file server.js
- * @version 14.0.0 "THE ALPHA CORE"
- * @description Cloud-Native (Docker/K8s Ready) - OCI Optimized
- * @standard Enterprise Tier-0 (Zero-Trust, High-Observability)
+ * @description Core HTTP + Socket.io server. Nothing else.
+ *   - No seeding        -> scripts/seedSuperAdmin.js
+ *   - No background jobs -> workers/instagramWorker.js
  */
 
 require("dotenv").config();
-const cookieParser = require("cookie-parser");
-const express = require("express");
+
+const crypto = require("crypto");
 const http = require("http");
+const express = require("express");
+const cookieParser = require("cookie-parser");
 const cors = require("cors");
 const helmet = require("helmet");
 const compression = require("compression");
-const pino = require("pino");
 const pinoHttp = require("pino-http");
 const socketIo = require("socket.io");
-const { logger } = require("./utils/logger");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const client = require("prom-client");
-const { rateLimit } = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 
-// Internal Modules
-const bcrypt = require("bcryptjs");
-const { connectDB, sequelize, User, Admin } = require("./models");
+const { logger } = require("./utils/logger");
+const { connectDB, sequelize } = require("./models");
 const { connection: redisClient } = require("./config/redis");
 const { setIoInstance } = require("./services/socketService");
 
-const app = express();
-const server = http.createServer(app);
-const PORT = process.env.PORT || 10000;
+// ============================================================
+// ⚙️ CONFIG
+// ============================================================
+const IS_PROD = process.env.NODE_ENV === "production";
+const PORT = Number(process.env.PORT) || 10000;
 
-// 📊 OBSERVABILITY: Real-time Metrics & Lifecycle Tracing
+// Proxy hops between the socket and the real client.
+// Render(local) -> Cloudflare -> client  = 3.
+// Verify after deploy by logging req.ip for a known device.
+const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS ?? 3);
+
+// Your frontend (rcmai.in on Vercel) proxies /api to Render, so Cloudflare
+// only sees Vercel's IP. Vercel puts the real user IP in x-vercel-forwarded-for.
+const TRUST_VERCEL_IP = process.env.TRUST_VERCEL_IP !== "false";
+
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 300;
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 25 * 1000;
+const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
+
+const allowedOrigins = [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:3002',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
+    'http://127.0.0.1:3002',
+    'https://rcmai.in',
+    'https://www.rcmai.in',
+    'https://api.rcmai.in',
+    process.env.FRONTEND_URL,
+    process.env.ADMIN_URL,
+    process.env.CLIENT_URL,
+].filter(Boolean);
+
+// ============================================================
+// 🚀 APP + HTTP SERVER
+// ============================================================
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", TRUST_PROXY_HOPS); // must be before any middleware
+
+const server = http.createServer(app);
+
+// Set before listen() so they apply from the first connection.
+// Must be higher than the load balancer idle timeout (~60s).
+server.keepAliveTimeout = 65 * 1000;
+server.headersTimeout = 66 * 1000;
+
+let isShuttingDown = false;
+
+// ============================================================
+// 📊 METRICS
+// ============================================================
 const register = new client.Registry();
 client.collectDefaultMetrics({ register });
 
 const httpRequestDuration = new client.Histogram({
-    name: 'http_request_duration_seconds',
-    help: 'Duration of HTTP requests in seconds',
-    labelNames: ['method', 'route', 'status_code'],
-    buckets: [0.1, 0.5, 1, 2, 5]
+    name: "http_request_duration_seconds",
+    help: "Duration of HTTP requests in seconds",
+    labelNames: ["method", "route", "status_code"],
+    buckets: [0.05, 0.1, 0.5, 1, 2, 5],
+    registers: [register],
 });
-register.registerMetric(httpRequestDuration);
 
 // ============================================================
-// 🛡️ MIDDLEWARE STACK (Zero-Trust Architecture)
+// 🧰 HELPERS
+// ============================================================
+const getClientIp = (req) => {
+    if (TRUST_VERCEL_IP) {
+        const vercelIp = req.headers["x-vercel-forwarded-for"];
+        if (vercelIp) return String(vercelIp).split(",")[0].trim();
+    }
+    return req.ip;
+};
+
+const buildRateLimitStore = () => {
+    try {
+        // npm i rate-limit-redis
+        const { RedisStore } = require("rate-limit-redis");
+        const sendCommand =
+            typeof redisClient.call === "function"
+                ? (...args) => redisClient.call(...args) // ioredis
+                : (...args) => redisClient.sendCommand(args); // node-redis
+        return new RedisStore({ sendCommand, prefix: "rl:global:" });
+    } catch (err) {
+        logger.warn(
+            { err: err.message },
+            "rate-limit-redis unavailable; using in-memory store (NOT shared across instances)"
+        );
+        return undefined;
+    }
+};
+
+const isInfraPath = (req) => req.path === "/health" || req.path === "/metrics";
+
+// ============================================================
+// 🛡️ MIDDLEWARE
 // ============================================================
 
-// 1. Request Tracing & Performance Logging
-app.use(pinoHttp({
-    logger,
-    genReqId: (req) => req.headers['x-trace-id'] || Math.random().toString(36).substring(7),
-    customSuccessMessage: (req, res) => `✓ ${req.method} ${req.url} completed [${res.statusCode}]`,
-}));
+// 1. Logging (minimal serializers: never log Authorization / Cookie / Set-Cookie)
+app.use(
+    pinoHttp({
+        logger,
+        genReqId: (req) => req.headers["x-trace-id"] || crypto.randomUUID(),
+        autoLogging: { ignore: isInfraPath },
+        serializers: {
+            req: (req) => ({
+                id: req.id,
+                method: req.method,
+                url: req.url,
+                ip: req.raw && getClientIp(req.raw),
+                userAgent: req.headers && req.headers["user-agent"],
+            }),
+            res: (res) => ({ statusCode: res.statusCode }),
+        },
+        customProps: (req) => ({ userId: req.user?.id }),
+        customLogLevel: (req, res, err) => {
+            if (err || res.statusCode >= 500) return "error";
+            if (res.statusCode >= 400) return "warn";
+            return "info";
+        },
+        customSuccessMessage: (req, res) => `${req.method} ${req.url} [${res.statusCode}]`,
+    })
+);
 
-// 2. Metrics Integration (Request Lifecycle)
+// 2. Metrics (low-cardinality route label)
 app.use((req, res, next) => {
+    if (isInfraPath(req)) return next();
     const end = httpRequestDuration.startTimer();
-    res.on('finish', () => {
-        end({ method: req.method, route: req.route?.path || req.path, status_code: res.statusCode });
+    res.on("finish", () => {
+        const route = req.route ? `${req.baseUrl}${req.route.path}` : "unmatched";
+        end({ method: req.method, route, status_code: res.statusCode });
     });
     next();
 });
 
-// 3. Hardened Security
-app.use(helmet({
-    crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" }
-}));
+// 3. Security headers + compression
+app.use(helmet({ crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" } }));
 app.use(compression());
 
-// 4. Strict CORS (No Wildcards)
-const allowedOrigins = [
-    "https://rcmai.in",
-    "https://www.rcmai.in",
-    "https://rcm-ai-admin-ui.vercel.app",
-    "http://localhost:3000", // For local development
-    "http://localhost:3001", // For local development
-    "http://localhost:3002", // For Admin UI local development
-    "http://localhost:5173"  // For local development
-];
+// 4. CORS (strict allowlist; handles preflight too, no separate app.options)
 app.use(cors({
     origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error("🚫 Titan Firewall: CORS Violation"), false);
+        if (!origin || allowedOrigins.includes(origin) || /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin)) {
+            return callback(null, true);
         }
+        console.warn(`[CORS Blocked] Origin not allowed: ${origin}`);
+        return callback(new Error(`CORS violation: origin not allowed (${origin})`));
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Trace-Id"]
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
 }));
+
+// Ensure preflight OPTIONS are answered immediately with 204
 app.options('*', cors());
 
-// 5. Distributed Rate Limiting (Redis Optimized)
-const globalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 1000,
-});
-app.use(globalLimiter);
+// 5. Health + metrics BEFORE the rate limiter so probes are never throttled
+let dbHealthy = false;
 
-app.use(cookieParser());
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
-// ============================================================
-// 🚦 CORE ENGINE COMPONENTS
-// ============================================================
-
-// Redis Adapter for Scaling (Docker/K8s Friendly)
-// server.js mein isey dhundo aur badlo
-const io = socketIo(server, {
-    cors: { 
-        origin: allowedOrigins, 
-        credentials: true 
-    },
-    transports: ['websocket', 'polling'], // 👈 'polling' ko wapas add karo
-    allowEIO3: true // Backward compatibility ke liye (optional)
-});
-
-// ============================================================
-// 🛣️ ROUTES & OBSERVABILITY ENDPOINTS
-// ============================================================
-
-// Prometheus Scraping Endpoint
-app.get("/metrics", async (req, res) => {
-    res.setHeader('Content-Type', register.contentType);
-    res.send(await register.metrics());
-});
-
-// Lightweight Health Check (Caching DB Status)
-let lastDbCheck = false;
-setInterval(async () => {
+const checkDb = async () => {
     try {
         await sequelize.authenticate();
-        lastDbCheck = true;
-    } catch (e) {
-        lastDbCheck = false;
-        logger.error("HealthCheck: Database Down");
+        dbHealthy = true;
+    } catch (err) {
+        dbHealthy = false;
+        logger.error({ err: err.message }, "HealthCheck: database down");
     }
-}, 30000);
+};
 
 app.get("/health", (req, res) => {
-    const status = lastDbCheck ? 200 : 503;
-    res.status(status).json({
-        status: lastDbCheck ? "healthy" : "degraded",
+    const ok = dbHealthy && !isShuttingDown;
+    res.status(ok ? 200 : 503).json({
+        status: ok ? "healthy" : isShuttingDown ? "shutting_down" : "degraded",
         timestamp: new Date().toISOString(),
-        version: "14.0.0-alpha"
     });
 });
 
-// API v1 Mounting
+app.get("/metrics", async (req, res, next) => {
+    try {
+        if (METRICS_TOKEN && req.headers.authorization !== `Bearer ${METRICS_TOKEN}`) {
+            return res.status(401).end();
+        }
+        res.setHeader("Content-Type", register.contentType);
+        res.send(await register.metrics());
+    } catch (err) {
+        next(err);
+    }
+});
+
+// 6. Global rate limiter (Redis-backed when rate-limit-redis is installed)
+const globalLimiter = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: RATE_LIMIT_MAX,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    passOnStoreError: true, // Redis hiccup must not take the whole API down
+    store: buildRateLimitStore(),
+    keyGenerator: (req) => {
+        const ip = getClientIp(req);
+        return typeof ipKeyGenerator === "function" ? ipKeyGenerator(ip) : ip;
+    },
+    handler: (req, res) =>
+        res.status(429).json({ success: false, message: "Too many requests, please try again later." }),
+});
+app.use(globalLimiter);
+
+// 7. Parsers (small default. Raise per-route for upload endpoints only)
+app.use(cookieParser());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ limit: "1mb", extended: true }));
+
+// ============================================================
+// 🔌 SOCKET.IO
+// ============================================================
+const io = socketIo(server, {
+    cors: { origin: allowedOrigins, credentials: true },
+    transports: ["websocket", "polling"],
+});
+app.set("io", io);
+setIoInstance(io);
+
+const socketRedisClients = [];
+
+const attachSocketRedisAdapter = async () => {
+    try {
+        if (redisClient.status !== 'ready') {
+            logger.info("Redis is not connected; skipping Socket.io Redis adapter (running with in-memory adapter).");
+            return;
+        }
+        const pubClient = redisClient.duplicate();
+        const subClient = redisClient.duplicate();
+        socketRedisClients.push(pubClient, subClient);
+
+        pubClient.on('error', (err) => logger.warn({ err: err.message }, "[REDIS PUB CLIENT ERROR]"));
+        subClient.on('error', (err) => logger.warn({ err: err.message }, "[REDIS SUB CLIENT ERROR]"));
+
+        io.adapter(createAdapter(pubClient, subClient));
+        logger.info("Socket.io Redis adapter attached");
+    } catch (err) {
+        logger.warn(
+            { err: err.message },
+            "Socket.io Redis adapter skipped (offline mode); running with in-memory adapter (single instance only)"
+        );
+    }
+};
+
+// ============================================================
+// 🛣️ ROUTES
+// ============================================================
 const apiV1 = express.Router();
 
-// Import Routes
+// More specific paths MUST be mounted before their parent ("/admin")
+apiV1.use("/admin/instagram", require("./routes/instagramRoutes"));
+
 apiV1.use("/auth", require("./routes/authRoutes"));
 apiV1.use("/admin", require("./routes/adminRoutes"));
 apiV1.use("/products", require("./routes/productRoutes"));
@@ -169,92 +297,108 @@ apiV1.use("/channels", require("./routes/channelRoutes"));
 apiV1.use("/calculator", require("./routes/calculatorRoutes"));
 apiV1.use("/shorts", require("./routes/shortsRoutes"));
 
-// Mount under both /api and /api/v1 for compatibility
+// /api/v1 is canonical; /api kept for backward compatibility
 app.use("/api/v1", apiV1);
 app.use("/api", apiV1);
 
-// ⚠️ GLOBAL ERROR HANDLER (Environment Aware)
-app.use((err, req, res, next) => {
-    const isProd = process.env.NODE_ENV === "production";
-    logger.error({ 
-        traceId: req.id, 
-        msg: err.message, 
-        stack: isProd ? null : err.stack 
-    }, "Internal Fault");
+// ============================================================
+// ⚠️ 404 + ERROR HANDLING
+// ============================================================
+app.use((req, res) => {
+    res.status(404).json({ success: false, message: "Route not found", traceId: req.id });
+});
 
-    res.status(err.status || 500).json({
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    const status = err.status || err.statusCode || 500;
+
+    (status >= 500 ? logger.error : logger.warn).call(
+        logger,
+        { traceId: req.id, status, err: err.message, stack: status >= 500 && !IS_PROD ? err.stack : undefined },
+        "Request failed"
+    );
+
+    if (res.headersSent) return next(err);
+
+    res.status(status).json({
         success: false,
-        message: isProd ? "Internal Server Error" : err.message,
-        traceId: req.id
+        message: status >= 500 && IS_PROD ? "Internal Server Error" : err.message,
+        traceId: req.id,
     });
 });
 
 // ============================================================
-// 🏁 GRACEFUL IGNITION PROTOCOL
+// 🏁 STARTUP
 // ============================================================
-const initSuperAdmin = async () => {
-    const superAdminEmail = "rcmaiasistant@gmail.com";
-    const defaultPassword = process.env.SUPER_ADMIN_DEFAULT_PASSWORD || "admin123"; // Use environment variable or a strong default
-    const SALT_ROUNDS = 10; // Make sure this matches authController
-
-    try {
-        const existingSuperAdmin = await Admin.findOne({ where: { email: superAdminEmail } });
-
-        if (!existingSuperAdmin) {
-            const hashedPassword = await bcrypt.hash(defaultPassword, SALT_ROUNDS);
-            await Admin.create({
-                name: "Super Admin", // Changed from fullName to name
-                email: superAdminEmail,
-                masterPassword: hashedPassword, // Changed from password to masterPassword
-                role: "SUPER_ADMIN", // Explicitly set as SUPER_ADMIN
-                status: "active",
-                isApproved: true,
-            });
-            logger.info("✅ Super Admin user created in Admin model: rcmaiasistant@gmail.com");
-        } else {
-            logger.info("Super Admin user already exists in Admin model: rcmaiasistant@gmail.com");
-            if (existingSuperAdmin.role !== "SUPER_ADMIN" || !existingSuperAdmin.isApproved || existingSuperAdmin.status !== "active") {
-                await existingSuperAdmin.update({ role: "SUPER_ADMIN", status: "active", isApproved: true });
-                logger.info("Super Admin role and approval status updated in Admin model.");
-            }
-        }
-    } catch (error) {
-        logger.error({ error: error.message, stack: error.stack }, "Error setting up Super Admin");
-    }
-};
+let healthTimer;
 
 const startServer = async () => {
     try {
         await connectDB();
-        await initSuperAdmin(); // Call super admin setup here
-        server.listen(PORT, () => {
-            logger.info(`⚡ TITAN ALPHA-14 ONLINE [Port: ${PORT}]`);
+        await checkDb(); // so /health is correct immediately, not after 30s
+        await attachSocketRedisAdapter();
+
+        healthTimer = setInterval(checkDb, 30 * 1000);
+        healthTimer.unref();
+
+        server.listen(PORT, "0.0.0.0", () => {
+            logger.info({ port: PORT, env: process.env.NODE_ENV, trustProxy: TRUST_PROXY_HOPS }, "Server online");
         });
-
-        // OCI Keep-Alive Optimization
-        server.keepAliveTimeout = 61000;
-        server.headersTimeout = 65000;
-
     } catch (err) {
-        logger.fatal(err, "Startup Failure");
+        logger.fatal({ err: err.message, stack: err.stack }, "Startup failure");
         process.exit(1);
     }
 };
 
-startServer();
+// ============================================================
+// 🛑 GRACEFUL SHUTDOWN
+// ============================================================
+const shutdown = async (signal, exitCode = 0) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    logger.info(`${signal} received. Starting graceful shutdown...`);
 
-// Graceful Shutdown (Memory & Connection Drain)
-const shutdown = async (signal) => {
-    logger.info(`🛑 ${signal} received. Initiating Graceful Shutdown...`);
-    server.close(async () => {
-        logger.info("HTTP Server drained.");
-        await sequelize.close();
-        await redisClient.quit();
-        logger.info("All connections closed. Titan Off.");
-        process.exit(0);
-    });
+    const forceTimer = setTimeout(() => {
+        logger.error("Graceful shutdown timed out. Forcing exit.");
+        process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceTimer.unref();
+
+    try {
+        clearInterval(healthTimer);
+
+        // Stop accepting new connections; drop idle keep-alive sockets so close() can finish
+        if (typeof server.closeIdleConnections === "function") server.closeIdleConnections();
+        await new Promise((resolve) => io.close(() => resolve())); // also closes the HTTP server
+        logger.info("HTTP + Socket.io drained.");
+
+        const results = await Promise.allSettled([
+            sequelize.close(),
+            ...socketRedisClients.map((c) => c.quit()),
+            redisClient.quit(),
+        ]);
+        results
+            .filter((r) => r.status === "rejected")
+            .forEach((r) => logger.warn({ err: r.reason?.message }, "Error during resource close"));
+
+        logger.info("All connections closed. Bye.");
+        process.exit(exitCode);
+    } catch (err) {
+        logger.error({ err: err.message }, "Error during shutdown");
+        process.exit(1);
+    }
 };
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("unhandledRejection", (reason) => {
+    logger.error({ err: reason instanceof Error ? reason.message : String(reason) }, "Unhandled promise rejection");
+});
+process.on("uncaughtException", (err) => {
+    logger.fatal({ err: err.message, stack: err.stack }, "Uncaught exception");
+    shutdown("uncaughtException", 1);
+});
 
+startServer();
+
+module.exports = { app, server, io };
