@@ -55,6 +55,7 @@ const allowedOrigins = [
     'https://rcmai.in',
     'https://www.rcmai.in',
     'https://api.rcmai.in',
+    'https://rcm-ai-admin-ui.vercel.app',
     process.env.FRONTEND_URL,
     process.env.ADMIN_URL,
     process.env.CLIENT_URL,
