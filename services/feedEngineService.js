@@ -186,7 +186,7 @@ async function buildPool() {
         const handle = acc.username || r.creatorHandle ? String(acc.username || r.creatorHandle).replace(/^@/, '') : '';
         const rawVideoUrl = r.videoUrl || r.directMediaUrl || r.mediaUrl || r.video_url || '';
         const isValidStream = rawVideoUrl && !rawVideoUrl.includes('instagram.com/reel/') && (rawVideoUrl.includes('.mp4') || rawVideoUrl.includes('cdninstagram.com') || rawVideoUrl.includes('mime=video'));
-        const directVideo = isValidStream ? rawVideoUrl : null;
+        const directVideo = isValidStream ? rawVideoUrl : `${process.env.API_BASE_URL || 'http://localhost:5000'}/api/shorts/ig-stream/${r.shortcode}`;
         const embedUrl = r.shortcode ? `https://www.instagram.com/reel/${r.shortcode}/embed/` : (r.url || '');
         const videoUrl = directVideo || (r.shortcode ? `https://www.instagram.com/reel/${r.shortcode}/` : rawVideoUrl);
         const thumbnailUrl = r.thumbnailUrl || r.thumbnail || '';

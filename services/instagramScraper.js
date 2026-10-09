@@ -128,11 +128,14 @@ function normalizeReelData(reelNode, creatorHandle) {
     const captionText = reelNode.title || (reelNode.edge_media_to_caption && reelNode.edge_media_to_caption.edges[0] && reelNode.edge_media_to_caption.edges[0].node.text) || `${creatorHandle} reel ${shortcode}`;
     const likesCount = reelNode.edge_media_preview_like && reelNode.edge_media_preview_like.count ? reelNode.edge_media_preview_like.count : Math.floor(Math.random() * 1000) + 50;
     const commentsCount = reelNode.edge_media_to_comment && reelNode.edge_media_to_comment.count ? reelNode.edge_media_to_comment.count : Math.floor(Math.random() * 50) + 5;
+    const rawVideoUrl = reelNode.video_url || reelNode.videoUrl || reelNode.video_versions?.[0]?.url || reelNode.edge_media_to_parent_video?.video_url || '';
+    const videoUrl = (rawVideoUrl && (rawVideoUrl.includes('.mp4') || rawVideoUrl.includes('cdninstagram.com'))) ? rawVideoUrl : null;
 
     return {
         shortcode: shortcode,
         url: `https://www.instagram.com/reel/${shortcode}/`,
         thumbnailUrl: reelNode.thumbnailUrl || `https://www.instagram.com/reel/${shortcode}/media/?size=l`,
+        videoUrl: videoUrl,
         title: captionText,
         creatorHandle: creatorHandle,
         likesCount: likesCount,

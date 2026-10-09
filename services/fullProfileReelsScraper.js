@@ -166,25 +166,33 @@ function extractReelsFromJson(obj, username, reelsMap) {
     return;
   }
 
-  // Check if object is a media node containing shortcode
-  if (obj.shortcode && typeof obj.shortcode === 'string' && obj.shortcode.length >= 5) {
-    const shortcode = obj.shortcode;
+  // Check if object is a media node containing shortcode or code
+  const shortcode = obj.shortcode || obj.code;
+  if (shortcode && typeof shortcode === 'string' && shortcode.length >= 5) {
     const caption = obj.title || (obj.edge_media_to_caption?.edges?.[0]?.node?.text) || obj.caption?.text || '';
     const thumbnailUrl = obj.thumbnail_src || obj.display_url || obj.thumbnailUrl || '';
-    const videoUrl = obj.video_url || obj.videoUrl || obj.video_versions?.[0]?.url || '';
+    const videoUrl = obj.video_url || obj.videoUrl || obj.video_versions?.[0]?.url || obj.edge_media_to_parent_video?.video_url || '';
     const existing = reelsMap.get(shortcode) || {};
     reelsMap.set(shortcode, {
       shortcode,
       url: `https://www.instagram.com/reel/${shortcode}/`,
       thumbnailUrl: thumbnailUrl || existing.thumbnailUrl,
-      videoUrl: videoUrl || existing.videoUrl,
+      videoUrl: (videoUrl && (videoUrl.includes('.mp4') || videoUrl.includes('cdninstagram.com')) ? videoUrl : '') || existing.videoUrl,
       title: caption || existing.title || `Instagram Reel ${shortcode}`,
       creatorHandle: username,
     });
   }
 
+  if (obj.video_url && obj.shortcode) {
+    const existing = reelsMap.get(obj.shortcode) || {};
+    if (obj.video_url.includes('.mp4') || obj.video_url.includes('cdninstagram.com')) {
+      existing.videoUrl = obj.video_url;
+      reelsMap.set(obj.shortcode, existing);
+    }
+  }
+
   for (const key of Object.keys(obj)) {
-    if (key === 'edge_owner_to_timeline_media' || key === 'xdt_api__v1__clips__home__connection' || key === 'edges' || key === 'node' || key === 'items') {
+    if (typeof obj[key] === 'object' && obj[key] !== null) {
       extractReelsFromJson(obj[key], username, reelsMap);
     }
   }

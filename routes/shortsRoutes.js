@@ -25,6 +25,8 @@ const {
   getFeed,
   trackView,
   trackSeenBatch,
+  getInstagramStream,
+  reportUnavailable,
 } = require('../controllers/shortsController');
 const { isAuthenticated, isActiveUser } = require('../middleware/authMiddleware');
 
@@ -124,6 +126,7 @@ router.post('/seen', optionalAuth, limitTrack, express.json({ limit: '8kb' }), t
 
 router.get('/', limitPublicRead, getShorts);
 router.get('/channel/:channelId', limitPublicRead, getShortsByChannel);
+router.get('/ig-stream/:shortcode', limitPublicRead, getInstagramStream);
 
 /* -------------------------------------------------------------------------- */
 /* Engagement                                                                 */
@@ -132,5 +135,6 @@ router.get('/channel/:channelId', limitPublicRead, getShortsByChannel);
 router.post('/:id/like', isAuthenticated, isActiveUser, limitLike, toggleLikeShort);
 router.post('/:id/comments', isAuthenticated, isActiveUser, limitComment, addShortComment);
 router.get('/:id/comments', limitPublicRead, getShortComments);
+router.post('/:id/unavailable', limitPublicRead, reportUnavailable);
 
 module.exports = router;

@@ -15,6 +15,7 @@
 
 const asyncHandler = require('express-async-handler');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const { Op, DataTypes, QueryTypes, literal } = require('sequelize');
 const { parse } = require('iso8601-duration');
 const { Channel, ChannelVideo, ShortInteraction, ShortComment, User } = require('../models');
@@ -469,6 +470,80 @@ exports.getShortsByChannel = asyncHandler(async (req, res) => {
 
   if (!channel) return fail(res, 404, 'Channel not found.');
   await serveFeed(req, res, channel.id);
+});
+
+exports.getInstagramStream = asyncHandler(async (req, res) => {
+  const shortcode = req.params.shortcode;
+  if (!shortcode || !/^[A-Za-z0-9_-]+$/.test(shortcode)) {
+    return fail(res, 400, 'Invalid shortcode.');
+  }
+
+  // Step A (DB Direct Cache Check)
+  try {
+    const { InstagramReel } = require('../models');
+    let reel = null;
+    try {
+      reel = await InstagramReel.findOne({ where: { shortcode }, attributes: ['videoUrl'], raw: true });
+    } catch (e) {
+      reel = await InstagramReel.findOne({ shortcode });
+    }
+    if (reel && reel.videoUrl && !reel.videoUrl.includes('instagram.com/reel/') && (reel.videoUrl.includes('.mp4') || reel.videoUrl.includes('cdninstagram.com'))) {
+      log.info(`[shortsController] Found cached direct videoUrl in InstagramReel DB for ${shortcode}`);
+      return res.redirect(302, reel.videoUrl);
+    }
+  } catch (dbErr) {
+    log.warn(`[shortsController] DB cache lookup failed for ${shortcode}: ${dbErr.message}`);
+  }
+
+  // Step B (Authenticated Live Stream Fetch)
+  try {
+    const sessionId = process.env.INSTAGRAM_SESSION_ID;
+    const response = await axios.get(`https://www.instagram.com/reel/${shortcode}/?__a=1&__d=dis`, {
+      headers: {
+        'Cookie': sessionId ? `sessionid=${sessionId}; ds_user_id=${sessionId.split('%')[0]}` : '',
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'Accept': '*/*'
+      },
+      validateStatus: () => true,
+      timeout: 9000
+    });
+
+    // Step C (URL Extraction & Cache)
+    let rawUrl =
+      response.data?.items?.[0]?.video_versions?.[0]?.url ||
+      response.data?.graphql?.shortcode_media?.video_url;
+
+    if (!rawUrl && typeof response.data === 'string') {
+      const ogMatch = response.data.match(/<meta property="og:video" content="([^"]+)"/i);
+      const jsonMatch = response.data.match(/"video_url":"(https:[^"]+)"/i);
+      rawUrl = ogMatch ? ogMatch[1] : (jsonMatch ? jsonMatch[1] : null);
+    }
+
+    if (rawUrl) {
+      const cleanUrl = rawUrl.replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+      try {
+        const { InstagramReel } = require('../models');
+        if (typeof InstagramReel.updateOne === 'function') {
+          await InstagramReel.updateOne({ shortcode }, { $set: { videoUrl: cleanUrl } });
+        } else {
+          await InstagramReel.update({ videoUrl: cleanUrl }, { where: { shortcode } });
+        }
+      } catch (cacheErr) {
+        log.warn(`[shortsController] Cache update failed for ${shortcode}: ${cacheErr.message}`);
+      }
+      return res.redirect(302, cleanUrl);
+    }
+
+    // Step D (Eliminate 404 Crashes): Fall back to Instagram embed redirect
+    return res.redirect(302, `https://www.instagram.com/reel/${shortcode}/embed/`);
+  } catch (err) {
+    log.error(`ig-stream proxy error for ${shortcode}: ${err.message}`);
+    return res.redirect(302, `https://www.instagram.com/reel/${shortcode}/embed/`);
+  }
+});
+
+exports.reportUnavailable = asyncHandler(async (req, res) => {
+  return res.status(200).json({ success: true });
 });
 
 exports.toggleLikeShort = asyncHandler(async (req, res) => {
