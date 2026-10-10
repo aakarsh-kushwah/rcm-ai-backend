@@ -5,8 +5,8 @@
 
 const jwt = require('jsonwebtoken');
 const { logger } = require('../utils/logger'); // Add logger import
-// ✅ FIX: Properly destructure User from the models export
 const { User, Admin } = require('../models'); 
+const { connection: redis } = require('../config/redis'); // Redis connection for active user tracking
 
 // ============================================================
 // 1. NEURAL TOKEN VALIDATOR (JWT Check)
@@ -28,6 +28,12 @@ const verifyTokenLogic = (req, res, next) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         req.user = decoded;
         req.userId = decoded.id || decoded.userId || decoded._id;
+
+        // Task 4.1: Track active user in Redis (TTL: 2 minutes)
+        if (req.userId) {
+            redis.setex(`active_user:${req.userId}`, 120, 'online').catch(() => {});
+        }
+
         logger.info(`[AuthMiddleware] verifyTokenLogic: Token decoded for user ID: ${req.userId}, role: ${req.user.role}`);
         next();
     } catch (error) {
@@ -43,7 +49,6 @@ const isActiveUser = async (req, res, next) => {
     logger.info('[AuthMiddleware] isActiveUser: Starting active user check.');
     try {
         let userId = req.userId || req.user?.id;
-        // ✅ FIX: Handle UUID vs Integer user IDs properly (Admin/User tables may use UUID or numeric IDs)
         if (userId) {
             const parsed = parseInt(userId, 10);
             userId = Number.isNaN(parsed) ? userId : parsed;
@@ -56,7 +61,6 @@ const isActiveUser = async (req, res, next) => {
 
         logger.info(`[AuthMiddleware] isActiveUser: Checking status for user ID: ${userId}, token role: ${req.user?.role}`);
 
-        // ✅ ADMIN BRANCH: If JWT role indicates Admin/Super Admin, query Admin table instead of User table to prevent 404
         const tokenRole = (req.user?.role || '').toUpperCase();
         if (tokenRole === 'ADMIN' || tokenRole === 'SUPER_ADMIN' || tokenRole === 'SUPERADMIN' || req.user?.isAdmin) {
             logger.info(`[AuthMiddleware] isActiveUser: User is an admin, checking Admin model.`);
@@ -81,16 +85,11 @@ const isActiveUser = async (req, res, next) => {
             return next();
         }
 
-        // ✅ FIX: Ensure User model is available
         if (!User) {
             console.error("🔥 CRITICAL: User model undefined in Middleware");
             return res.status(500).json({ success: false, message: 'System Error: DB Model Missing.' });
         }
 
-        // 1. Fetch User (Only Status Needed)
-        // ✅ FIX: Removed 'isApproved' from attributes. The User model does not have
-        // an 'isApproved' column (only the Admin model does). Requesting it caused
-        // a "Unknown column 'isapproved'" 500 error in production.
         const user = await User.findByPk(userId, {
             attributes: ['id', 'status', 'role']
         });
@@ -100,7 +99,6 @@ const isActiveUser = async (req, res, next) => {
             return res.status(404).json({ success: false, message: '🚫 User Not Found.' });
         }
 
-        // 2. ADMIN BYPASS & APPROVAL CHECK
         const userRole = (user.role || '').toUpperCase();
         if (userRole === 'ADMIN' || userRole === 'SUPPORT' || user.isAdmin) {
             logger.info(`[AuthMiddleware] isActiveUser: User ${userId} has role ${userRole}, bypassing further checks.`);
@@ -113,25 +111,40 @@ const isActiveUser = async (req, res, next) => {
             return next();
         }
 
-        // 3. BAN CHECK
-        if (user.status === 'banned') {
-            logger.warn(`[AuthMiddleware] isActiveUser: User ${userId} is banned.`);
-            return res.status(403).json({ success: false, message: '🚫 Account Banned.' });
+        if (user.status === 'banned' || user.status === 'suspended') {
+            logger.warn(`[AuthMiddleware] isActiveUser: User ${userId} is banned or suspended. Status: ${user.status}`);
+            return res.status(403).json({ success: false, message: '🚫 User is banned or suspended.' });
         }
 
-        // 4. SIMPLE STATUS CHECK
-        if (user.status === 'active' || user.status === 'premium') {
-            req.userStatus = user.status;
-            req.userRole = user.role;
-            logger.info(`[AuthMiddleware] isActiveUser: User ${userId} is active/premium. Status: ${user.status}`);
-            next();
+        // Allow 'active', 'premium', or 'pending' for specific routes
+        const shortsRoutes = ["/api/shorts/feed", "/api/shorts/seen"];
+        const isShortsRoute = shortsRoutes.some(route => req.path.startsWith(route));
+
+        if (isShortsRoute) {
+            if (user.status === "active" || user.status === "premium" || user.status === "pending") {
+                req.userStatus = user.status;
+                req.userRole = user.role;
+                logger.info(`[AuthMiddleware] isActiveUser: User ${userId} accessing shorts route with status: ${user.status}`);
+                next();
+            } else {
+                logger.warn(`[AuthMiddleware] isActiveUser: User ${userId} attempted shorts route access with status: ${user.status}. Access denied.`);
+                return res.status(403).json({ success: false, message: '🚫 Access denied for this user status for shorts routes.' });
+            }
         } else {
-            logger.warn(`[AuthMiddleware] isActiveUser: User ${userId} requires subscription. Status: ${user.status}`);
-            return res.status(403).json({
-                success: false,
-                message: '⛔ Subscription Required. Please complete payment.',
-                code: 'SUBSCRIPTION_REQUIRED'
-            });
+            // Existing logic for other routes: only 'active' or 'premium' users can access
+            if (user.status === 'active' || user.status === 'premium') {
+                req.userStatus = user.status;
+                req.userRole = user.role;
+                logger.info(`[AuthMiddleware] isActiveUser: User ${userId} is active/premium. Status: ${user.status}`);
+                next();
+            } else {
+                logger.warn(`[AuthMiddleware] isActiveUser: User ${userId} requires subscription for route ${req.path}. Status: ${user.status}`);
+                return res.status(403).json({
+                    success: false,
+                    message: '⛔ Subscription Required. Please complete payment.',
+                    code: 'SUBSCRIPTION_REQUIRED'
+                });
+            }
         }
 
     } catch (error) {

@@ -7,17 +7,18 @@
 const { sequelize } = require('../config/db'); // Imported sequelize instance directly from config/db for transactions
 const { Op } = require('sequelize');
 const admin = require('../config/firebase'); // Firebase Admin SDK
+const { connection: redis } = require('../config/redis');
 
-// âœ… CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
+// ✅ CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
 const { User, Admin, ChatMessage, NotificationToken, PaymentLog } = require('../models');
 
-// ðŸ“Š Optimized Selection: Sirf wahi data mangaayein jo dashboard par dikhana hai
+// 📊 Optimized Selection: Sirf wahi data mangaayein jo dashboard par dikhana hai
 const userSelectFields = [
     'id', 'fullName', 'googleId', 'email', 'phone', 'role', 'status', 'autoPayStatus', 'createdAt'
 ];
 
 // =======================================================
-// 1ï¸âƒ£ GET REGULAR USERS (Optimized for Dashboard)
+// 1️⃣ GET REGULAR USERS (Optimized for Dashboard)
 // =======================================================
 const getRegularUsers = async (req, res) => {
     try {
@@ -28,13 +29,13 @@ const getRegularUsers = async (req, res) => {
         
         res.status(200).json({ success: true, count: users.length, data: users });
     } catch (error) {
-        console.error('âŒ Fetch Users Error:', error.message);
+        console.error('❌ Fetch Users Error:', error.message);
         res.status(500).json({ success: false, message: 'Failed to retrieve user registry.' });
     }
 };
 
 // =======================================================
-// 2ï¸âƒ£ GET ALL ADMINS (Team View - From Separate Admin Model)
+// 2️⃣ GET ALL ADMINS (Team View - From Separate Admin Model)
 // =======================================================
 const getAllAdmins = async (req, res) => {
     try {
@@ -44,18 +45,18 @@ const getAllAdmins = async (req, res) => {
         });
         res.status(200).json({ success: true, data: admins });
     } catch (error) {
-        console.error('âŒ Fetch Admins Error:', error.message);
+        console.error('❌ Fetch Admins Error:', error.message);
         res.status(500).json({ success: false, message: 'Failed to retrieve admin registry.' });
     }
 };
 
 // =======================================================
-// 3ï¸âƒ£ DELETE USER (Atomic Transaction - ASI Level) ðŸ›¡ï¸
+// 3️⃣ DELETE USER (Atomic Transaction - ASI Level) 🛡️
 // =======================================================
 const deleteUser = async (req, res) => {
     const { userId } = req.params;
     
-    // ðŸš¦ Start Transaction: Sab kuch delete hoga, ya kuch bhi nahi.
+    // 🚦 Start Transaction: Sab kuch delete hoga, ya kuch bhi nahi.
     const t = await sequelize.transaction(); // Using imported sequelize instance directly
 
     try {
@@ -67,7 +68,7 @@ const deleteUser = async (req, res) => {
             return res.status(403).json({ success: false, message: "Security Alert: Cannot delete yourself." });
         }
 
-        console.log(`ðŸ—‘ï¸ [DELETE] Initiating wipe for User ID: ${userId}`);
+        console.log(`🗑️ [DELETE] Initiating wipe for User ID: ${userId}`);
 
         // Step 1: Delete Chat History
         await ChatMessage.destroy({ where: { userId }, transaction: t });
@@ -80,26 +81,26 @@ const deleteUser = async (req, res) => {
         // Step 3: Delete the User Account
         const deletedCount = await User.destroy({ where: { id: userId }, transaction: t });
 
-        // âœ… Commit Changes
+        // ✅ Commit Changes
         await t.commit();
 
         if (deletedCount === 0) {
             return res.status(404).json({ success: false, message: "User not found." });
         }
 
-        console.log(`âœ… [DELETE] User ${userId} wiped successfully.`);
+        console.log(`✅ [DELETE] User ${userId} wiped successfully.`);
         res.status(200).json({ success: true, message: "User and all associated data wiped." });
 
     } catch (error) {
-        // â†©ï¸ Rollback: Undo everything if error occurs
+        // ↩️ Rollback: Undo everything if error occurs
         await t.rollback();
-        console.error("âŒ User Wipe Error:", error);
+        console.error("❌ User Wipe Error:", error);
         res.status(500).json({ success: false, message: "Deletion failed due to system lock." });
     }
 };
 
 // =======================================================
-// 4ï¸âƒ£ UPDATE USER DATA (CRM Operations)
+// 4️⃣ UPDATE USER DATA (CRM Operations)
 // =======================================================
 const updateUserData = async (req, res) => {
     const { userId } = req.params;
@@ -139,13 +140,13 @@ const updateUserData = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("âŒ Update Error:", error);
+        console.error("❌ Update Error:", error);
         res.status(500).json({ success: false, message: "Update failed." });
     }
 };
 
 // =======================================================
-// 5ï¸âƒ£ âœ¨ TITAN NOTIFICATION BLAST (The Broadcast Engine) ðŸš€
+// 5️⃣ ✨ TITAN NOTIFICATION BLAST (The Broadcast Engine) 🚀
 // =======================================================
 const pushNotificationToAll = async (req, res) => {
     try {
@@ -169,7 +170,7 @@ const pushNotificationToAll = async (req, res) => {
             return res.status(404).json({ success: false, message: "No active devices found in Titan Grid." });
         }
 
-        console.log(`ðŸ“£ [TITAN BLAST] Targeting ${tokens.length} devices...`);
+        console.log(`📢 [TITAN BLAST] Targeting ${tokens.length} devices...`);
 
         // 2. SMART BATCHING (500 per chunk - Firebase Limit)
         const chunks = [];
@@ -206,7 +207,7 @@ const pushNotificationToAll = async (req, res) => {
             failureCount += r.failureCount;
         });
 
-        console.log(`âœ… [BLAST COMPLETE] Success: ${successCount}, Failed: ${failureCount}`);
+        console.log(`✅ [BLAST COMPLETE] Success: ${successCount}, Failed: ${failureCount}`);
 
         res.status(200).json({ 
             success: true, 
@@ -215,13 +216,13 @@ const pushNotificationToAll = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("ðŸ”¥ Broadcast System Error:", error);
+        console.error("🔥 Broadcast System Error:", error);
         res.status(500).json({ success: false, message: "Broadcast interrupted." });
     }
 };
 
 // =======================================================
-// 6ï¸âƒ£ GET ADMIN METRICS OVERVIEW
+// 6️⃣ GET ADMIN METRICS OVERVIEW
 // =======================================================
 const getMetricsOverview = async (req, res) => {
     try {
@@ -245,13 +246,13 @@ const getMetricsOverview = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('âŒ Get Metrics Overview Error:', error.message);
+        console.error('❌ Get Metrics Overview Error:', error.message);
         res.status(500).json({ success: false, message: 'Failed to retrieve metrics overview.' });
     }
 };
 
 // =======================================================
-// 7ï¸âƒ£ GET PAGINATED PAYMENT LOGS
+// 7️⃣ GET PAGINATED PAYMENT LOGS
 // =======================================================
 const getPaymentLogs = async (req, res) => {
     const page = parseInt(req.query.page, 10) || 1;
@@ -303,7 +304,7 @@ const getPaymentLogs = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('âŒ Get Payment Logs Error:', error.message);
+        console.error('❌ Get Payment Logs Error:', error.message);
         res.status(500).json({ success: false, message: 'Failed to retrieve payment logs.' });
     }
 };
@@ -341,6 +342,27 @@ const approveAdmin = async (req, res) => {
 };
 
 // =======================================================
+// 9️⃣ REALTIME ACTIVE USERS (Redis)
+// =======================================================
+const getRealtimeActiveUsers = async (req, res) => {
+    try {
+        let activeCount = 0;
+        if (redis && typeof redis.keys === 'function') {
+            const keys = await redis.keys('active_user:*');
+            activeCount = keys ? keys.length : 0;
+        }
+        res.status(200).json({
+            success: true,
+            activeCount,
+            timestamp: new Date(),
+        });
+    } catch (error) {
+        console.error('❌ Get Realtime Active Users Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to retrieve active users count.' });
+    }
+};
+
+// =======================================================
 // ✅ MODULE EXPORTS
 // =======================================================
 module.exports = {
@@ -352,4 +374,5 @@ module.exports = {
     approveAdmin,
     getMetricsOverview,
     getPaymentLogs,
+    getRealtimeActiveUsers,
 };

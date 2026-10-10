@@ -11,16 +11,17 @@ const { User, Admin, RefreshToken } = require("../models");
 const { Op } = require("sequelize");
 const { logger } = require("../utils/logger");
 const crypto = require("crypto");
-const { sendNewUserAlert } = require("../utils/emailService");
+const { sendNewUserAlert, sendAdminAlert } = require("../utils/emailService");
 
 // ⚙️ CONFIGURATION
 const JWT_ACCESS_EXPIRY = "15m";
 const SALT_ROUNDS = 10;
+const isProduction = process.env.NODE_ENV === "production";
 const COOKIE_OPTIONS = {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    maxAge: 90 * 24 * 60 * 60 * 1000 // 90 days sliding session
+    secure: isProduction, // Allows cookies over local LAN/HTTP during development/testing
+    sameSite: isProduction ? "none" : "lax",
+    maxAge: 90 * 24 * 60 * 60 * 1000 // 90-day persistent sliding window
 };
 
 // Helper: Token Generator (Access Token JWT)
@@ -89,6 +90,8 @@ exports.googleAuthLogin = async (req, res) => {
             return res.status(401).json({ success: false, message: "Google account email is not verified." });
         }
 
+        let isNewUser = false;
+
         let user = await User.findOne({
             where: {
                 [Op.or]: [
@@ -112,23 +115,17 @@ exports.googleAuthLogin = async (req, res) => {
                 await user.save();
             }
         } else {
+            isNewUser = true; // Mark as new user
             user = await User.create({
                 fullName: name || "Google User",
                 email: email.toLowerCase().trim(),
                 googleId: googleId,
                 avatar: picture || null,
-                status: "pending",
+                status: "active",
                 autoPayStatus: false,
                 nextBillingDate: null
             });
             logger.info({ traceId: req.id, userId: user.id }, "New user registered via Google OAuth");
-            await sendNewUserAlert({
-                fullName: user.fullName,
-                email: user.email,
-                phone: user.phone, // Assuming phone might be added later or not present for Google OAuth
-                role: user.role,
-                registrationTimestamp: user.createdAt,
-            });
         }
 
         if (user.status === "banned" || user.status === "suspended") {
@@ -138,6 +135,30 @@ exports.googleAuthLogin = async (req, res) => {
 
         const accessToken = generateToken(user, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"]);
+
+        // Asynchronous non-blocking admin alert
+        if (isNewUser) {
+          // Non-blocking asynchronous dispatch: user receives 200 OK immediately
+          setImmediate(async () => {
+            try {
+              const totalUsersCount = await User.count();
+              await sendAdminAlert({
+                type: 'NEW_USER_REGISTRATION',
+                user: {
+                  name: user.fullName || user.name || 'New Member',
+                  email: user.email,
+                  role: user.role || 'USER',
+                  id: user.id
+                },
+                totalUsers: totalUsersCount,
+                ip: req.ip || req.headers['x-forwarded-for'],
+                userAgent: req.headers['user-agent']
+              });
+            } catch (err) {
+              console.error('❌ [Admin Alert Background Error]:', err.message);
+            }
+          });
+        }
 
         // Set HttpOnly Cookie
         res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
@@ -196,13 +217,7 @@ exports.adminSignup = async (req, res) => {
         });
 
         logger.info({ traceId: req.id, adminId: admin.id, email: admin.email }, "New admin registered, awaiting verification");
-        await sendNewUserAlert({
-            fullName: admin.fullName,
-            email: admin.email,
-            phone: admin.phone,
-            role: admin.role,
-            registrationTimestamp: admin.createdAt,
-        });
+
 
         res.status(202).json({
             success: true,
@@ -248,13 +263,24 @@ exports.refreshToken = async (req, res) => {
 
         // Reuse Detection: If already revoked, compromise suspected! Revoke all user tokens.
         if (tokenRecord.revokedAt) {
-            logger.error({ traceId: req.id, userId: tokenRecord.userId }, "🚨 Refresh Token Reuse Detected! Revoking all sessions.");
-            await RefreshToken.update(
-                { revokedAt: new Date() },
-                { where: { userId: tokenRecord.userId, userType: "USER", revokedAt: null } }
-            );
-            res.clearCookie("refreshToken", COOKIE_OPTIONS);
-            return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All sessions revoked." });
+            const revokedTime = new Date(tokenRecord.revokedAt).getTime();
+            const currentTime = Date.now();
+            const gracePeriod = 60 * 1000; // 60 seconds
+
+            if ((currentTime - revokedTime) <= gracePeriod) {
+                // Within grace period, do NOT terminate sessions, issue new token
+                logger.warn({ traceId: req.id, userId: tokenRecord.userId }, "Refresh token reuse detected within grace period. Issuing new token.");
+                // Proceed to the normal token rotation logic (which is after this if block)
+            } else {
+                // Outside grace period, terminate sessions
+                logger.error({ traceId: req.id, userId: tokenRecord.userId }, "🚨 Refresh Token Reuse Detected! Revoking all sessions.");
+                await RefreshToken.update(
+                    { revokedAt: new Date() },
+                    { where: { userId: tokenRecord.userId, userType: "USER", revokedAt: null } }
+                );
+                res.clearCookie("refreshToken", COOKIE_OPTIONS);
+                return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All sessions revoked." });
+            }
         }
 
         const user = await User.findByPk(tokenRecord.userId);

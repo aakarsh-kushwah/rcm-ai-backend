@@ -1,4 +1,3 @@
-
 /**
  * @file rcm-ai-backend/services/fullProfileReelsScraper.js
  * @description Unlimited Instagram profile reels scraper using Puppeteer infinite scroll pagination & dynamic API extraction with zero mock arrays.
@@ -10,6 +9,7 @@ puppeteer.use(StealthPlugin());
 
 const axios = require('axios');
 const { logger } = require('../utils/logger');
+const InstagramReel = require('../models/InstagramReel');
 
 /**
  * Exhaustively scrapes all reels from a public Instagram profile using infinite scroll pagination.
@@ -92,12 +92,36 @@ async function fetchFullProfileReels(username, options = {}) {
     // Infinite scroll loop until no new reels or max attempts reached
     let previousReelCount = 0;
     let consecutiveNoNewReels = 0;
+    let consecutiveExistingReels = 0; // New counter for early stop
     const maxScrollAttempts = 50; // Safeguard against infinite loops
 
     for (let scrollAttempt = 1; scrollAttempt <= maxScrollAttempts; scrollAttempt++) {
       // Extract shortcodes and data from current DOM HTML as well
       const pageHtml = await page.content();
-      extractReelsFromHtml(pageHtml, cleanUsername, reelsMap);
+      const extractedShortcodes = new Set();
+      extractReelsFromHtml(pageHtml, cleanUsername, reelsMap, extractedShortcodes); // Modified to pass extractedShortcodes
+      
+      // Check if any of the newly extracted reels already exist in the DB
+      const newShortcodes = Array.from(extractedShortcodes).filter(sc => !reelsMap.has(sc));
+      
+      let allNewShortcodesExist = true;
+      for (const shortcode of newShortcodes) {
+        const existsInDb = await InstagramReel.exists({ shortcode });
+        if (!existsInDb) {
+          allNewShortcodesExist = false;
+          break;
+        }
+      }
+
+      if (newShortcodes.length > 0 && allNewShortcodesExist) {
+        consecutiveExistingReels++;
+        if (consecutiveExistingReels >= 2) { // Changed from 3 to 2 for testing
+          logger.info(`[FullProfileReelsScraper] Early stop: 2 consecutive batches of existing reels found for @${cleanUsername}.`);
+          break;
+        }
+      } else {
+        consecutiveExistingReels = 0;
+      }
 
       const currentCount = reelsMap.size;
       logger.info(`[FullProfileReelsScraper] @${cleanUsername} - Scroll ${scrollAttempt}: found ${currentCount} unique reels so far.`);
@@ -142,7 +166,7 @@ async function fetchFullProfileReels(username, options = {}) {
     url: reel.url || `https://www.instagram.com/reel/${reel.shortcode}/`,
     thumbnailUrl: reel.thumbnailUrl || `https://www.instagram.com/reel/${reel.shortcode}/media/?size=l`,
     videoUrl: reel.videoUrl || null,
-    title: String(reel.title || `Instagram Reel ${reel.shortcode}`).trim().slice(0, 500),
+    title: String(reel.title || `Instagram Reel ${shortcode}`).trim().slice(0, 500),
     creatorHandle: cleanUsername,
     category: category,
     accountId: accountId || null,
@@ -201,7 +225,7 @@ function extractReelsFromJson(obj, username, reelsMap) {
 /**
  * Helper to extract shortcodes from HTML string via regex
  */
-function extractReelsFromHtml(html, username, reelsMap) {
+function extractReelsFromHtml(html, username, reelsMap, extractedShortcodes = new Set()) {
   if (!html || typeof html !== 'string') return;
 
   // Regex matching /reel/shortcode or /p/shortcode
@@ -209,6 +233,7 @@ function extractReelsFromHtml(html, username, reelsMap) {
   let match;
   while ((match = regex.exec(html)) !== null) {
     const shortcode = match[1];
+    extractedShortcodes.add(shortcode); // Add to the set of extracted shortcodes
     if (!reelsMap.has(shortcode)) {
       reelsMap.set(shortcode, {
         shortcode,

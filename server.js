@@ -19,11 +19,14 @@ const socketIo = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const client = require("prom-client");
 const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
+const cron = require('node-cron'); // Added node-cron
 
 const { logger } = require("./utils/logger");
-const { connectDB, sequelize } = require("./models");
+const { connectDB, sequelize, Channel, InstagramAccount } = require("./models"); // Added Channel, InstagramAccount
 const { connection: redisClient } = require("./config/redis");
 const { setIoInstance } = require("./services/socketService");
+const { syncChannel } = require('./services/channelSyncService'); // Added syncChannel
+const { syncAllAccounts: syncAllInstagramAccounts } = require('./services/instagramSyncService'); // Added Instagram sync service
 
 // ============================================================
 // ⚙️ CONFIG
@@ -344,6 +347,36 @@ const startServer = async () => {
 
         server.listen(PORT, "0.0.0.0", () => {
             logger.info({ port: PORT, env: process.env.NODE_ENV, trustProxy: TRUST_PROXY_HOPS }, "Server online");
+
+            // Configure scheduled task for incremental sync (every 4 hours)
+            cron.schedule('0 */4 * * *', async () => {
+                logger.info('[CRON] Starting scheduled incremental sync for all active accounts.');
+                try {
+                    // Sync YouTube Channels
+                    const channels = await Channel.findAll({ where: { isActive: true } });
+                    for (const channel of channels) {
+                        try {
+                            await syncChannel(channel);
+                            logger.info(`[CRON] Channel sync successful for ${channel.name}.`);
+                        } catch (error) {
+                            logger.error(`[CRON] Channel sync failed for ${channel.name}: ${error.message}`);
+                        }
+                    }
+
+                    // Sync Instagram Accounts
+                    await syncAllInstagramAccounts();
+                    logger.info('[CRON] Scheduled Instagram accounts sync initiated.');
+
+                } catch (error) {
+                    logger.error(`[CRON] Error during scheduled sync: ${error.message}`);
+                }
+                logger.info('[CRON] Finished scheduled incremental sync.');
+            }, {
+                scheduled: true,
+                timezone: "Asia/Kolkata" // Or appropriate timezone for 4-6 hour interval calculation
+            });
+            logger.info('[CRON] Scheduled incremental sync set to run every 4 hours.');
+
         });
     } catch (err) {
         logger.fatal({ err: err.message, stack: err.stack }, "Startup failure");

@@ -5,6 +5,7 @@
 
 const axios = require('axios');
 const { logger } = require('../utils/logger');
+const InstagramReel = require('../models/InstagramReel'); // Added import
 
 async function fetchProfileReels(username) {
     const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
@@ -99,7 +100,19 @@ async function fetchProfileReels(username) {
     }
 
     // Remove duplicates based on shortcode
-    const uniqueReels = Array.from(new Map(reels.map(reel => [reel.shortcode, reel])).values());
+    let uniqueReels = Array.from(new Map(reels.map(reel => [reel.shortcode, reel])).values());
+
+    // Filter out reels that already exist in the database
+    const existingReelShortcodes = (await InstagramReel.find({
+        shortcode: { $in: uniqueReels.map(reel => reel.shortcode) }
+    }).select('shortcode')).map(reel => reel.shortcode);
+
+    uniqueReels = uniqueReels.filter(reel => !existingReelShortcodes.includes(reel.shortcode));
+    
+    if (uniqueReels.length < reels.length) {
+      logger.info(`[InstagramScraper] Filtered out ${reels.length - uniqueReels.length} existing reels for @${username}.`);
+    }
+
     return uniqueReels;
 }
 

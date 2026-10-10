@@ -233,16 +233,19 @@ exports.createChannel = asyncHandler(async (req, res) => {
     isShortsOnly,
   });
 
-  // Immediately trigger initial sync
-  try {
-    await syncChannel(channel);
-  } catch (err) {
-    logger.warn(`Initial sync failed for newly added channel ${name}: ${err.message}`);
-  }
+  // Immediately trigger initial sync asynchronously without blocking the response
+  Promise.resolve().then(async () => {
+    try {
+      await syncChannel(channel);
+      logger.info(`Initial sync completed for newly added channel ${channel.name}.`);
+    } catch (err) {
+      logger.error(`Initial sync failed for newly added channel ${channel.name}: ${err.message}`);
+    }
+  });
 
   res.status(201).json({
     success: true,
-    message: 'Channel added successfully and initial sync triggered.',
+    message: 'Channel added successfully and initial sync triggered in background.',
     data: channel,
   });
 });
@@ -648,15 +651,19 @@ exports.createShortsOnlyChannel = asyncHandler(async (req, res) => {
     isShortsOnly: true,
   });
 
-  try {
-    await syncChannel(channel);
-  } catch (err) {
-    logger.warn(`Initial sync failed for newly added shorts-only channel ${name}: ${err.message}`);
-  }
+  // Immediately trigger initial sync asynchronously without blocking the response
+  Promise.resolve().then(async () => {
+    try {
+      await syncChannel(channel);
+      logger.info(`Initial sync completed for newly added shorts-only channel ${channel.name}.`);
+    } catch (err) {
+      logger.error(`Initial sync failed for newly added shorts-only channel ${channel.name}: ${err.message}`);
+    }
+  });
 
   res.status(201).json({
     success: true,
-    message: 'Shorts-only channel added successfully and initial sync triggered.',
+    message: 'Shorts-only channel added successfully and initial sync triggered in background.',
     data: channel,
   });
 });

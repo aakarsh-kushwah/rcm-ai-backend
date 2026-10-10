@@ -20,7 +20,7 @@ const {
   approveAdmin,
   getMetricsOverview,
   getPaymentLogs,
-  // createShortsOnlyChannel removed from adminController import
+  getRealtimeActiveUsers, // Added
 } = require("../controllers/adminController");
 const { createChannel, createShortsOnlyChannel } = require("../controllers/channelController");
 
@@ -109,6 +109,9 @@ router.post("/approve/:adminId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(ad
 
 // 1. Get Metrics Overview (KPI Cards)
 router.get("/metrics/overview", restrictTo("SUPER_ADMIN", "ADMIN"), getMetricsOverview);
+
+// 1.1 Real-time Active Users
+router.get("/analytics/realtime-active", restrictTo("SUPER_ADMIN", "ADMIN"), getRealtimeActiveUsers);
 
 // 2. Get Paginated Payment Logs
 router.get("/payments", restrictTo("SUPER_ADMIN", "ADMIN"), getPaymentLogs);
