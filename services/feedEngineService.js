@@ -11,7 +11,7 @@ const { QueryTypes } = require('sequelize');
 
 const PREFIX = 'rcm:engine:';
 const RK = {
-  catalog: `${PREFIX}catalog`,
+  catalog: 'shorts:candidate_pool',
   seen: (userId) => `${PREFIX}seen:${userId}`,
 };
 
@@ -19,7 +19,7 @@ const PLATFORM = { youtube: 1, instagram: 2 };
 const SEEN_TTL_MS = 48 * 3600 * 1000;
 const SEEN_MAX_PER_USER = 2000;
 const SEEN_BUFFER_MAX = 10000;
-const POOL_TTL_MS = 90 * 1000;
+const POOL_TTL_MS = 15 * 60 * 1000;
 const BATCH_LIMIT_PER_CREATOR = 10;
 
 const redisReady = () => !!(redis && redis.status === 'ready');
@@ -355,7 +355,7 @@ async function getCandidatePool() {
       recordDbSuccess();
       if (redisReady()) {
         try {
-          await redis.set(RK.catalog, JSON.stringify(pool), 'EX', 90);
+          await redis.set(RK.catalog, JSON.stringify(pool), 'EX', 600);
         } catch (e) {
           /* ignore */
         }

@@ -7,7 +7,7 @@
 const express = require("express");
 const router = express.Router();
 const rateLimit = require("express-rate-limit");
-
+const notificationController = require("../controllers/notificationController");
 const { adminGetShorts, adminToggleChannelShortsOnly, adminToggleVideoShort, adminDeleteShort, adminImportSingleShort } = require("../controllers/shortsController");
 
 // ✅ Import Controller Functions
@@ -91,18 +91,19 @@ router.delete("/users/:userId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(use
 // 🚀 MODULE B: TITAN NOTIFICATION WAR ROOM
 // ============================================================
 
-// 1. Titan Blast: Send Push Notification to ALL Users
+// 1. Titan Blast: queue based broadcast (returns 202 immediately)
 router.post(
     "/notifications/send-all",
     restrictTo("SUPER_ADMIN", "ADMIN"),
-    blastLimiter, // 🛡️ Rate Limit Applied Here
-    validate(notificationSchema), // Validate notification payload
-    pushNotificationToAll
+    blastLimiter,
+    notificationController.sendTitanBroadcast
 );
 
-// 6. Approve Admin (IAM)
-router.post("/approve/:adminId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(adminApprovalSchema), approveAdmin);
-
+router.get(
+    "/notifications/send-all/:jobId/status",
+    restrictTo("SUPER_ADMIN", "ADMIN"),
+    notificationController.getBroadcastStatus
+);
 // ============================================================
 // 📊 MODULE C: ANALYTICS & REPORTING
 // ============================================================

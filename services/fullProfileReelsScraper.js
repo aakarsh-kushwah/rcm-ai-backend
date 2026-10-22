@@ -223,7 +223,7 @@ function extractReelsFromJson(obj, username, reelsMap) {
 }
 
 /**
- * Helper to extract shortcodes from HTML string via regex
+ * Helper to extract shortcodes from HTML string via regex and sharedData
  */
 function extractReelsFromHtml(html, username, reelsMap, extractedShortcodes = new Set()) {
   if (!html || typeof html !== 'string') return;
@@ -244,6 +244,20 @@ function extractReelsFromHtml(html, username, reelsMap, extractedShortcodes = ne
       });
     }
   }
+
+  // Try to extract _sharedData from HTML
+  const sharedDataRegex = /window\._sharedData\s*=\s*({.*?});/;
+  const sharedDataMatch = html.match(sharedDataRegex);
+  if (sharedDataMatch && sharedDataMatch[1]) {
+    try {
+      const sharedData = JSON.parse(sharedDataMatch[1]);
+      // Pass the extracted sharedData to extractReelsFromJson
+      extractReelsFromJson(sharedData, username, reelsMap);
+      logger.info(`[FullProfileReelsScraper] Extracted reels from _sharedData in HTML for @${username}.`);
+    } catch (e) {
+      logger.warn(`[FullProfileReelsScraper] Failed to parse _sharedData for @${username}: ${e.message}`);
+    }
+  }
 }
 
 /**
@@ -261,7 +275,25 @@ async function fetchProfileReelsAxios(username) {
   const res = await axios.get(`https://www.instagram.com/${username}/reels/`, { headers, timeout: 15000 });
   const html = typeof res.data === 'string' ? res.data : '';
   const reelsMap = new Map();
+  // Use the enhanced extractReelsFromHtml to also get data from _sharedData
   extractReelsFromHtml(html, username, reelsMap);
+
+  // Also look for meta tags for individual reel URLs
+  const metaRegex = /<meta property="og:url" content="https:\/\/www\.instagram\.com\/p\/([A-Za-z0-9_-]+)\//g;
+  let metaMatch;
+  while ((metaMatch = metaRegex.exec(html)) !== null) {
+    const shortcode = metaMatch[1];
+    if (!reelsMap.has(shortcode)) {
+      reelsMap.set(shortcode, {
+        shortcode,
+        url: `https://www.instagram.com/p/${shortcode}/`,
+        thumbnailUrl: `https://www.instagram.com/p/${shortcode}/media/?size=l`,
+        title: `Instagram Post ${shortcode}`,
+        creatorHandle: username,
+      });
+    }
+  }
+
   return Array.from(reelsMap.values());
 }
 

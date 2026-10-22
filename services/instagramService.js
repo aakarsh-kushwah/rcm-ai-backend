@@ -41,7 +41,10 @@ const instagramService = {
   getCatalogBatch: async ({ limit = 50 } = {}) => {
     try {
       const reels = await InstagramReel.findAll({
-        where: { isActive: true },
+        where: {
+          isActive: true,
+          videoUrl: { [Op.ne]: null, [Op.ne]: '' }
+        },
         attributes: ['id', 'likesCount'],
         limit,
         order: [['id', 'DESC']],
@@ -75,7 +78,11 @@ const instagramService = {
       if (numericIds.length === 0) return hydrated;
 
       const reels = await InstagramReel.findAll({
-        where: { id: { [Op.in]: numericIds }, isActive: true },
+        where: {
+          id: { [Op.in]: numericIds },
+          isActive: true,
+          videoUrl: { [Op.ne]: null, [Op.ne]: '' }
+        },
         include: [{ model: InstagramAccount, as: 'account', required: false }],
       });
 
@@ -90,6 +97,7 @@ const instagramService = {
           title: reel.title || `Instagram Reel ${reel.shortcode}`,
           category: reel.category || 'Motivation',
           thumbnail: reel.thumbnailUrl || '',
+          videoUrl: reel.videoUrl,
           likesCount: Number(reel.likesCount) || 0,
           commentsCount: Number(reel.commentsCount) || 0,
           viewCount: Number(reel.viewCount) || 0,

@@ -1,179 +1,262 @@
 /**
  * @file controllers/notificationController.js
- * @title TITAN NEURAL PUSH ENGINE (ENTERPRISE EDITION)
- * @description Hyper-Scale Notification Orchestrator (Safe & Lazy Loaded)
+ * @description Notification API. This file does almost no work itself:
+ *   - device register / unsubscribe  : tiny DB reads/writes
+ *   - broadcast                      : validates, queues ONE job, returns 202 (web server load ~ 0)
+ *   - actual FCM delivery            : workers/notificationWorker.js
  */
 
-const { NotificationToken, sequelize } = require("../models");
-const { Op } = require('sequelize');
+const { NotificationToken } = require("../models");
+const { connection: redis } = require("../config/redis");
+const push = require("../services/pushService");
+const queue = require("../queues/notificationQueue");
 
-// 🛡️ SAFE FIREBASE LOADER (Prevents Server Crash on Boot)
-const getFirebase = () => {
+const PLATFORMS = ["ANDROID", "IOS", "WEB", "DESKTOP"];
+const REFRESH_AFTER_MS = 24 * 60 * 60 * 1000; // re-write an unchanged token at most once a day
+const MAX_TITLE = 120;
+const MAX_BODY = 500;
+const MAX_DATA_JSON = 2000; // FCM message limit is 4KB
+
+const isPlainObject = (v) => v && typeof v === "object" && !Array.isArray(v);
+
+/** Allows "/path" or "https://..." only (blocks "//evil.com", "javascript:", etc). */
+const normalizeActionUrl = (value) => {
+    if (!value) return undefined;
+    const url = String(value).trim();
+    if (url.startsWith("/") && !url.startsWith("//")) return url;
+    if (/^https:\/\//i.test(url)) return url;
+    return null; // invalid
+};
+
+// ============================================================
+// Event-driven helpers (used by other modules)
+// ============================================================
+
+/** Queues a broadcast. Returns immediately. Other modules can keep calling this. */
+const broadcastNotification = async ({ title, body, imageUrl, actionUrl, dataPayload }) => {
     try {
-        const { admin } = require("../config/firebase"); // Lazy Import
-        if (!admin || !admin.apps.length) throw new Error("Firebase App not initialized");
-        return admin;
-    } catch (e) {
-        console.warn("⚠️ [TITAN PUSH WARNING]: Firebase is not configured. Skipping notification.");
-        return null;
+        const { jobId } = await queue.enqueueBroadcast({ title, body, imageUrl, actionUrl, dataPayload });
+        return { queued: true, jobId, successCount: 0, failureCount: 0 };
+    } catch (err) {
+        console.error(`🔥 [NOTIF] Could not queue broadcast: ${err.message}`);
+        return { queued: false, successCount: 0, failureCount: 0 };
+    }
+};
+exports.broadcastNotification = broadcastNotification;
+
+/** Targeted push to one user. Queued; falls back to a direct send (small) if the queue is down. */
+exports.sendTransactional = async (userId, payload) => {
+    const content = {
+        title: payload.title,
+        body: payload.body,
+        imageUrl: payload.imageUrl,
+        actionUrl: payload.url,
+        dataPayload: payload.data,
+    };
+    try {
+        await queue.enqueueTransactional(userId, content);
+        return true;
+    } catch (queueErr) {
+        console.warn(`⚠️ [NOTIF] Queue unavailable, sending directly: ${queueErr.message}`);
+        try {
+            const result = await push.sendToUser(userId, content);
+            return result.successCount > 0;
+        } catch (err) {
+            console.error("Transactional Push Failed:", err.message);
+            return false;
+        }
     }
 };
 
-/**
- * Core Broadcast Helper function for background and event-driven pushes
- */
-const broadcastNotification = async ({ title, body, imageUrl, actionUrl, dataPayload }) => {
-    const admin = getFirebase();
-    if (!admin) {
-        console.warn("⚠️ [TITAN PUSH WARNING]: Firebase not configured. Skipping broadcast.");
-        return { successCount: 0, failureCount: 0 };
+// ============================================================
+// 1. 🛰️ DEVICE REGISTRATION
+// ============================================================
+exports.registerDevice = async (req, res) => {
+    const { token, platform, deviceMeta, fingerprint, preferences } = req.body || {};
+    const userId = req.user ? req.user.id : null;
+
+    if (typeof token !== "string" || token.length < 20 || token.length > 512) {
+        return res.status(400).json({ success: false, message: "Invalid token" });
     }
 
-    let successCount = 0;
-    let failureCount = 0;
-    let lastId = 0;
-    const batchSize = 500;
+    const upperPlatform = String(platform || "WEB").toUpperCase();
+    const safePlatform = PLATFORMS.includes(upperPlatform) ? upperPlatform : "WEB";
+    const now = new Date();
 
-    console.log(`📡 [TITAN LAUNCH] Starting Hyper-Scale Broadcast...`);
+    try {
+        let existing = await NotificationToken.findOne({ where: { token } });
+        let type = "CREATED";
 
-    while (true) {
-        try {
-            const tokens = await NotificationToken.findAll({
-                where: {
-                    id: { [Op.gt]: lastId },
-                    status: 'ACTIVE'
-                },
-                limit: batchSize,
-                attributes: ['id', 'token'],
-                raw: true,
-                order: [['id', 'ASC']]
-            });
-
-            if (tokens.length === 0) break;
-            lastId = tokens[tokens.length - 1].id;
-
-            const deviceTokens = tokens.map(t => t.token);
-            if (deviceTokens.length === 0) continue;
-
-            const message = {
-                notification: { title, body },
-                data: {
-                    url: actionUrl || '/',
-                    ...Object.fromEntries(Object.entries(dataPayload || {}).map(([k, v]) => [k, String(v)]))
-                },
-                tokens: deviceTokens
-            };
-
-            const response = await admin.messaging().sendEachForMulticast(message);
-            successCount += response.successCount;
-            failureCount += response.failureCount;
-
-            if (response.failureCount > 0) {
-                response.responses.forEach((resp) => {
-                    if (!resp.success) {
-                        console.warn(`Failed token delivery: ${resp.error?.message || 'Unknown error'}`);
-                    }
+        if (!existing) {
+            try {
+                await NotificationToken.create({
+                    token,
+                    userId,
+                    platform: safePlatform,
+                    deviceMeta: isPlainObject(deviceMeta) ? deviceMeta : {},
+                    deviceFingerprint: typeof fingerprint === "string" ? fingerprint.slice(0, 255) : null,
+                    ...(isPlainObject(preferences) ? { preferences } : {}),
+                    status: "ACTIVE",
+                    failureCount: 0,
+                    lastUsedAt: now,
                 });
+                console.log(`📲 [DEVICE SYNC] New token for user: ${userId || "Guest"}`);
+                return res.status(200).json({ success: true, message: "Device registered", type });
+            } catch (err) {
+                // Two requests raced to insert the same token: fall through and update.
+                if (err.name !== "SequelizeUniqueConstraintError") throw err;
+                existing = await NotificationToken.findOne({ where: { token } });
+                if (!existing) throw err;
             }
-        } catch (err) {
-            console.error(`Error in broadcast batch: ${err.message}`);
-            break;
+        }
+
+        const isFresh = now.getTime() - new Date(existing.updatedAt).getTime() < REFRESH_AFTER_MS;
+        const sameOwner = (existing.userId ?? null) === userId;
+        const hasChanges = isPlainObject(preferences) || isPlainObject(deviceMeta) || typeof fingerprint === "string";
+
+        if (isFresh && sameOwner && existing.status === "ACTIVE" && !hasChanges) {
+            return res.status(200).json({ success: true, message: "Device already registered", type: "UNCHANGED" });
+        }
+
+        const updates = {
+            userId,
+            platform: safePlatform,
+            status: "ACTIVE",
+            failureCount: 0,
+            lastUsedAt: now,
+        };
+        if (isPlainObject(preferences)) updates.preferences = preferences; // never reset user's choices silently
+        if (isPlainObject(deviceMeta)) updates.deviceMeta = deviceMeta;
+        if (typeof fingerprint === "string") updates.deviceFingerprint = fingerprint.slice(0, 255);
+
+        await existing.update(updates);
+        type = "UPDATED";
+
+        return res.status(200).json({ success: true, message: "Device updated", type });
+    } catch (error) {
+        console.error("🔥 [DEVICE SYNC]:", error.message);
+        return res.status(503).json({ success: false, message: "Could not register device, please retry" });
+    }
+};
+
+// ============================================================
+// 2. 🔕 UNSUBSCRIBE (dashboard bell toggle OFF)
+// ============================================================
+exports.unregisterDevice = async (req, res) => {
+    const { token } = req.body || {};
+    const userId = req.user ? req.user.id : null;
+
+    if (typeof token !== "string" || !token) {
+        return res.status(400).json({ success: false, message: "Token required" });
+    }
+
+    try {
+        // Only the owner can switch off their own token
+        const [affected] = await NotificationToken.update({ status: "INACTIVE" }, { where: { token, userId } });
+        return res.status(200).json({ success: true, message: "Notifications disabled", affected });
+    } catch (error) {
+        console.error("🔥 [UNSUBSCRIBE]:", error.message);
+        return res.status(503).json({ success: false, message: "Could not update, please retry" });
+    }
+};
+
+// ============================================================
+// 3. 🚀 BROADCAST (admin only, 202 Accepted)
+// ============================================================
+exports.sendTitanBroadcast = async (req, res) => {
+    if (!push.isFirebaseReady()) {
+        return res.status(503).json({ success: false, message: "Notification system offline (Firebase not configured)" });
+    }
+
+    const { title, body, imageUrl, actionUrl, dataPayload } = req.body || {};
+
+    if (typeof title !== "string" || typeof body !== "string" || !title.trim() || !body.trim()) {
+        return res.status(400).json({ success: false, message: "Title and body are required" });
+    }
+    if (title.length > MAX_TITLE || body.length > MAX_BODY) {
+        return res
+            .status(400)
+            .json({ success: false, message: `Title max ${MAX_TITLE} chars, body max ${MAX_BODY} chars` });
+    }
+
+    let cleanImage;
+    if (imageUrl) {
+        cleanImage = push.sanitizeImageUrl(imageUrl);
+        if (!cleanImage) {
+            return res.status(400).json({ success: false, message: "imageUrl must be a valid https URL" });
         }
     }
 
-    console.log(`✅ [TITAN BROADCAST FINISHED] Success: ${successCount}, Failures: ${failureCount}`);
-    return { successCount, failureCount };
-};
+    const cleanAction = normalizeActionUrl(actionUrl);
+    if (cleanAction === null) {
+        return res
+            .status(400)
+            .json({ success: false, message: "actionUrl must start with / or be a valid https URL" });
+    }
 
-exports.broadcastNotification = broadcastNotification;
+    if (dataPayload !== undefined) {
+        if (!isPlainObject(dataPayload) || JSON.stringify(dataPayload).length > MAX_DATA_JSON) {
+            return res.status(400).json({ success: false, message: "dataPayload must be a small object" });
+        }
+    }
 
-// ============================================================
-// 1. 🛰️ NEURAL SYNC (Device Registration)
-// ============================================================
-exports.registerDevice = async (req, res) => {
     try {
-        const { token, platform, deviceMeta, fingerprint, preferences } = req.body;
-        const userId = req.user ? req.user.id : null;
+        const { jobId } = await queue.enqueueBroadcast(
+            {
+                title: title.trim(),
+                body: body.trim(),
+                imageUrl: cleanImage,
+                actionUrl: cleanAction,
+                dataPayload,
+            },
+            req.user ? req.user.id : null
+        );
 
-        if (!token) return res.status(400).json({ success: false, message: "Token Missing" });
-
-        // Upsert Logic (Create or Update)
-        const [node, created] = await NotificationToken.upsert({
-            token: token,
-            userId: userId,
-            platform: platform || 'WEB',
-            deviceMeta: deviceMeta || {},
-            deviceFingerprint: fingerprint,
-            preferences: preferences || { marketing: true },
-            status: 'ACTIVE',
-            lastUsedAt: new Date(),
-            updatedAt: new Date()
-        }, { returning: true });
-
-        console.log(`📲 [DEVICE SYNC] Token Registered for User: ${userId || 'Guest'}`);
-
-        res.status(200).json({ 
-            success: true, 
-            message: "Neural Link Established", 
-            type: created ? "CREATED" : "UPDATED" 
+        return res.status(202).json({
+            success: true,
+            message: "Broadcast accepted. Delivery is running in the background.",
+            jobId,
         });
-
-    } catch (error) {
-        console.error("🔥 [SYNC CRITICAL]:", error.message);
-        res.status(200).json({ success: true, message: "Sync Queued (DB Error)" });
+    } catch (err) {
+        console.error(`🔥 [BROADCAST] Queue unavailable: ${err.message}`);
+        return res.status(503).json({ success: false, message: "Queue unavailable, please retry in a moment" });
     }
 };
 
 // ============================================================
-// 2. 🚀 TITAN BROADCAST (Cursor Based Streaming)
+// 4. 📊 BROADCAST PROGRESS (admin only)
 // ============================================================
-exports.sendTitanBroadcast = async (req, res) => {
-    const admin = getFirebase(); // 🛡️ LOAD ON DEMAND
-    if (!admin) {
-        return res.status(503).json({ success: false, message: "Notification System Offline (Check .env)" });
+exports.getBroadcastStatus = async (req, res) => {
+    const { jobId } = req.params;
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(jobId)) {
+        return res.status(400).json({ success: false, message: "Invalid job id" });
     }
 
-    const { title, body, imageUrl, actionUrl, dataPayload } = req.body;
-    if (!title || !body) return res.status(400).json({ success: false, message: "Payload Incomplete" });
-
-    // 1. Immediate Response
-    res.status(200).json({ 
-        success: true, 
-        message: "Titan Broadcast Initiated. Processing in background..." 
-    });
-
-    // 2. Background Processing
-    setImmediate(async () => {
-        await broadcastNotification({ title, body, imageUrl, actionUrl, dataPayload });
-    });
-};
-
-// ============================================================
-// 3. 🎯 TARGETED SNIPE
-// ============================================================
-exports.sendTransactional = async (userId, payload) => {
-    const admin = getFirebase(); // 🛡️ LOAD ON DEMAND
-    if (!admin) return false;
-
     try {
-        const userNodes = await NotificationToken.findAll({
-            where: { userId, status: 'ACTIVE' },
-            attributes: ['token'],
-            raw: true
+        const [stats, state] = await Promise.all([
+            redis.hgetall(queue.statsKey(jobId)),
+            queue.getJobState(jobId).catch(() => null),
+        ]);
+
+        const num = (v) => Number(v || 0);
+        const total = num(stats.total);
+        const batches = num(stats.batches);
+        const batchesDone = num(stats.batchesDone);
+
+        return res.status(200).json({
+            success: true,
+            jobId,
+            queueState: state || "unknown",
+            status: stats.status || (state ? "queued" : "unknown"),
+            totalTokens: total,
+            batches,
+            batchesDone,
+            progressPercent: batches > 0 ? Math.min(100, Math.round((batchesDone / batches) * 100)) : 0,
+            success_count: num(stats.success),
+            failure_count: num(stats.failure),
+            purged_dead_tokens: num(stats.purged),
         });
-
-        if (!userNodes.length) return false;
-
-        const message = {
-            notification: { title: payload.title, body: payload.body },
-            data: { ...payload.data, url: payload.url || '/' },
-            tokens: userNodes.map(n => n.token)
-        };
-
-        const response = await admin.messaging().sendEachForMulticast(message);
-        return response.successCount > 0;
-    } catch (error) {
-        console.error("Transactional Push Failed:", error.message);
-        return false;
+    } catch (err) {
+        return res.status(503).json({ success: false, message: "Status unavailable" });
     }
 };

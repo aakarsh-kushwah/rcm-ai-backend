@@ -1,8 +1,12 @@
 /**
  * @file server.js
  * @description Core HTTP + Socket.io server. Nothing else.
- *   - No seeding        -> scripts/seedSuperAdmin.js
- *   - No background jobs -> workers/instagramWorker.js
+ *   - CORS config        -> config/cors.js
+ *   - Rate limiting      -> middleware/rateLimiter.js
+ *   - Metrics            -> middleware/metrics.js
+ *   - Cron / sync jobs   -> workers/scheduler.js   (separate process)
+ *   - Push fan-out       -> workers/notificationWorker.js (separate process)
+ *   - Seeding            -> scripts/seedSuperAdmin.js
  */
 
 require("dotenv").config();
@@ -17,16 +21,14 @@ const compression = require("compression");
 const pinoHttp = require("pino-http");
 const socketIo = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
-const client = require("prom-client");
-const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
-const cron = require('node-cron'); // Added node-cron
 
 const { logger } = require("./utils/logger");
-const { connectDB, sequelize, Channel, InstagramAccount } = require("./models"); // Added Channel, InstagramAccount
+const { connectDB, sequelize } = require("./models");
 const { connection: redisClient } = require("./config/redis");
 const { setIoInstance } = require("./services/socketService");
-const { syncChannel } = require('./services/channelSyncService'); // Added syncChannel
-const { syncAllAccounts: syncAllInstagramAccounts } = require('./services/instagramSyncService'); // Added Instagram sync service
+const { allowedOrigins, corsOptions } = require("./config/cors");
+const { globalLimiter, getClientIp } = require("./middleware/rateLimiter");
+const { metricsMiddleware, metricsHandler } = require("./middleware/metrics");
 
 // ============================================================
 // ⚙️ CONFIG
@@ -35,34 +37,22 @@ const IS_PROD = process.env.NODE_ENV === "production";
 const PORT = Number(process.env.PORT) || 10000;
 
 // Proxy hops between the socket and the real client.
-// Render(local) -> Cloudflare -> client  = 3.
-// Verify after deploy by logging req.ip for a known device.
+// Render(local) -> Cloudflare -> client = 3. Verify after deploy by logging req.ip.
 const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS ?? 3);
 
-// Your frontend (rcmai.in on Vercel) proxies /api to Render, so Cloudflare
-// only sees Vercel's IP. Vercel puts the real user IP in x-vercel-forwarded-for.
-const TRUST_VERCEL_IP = process.env.TRUST_VERCEL_IP !== "false";
-
-const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
-const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 300;
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 25 * 1000;
-const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
+// Time to keep serving while the load balancer notices /ready is failing.
+const DRAIN_DELAY_MS = Number(process.env.DRAIN_DELAY_MS ?? 5000);
+const REDIS_WAIT_MS = Number(process.env.REDIS_WAIT_MS) || 5000;
 
-const allowedOrigins = [
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://localhost:3002',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:3001',
-    'http://127.0.0.1:3002',
-    'https://rcmai.in',
-    'https://www.rcmai.in',
-    'https://api.rcmai.in',
-    'https://rcm-ai-admin-ui.vercel.app',
-    process.env.FRONTEND_URL,
-    process.env.ADMIN_URL,
-    process.env.CLIENT_URL,
-].filter(Boolean);
+// Cloudflare already compresses responses for free. Enable only if you run without it.
+const ENABLE_APP_COMPRESSION = process.env.ENABLE_COMPRESSION === "true";
+
+// With several instances and no sticky sessions, use "websocket" only.
+const SOCKET_TRANSPORTS = (process.env.SOCKET_TRANSPORTS || "websocket,polling")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
 
 // ============================================================
 // 🚀 APP + HTTP SERVER
@@ -73,63 +63,23 @@ app.set("trust proxy", TRUST_PROXY_HOPS); // must be before any middleware
 
 const server = http.createServer(app);
 
-// Set before listen() so they apply from the first connection.
 // Must be higher than the load balancer idle timeout (~60s).
 server.keepAliveTimeout = 65 * 1000;
 server.headersTimeout = 66 * 1000;
+// Whole request (incl. 10MB image uploads on slow mobile networks) must finish in 2 min.
+server.requestTimeout = 120 * 1000;
 
 let isShuttingDown = false;
+let dbHealthy = false;
 
-// ============================================================
-// 📊 METRICS
-// ============================================================
-const register = new client.Registry();
-client.collectDefaultMetrics({ register });
-
-const httpRequestDuration = new client.Histogram({
-    name: "http_request_duration_seconds",
-    help: "Duration of HTTP requests in seconds",
-    labelNames: ["method", "route", "status_code"],
-    buckets: [0.05, 0.1, 0.5, 1, 2, 5],
-    registers: [register],
-});
-
-// ============================================================
-// 🧰 HELPERS
-// ============================================================
-const getClientIp = (req) => {
-    if (TRUST_VERCEL_IP) {
-        const vercelIp = req.headers["x-vercel-forwarded-for"];
-        if (vercelIp) return String(vercelIp).split(",")[0].trim();
-    }
-    return req.ip;
-};
-
-const buildRateLimitStore = () => {
-    try {
-        // npm i rate-limit-redis
-        const { RedisStore } = require("rate-limit-redis");
-        const sendCommand =
-            typeof redisClient.call === "function"
-                ? (...args) => redisClient.call(...args) // ioredis
-                : (...args) => redisClient.sendCommand(args); // node-redis
-        return new RedisStore({ sendCommand, prefix: "rl:global:" });
-    } catch (err) {
-        logger.warn(
-            { err: err.message },
-            "rate-limit-redis unavailable; using in-memory store (NOT shared across instances)"
-        );
-        return undefined;
-    }
-};
-
-const isInfraPath = (req) => req.path === "/health" || req.path === "/metrics";
+const isInfraPath = (req) =>
+    req.path === "/health" || req.path === "/ready" || req.path === "/metrics";
 
 // ============================================================
 // 🛡️ MIDDLEWARE
 // ============================================================
 
-// 1. Logging (minimal serializers: never log Authorization / Cookie / Set-Cookie)
+// 1. Logging (never log Authorization / Cookie / Set-Cookie)
 app.use(
     pinoHttp({
         logger,
@@ -155,41 +105,17 @@ app.use(
     })
 );
 
-// 2. Metrics (low-cardinality route label)
-app.use((req, res, next) => {
-    if (isInfraPath(req)) return next();
-    const end = httpRequestDuration.startTimer();
-    res.on("finish", () => {
-        const route = req.route ? `${req.baseUrl}${req.route.path}` : "unmatched";
-        end({ method: req.method, route, status_code: res.statusCode });
-    });
-    next();
-});
+// 2. Metrics
+app.use(metricsMiddleware(isInfraPath));
 
-// 3. Security headers + compression
+// 3. Security headers (+ optional compression)
 app.use(helmet({ crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" } }));
-app.use(compression());
+if (ENABLE_APP_COMPRESSION) app.use(compression());
 
-// 4. CORS (strict allowlist; handles preflight too, no separate app.options)
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin) || /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin)) {
-            return callback(null, true);
-        }
-        console.warn(`[CORS Blocked] Origin not allowed: ${origin}`);
-        return callback(new Error(`CORS violation: origin not allowed (${origin})`));
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
-}));
+// 4. CORS (strict allowlist; this middleware also answers preflight OPTIONS)
+app.use(cors(corsOptions));
 
-// Ensure preflight OPTIONS are answered immediately with 204
-app.options('*', cors());
-
-// 5. Health + metrics BEFORE the rate limiter so probes are never throttled
-let dbHealthy = false;
-
+// 5. Infra endpoints BEFORE the rate limiter so probes are never throttled
 const checkDb = async () => {
     try {
         await sequelize.authenticate();
@@ -200,44 +126,32 @@ const checkDb = async () => {
     }
 };
 
+// Liveness: "is the process alive?" Never fails because of DB. Fails only while shutting down.
 app.get("/health", (req, res) => {
-    const ok = dbHealthy && !isShuttingDown;
-    res.status(ok ? 200 : 503).json({
-        status: ok ? "healthy" : isShuttingDown ? "shutting_down" : "degraded",
+    res.status(isShuttingDown ? 503 : 200).json({
+        status: isShuttingDown ? "shutting_down" : "alive",
+        uptime: Math.round(process.uptime()),
         timestamp: new Date().toISOString(),
     });
 });
 
-app.get("/metrics", async (req, res, next) => {
-    try {
-        if (METRICS_TOKEN && req.headers.authorization !== `Bearer ${METRICS_TOKEN}`) {
-            return res.status(401).end();
-        }
-        res.setHeader("Content-Type", register.contentType);
-        res.send(await register.metrics());
-    } catch (err) {
-        next(err);
-    }
+// Readiness: "should traffic be routed here?"
+app.get("/ready", (req, res) => {
+    const ok = dbHealthy && !isShuttingDown;
+    res.status(ok ? 200 : 503).json({
+        status: ok ? "ready" : isShuttingDown ? "shutting_down" : "degraded",
+        db: dbHealthy,
+        redis: redisClient.status,
+        timestamp: new Date().toISOString(),
+    });
 });
+
+app.get("/metrics", metricsHandler);
 
 // 6. Global rate limiter (Redis-backed when rate-limit-redis is installed)
-const globalLimiter = rateLimit({
-    windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: RATE_LIMIT_MAX,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-    passOnStoreError: true, // Redis hiccup must not take the whole API down
-    store: buildRateLimitStore(),
-    keyGenerator: (req) => {
-        const ip = getClientIp(req);
-        return typeof ipKeyGenerator === "function" ? ipKeyGenerator(ip) : ip;
-    },
-    handler: (req, res) =>
-        res.status(429).json({ success: false, message: "Too many requests, please try again later." }),
-});
 app.use(globalLimiter);
 
-// 7. Parsers (small default. Raise per-route for upload endpoints only)
+// 7. Parsers (small default. Multipart uploads are handled by Multer inside the upload route)
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ limit: "1mb", extended: true }));
@@ -247,32 +161,56 @@ app.use(express.urlencoded({ limit: "1mb", extended: true }));
 // ============================================================
 const io = socketIo(server, {
     cors: { origin: allowedOrigins, credentials: true },
-    transports: ["websocket", "polling"],
+    transports: SOCKET_TRANSPORTS,
+    perMessageDeflate: false, // saves a lot of CPU at high connection counts
+    pingInterval: 25 * 1000,
+    pingTimeout: 20 * 1000,
+    maxHttpBufferSize: 1e6,
 });
 app.set("io", io);
 setIoInstance(io);
 
 const socketRedisClients = [];
 
+const waitForRedis = (timeoutMs) =>
+    new Promise((resolve) => {
+        if (redisClient.status === "ready") return resolve(true);
+
+        const onReady = () => {
+            clearTimeout(timer);
+            resolve(true);
+        };
+        const timer = setTimeout(() => {
+            redisClient.off("ready", onReady);
+            resolve(false);
+        }, timeoutMs);
+
+        redisClient.once("ready", onReady);
+    });
+
 const attachSocketRedisAdapter = async () => {
     try {
-        if (redisClient.status !== 'ready') {
-            logger.info("Redis is not connected; skipping Socket.io Redis adapter (running with in-memory adapter).");
+        const ready = await waitForRedis(REDIS_WAIT_MS);
+        if (!ready) {
+            logger.warn(
+                "Redis not ready after wait; Socket.io is running with in-memory adapter (single instance only)."
+            );
             return;
         }
+
         const pubClient = redisClient.duplicate();
         const subClient = redisClient.duplicate();
         socketRedisClients.push(pubClient, subClient);
 
-        pubClient.on('error', (err) => logger.warn({ err: err.message }, "[REDIS PUB CLIENT ERROR]"));
-        subClient.on('error', (err) => logger.warn({ err: err.message }, "[REDIS SUB CLIENT ERROR]"));
+        pubClient.on("error", (err) => logger.warn({ err: err.message }, "[REDIS PUB CLIENT ERROR]"));
+        subClient.on("error", (err) => logger.warn({ err: err.message }, "[REDIS SUB CLIENT ERROR]"));
 
         io.adapter(createAdapter(pubClient, subClient));
         logger.info("Socket.io Redis adapter attached");
     } catch (err) {
         logger.warn(
             { err: err.message },
-            "Socket.io Redis adapter skipped (offline mode); running with in-memory adapter (single instance only)"
+            "Socket.io Redis adapter skipped; running with in-memory adapter (single instance only)"
         );
     }
 };
@@ -285,6 +223,10 @@ const apiV1 = express.Router();
 // More specific paths MUST be mounted before their parent ("/admin")
 apiV1.use("/admin/instagram", require("./routes/instagramRoutes"));
 
+// 📸 Image upload (enable after routes/uploadRoutes.js is created in Step 1)
+// apiV1.use("/upload", require("./routes/uploadRoutes"));
+
+apiV1.use("/upload", require("./routes/uploadRoutes"));
 apiV1.use("/auth", require("./routes/authRoutes"));
 apiV1.use("/admin", require("./routes/adminRoutes"));
 apiV1.use("/products", require("./routes/productRoutes"));
@@ -312,9 +254,25 @@ app.use((req, res) => {
     res.status(404).json({ success: false, message: "Route not found", traceId: req.id });
 });
 
+/** Converts known library errors (Multer, body-parser) into correct 4xx responses. */
+const normalizeError = (err) => {
+    if (err && err.name === "MulterError") {
+        switch (err.code) {
+            case "LIMIT_FILE_SIZE":
+                return { status: 413, message: "Image is too large. Maximum allowed size is 10MB." };
+            case "LIMIT_UNEXPECTED_FILE":
+                return { status: 400, message: "Unexpected file field. Upload the image using the field name 'image'." };
+            default:
+                return { status: 400, message: `Upload error: ${err.message}` };
+        }
+    }
+    const status = err.status || err.statusCode || 500;
+    return { status, message: err.message };
+};
+
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-    const status = err.status || err.statusCode || 500;
+    const { status, message } = normalizeError(err);
 
     (status >= 500 ? logger.error : logger.warn).call(
         logger,
@@ -326,7 +284,7 @@ app.use((err, req, res, next) => {
 
     res.status(status).json({
         success: false,
-        message: status >= 500 && IS_PROD ? "Internal Server Error" : err.message,
+        message: status >= 500 && IS_PROD ? "Internal Server Error" : message,
         traceId: req.id,
     });
 });
@@ -339,44 +297,17 @@ let healthTimer;
 const startServer = async () => {
     try {
         await connectDB();
-        await checkDb(); // so /health is correct immediately, not after 30s
+        await checkDb(); // so /ready is correct immediately, not after 30s
         await attachSocketRedisAdapter();
 
         healthTimer = setInterval(checkDb, 30 * 1000);
         healthTimer.unref();
 
         server.listen(PORT, "0.0.0.0", () => {
-            logger.info({ port: PORT, env: process.env.NODE_ENV, trustProxy: TRUST_PROXY_HOPS }, "Server online");
-
-            // Configure scheduled task for incremental sync (every 4 hours)
-            cron.schedule('0 */4 * * *', async () => {
-                logger.info('[CRON] Starting scheduled incremental sync for all active accounts.');
-                try {
-                    // Sync YouTube Channels
-                    const channels = await Channel.findAll({ where: { isActive: true } });
-                    for (const channel of channels) {
-                        try {
-                            await syncChannel(channel);
-                            logger.info(`[CRON] Channel sync successful for ${channel.name}.`);
-                        } catch (error) {
-                            logger.error(`[CRON] Channel sync failed for ${channel.name}: ${error.message}`);
-                        }
-                    }
-
-                    // Sync Instagram Accounts
-                    await syncAllInstagramAccounts();
-                    logger.info('[CRON] Scheduled Instagram accounts sync initiated.');
-
-                } catch (error) {
-                    logger.error(`[CRON] Error during scheduled sync: ${error.message}`);
-                }
-                logger.info('[CRON] Finished scheduled incremental sync.');
-            }, {
-                scheduled: true,
-                timezone: "Asia/Kolkata" // Or appropriate timezone for 4-6 hour interval calculation
-            });
-            logger.info('[CRON] Scheduled incremental sync set to run every 4 hours.');
-
+            logger.info(
+                { port: PORT, env: process.env.NODE_ENV, trustProxy: TRUST_PROXY_HOPS, transports: SOCKET_TRANSPORTS },
+                "Server online"
+            );
         });
     } catch (err) {
         logger.fatal({ err: err.message, stack: err.stack }, "Startup failure");
@@ -387,9 +318,11 @@ const startServer = async () => {
 // ============================================================
 // 🛑 GRACEFUL SHUTDOWN
 // ============================================================
-const shutdown = async (signal, exitCode = 0) => {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const shutdown = async (signal, exitCode = 0, { drain = true } = {}) => {
     if (isShuttingDown) return;
-    isShuttingDown = true;
+    isShuttingDown = true; // /ready and /health now return 503
     logger.info(`${signal} received. Starting graceful shutdown...`);
 
     const forceTimer = setTimeout(() => {
@@ -400,6 +333,9 @@ const shutdown = async (signal, exitCode = 0) => {
 
     try {
         clearInterval(healthTimer);
+
+        // Give the load balancer time to stop routing new traffic here.
+        if (drain && DRAIN_DELAY_MS > 0) await sleep(DRAIN_DELAY_MS);
 
         // Stop accepting new connections; drop idle keep-alive sockets so close() can finish
         if (typeof server.closeIdleConnections === "function") server.closeIdleConnections();
@@ -424,13 +360,14 @@ const shutdown = async (signal, exitCode = 0) => {
 };
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGINT", () => shutdown("SIGINT", 0, { drain: false }));
 process.on("unhandledRejection", (reason) => {
     logger.error({ err: reason instanceof Error ? reason.message : String(reason) }, "Unhandled promise rejection");
 });
 process.on("uncaughtException", (err) => {
+    // Process state may be corrupt: do not wait for drain, exit fast.
     logger.fatal({ err: err.message, stack: err.stack }, "Uncaught exception");
-    shutdown("uncaughtException", 1);
+    shutdown("uncaughtException", 1, { drain: false });
 });
 
 startServer();

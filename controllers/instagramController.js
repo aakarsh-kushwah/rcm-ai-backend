@@ -275,18 +275,41 @@ const instagramController = {
   // POST /accounts/:id/sync
   syncAccount: async (req, res, next) => {
     try {
-      const account = await InstagramAccount.findByPk(req.params.id, { attributes: ['id', 'username'] });
-      if (!account) return res.status(404).json({ success: false, message: 'Instagram account not found.' });
-      
-      const syncResult = await instagramService.syncAccountReels(account.id, account.username);
-      invalidateFeedCache();
-      return res.status(200).json({
+      const accountId = req.params.id;
+      const account = await InstagramAccount.findByPk(accountId, { attributes: ['id', 'username'] });
+      if (!account) {
+        logger.warn(`[InstagramController] 404: Sync request for non-existent account ID: ${accountId}`);
+        return res.status(404).json({ success: false, message: 'Instagram account not found.' });
+      }
+
+      // 1. Return immediate success response to prevent admin UI timeout
+      res.status(200).json({
         success: true,
-        message: `Instagram account synced successfully (${syncResult.scrapedCount || 0} reels fetched).`,
-        data: syncResult,
+        message: `Sync for @${account.username} initiated. Reels will be scraped in the background.`,
+        count: 0, // Initial count, will be updated by background process
+      });
+
+      // 2. Process account scraping in the background
+      setImmediate(async () => {
+        try {
+          logger.info(`[InstagramController] Background: Initiating single account sync for @${account.username} (Account ID: ${account.id})`);
+          const syncResult = await instagramService.syncAccountReels(account.id, account.username);
+          
+          // After background process completes, update account details and invalidate cache
+          const reelsCount = await InstagramReel.count({ where: { accountId: account.id } });
+          account.reelsCount = reelsCount;
+          account.lastSyncedAt = new Date();
+          await account.save();
+
+          invalidateFeedCache();
+          logger.info(`[InstagramController] Background: Completed single account sync for @${account.username}. Total reels: ${reelsCount}, new reels: ${syncResult.newReelsCount || 0}`);
+          // TODO: Potentially notify admin UI of completion and final count via websocket if needed.
+        } catch (backgroundErr) {
+          logger.error({ err: backgroundErr.message, stack: backgroundErr.stack, accountId: account.id, username: account.username }, '[InstagramController] Background single account sync failed');
+        }
       });
     } catch (err) {
-      logger.error({ err: err.message }, `[InstagramController] syncAccount failed for accountId ${req.params.id}`);
+      logger.error({ err: err.message, accountId: req.params.id }, '[InstagramController] syncAccount error');
       next(err);
     }
   },

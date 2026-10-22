@@ -1,6 +1,7 @@
 /**
  * @file services/cloudinaryService.js
  * @description TITAN V105: Clean-URL Media Engine (Fixed 400 Error & Special Char Bypass)
+ *   + uploadNotificationImage: admin banners for push notifications (16:9, throws real errors)
  */
 
 const cloudinary = require('cloudinary').v2;
@@ -82,10 +83,10 @@ const uploadProductImage = async (imageUrl, productName) => {
         overwrite: true,
         // 🔥 TITAN OPTIMIZATION (WebP + Lossy Compression)
         transformation: [
-            { width: 1000, crop: "limit" },     
-            { quality: "auto:best" },           
+            { width: 1000, crop: "limit" },
+            { quality: "auto:best" },
             { fetch_format: "auto" },           // Converts to WebP/AVIF automatically
-            { flags: "lossy" }                  
+            { flags: "lossy" }
         ]
     };
 
@@ -102,7 +103,7 @@ const uploadAudioToCloudinary = async (audioSource, voiceLabel) => {
     const options = {
         folder: 'rcm_ai/voices',
         public_id: `v_${textHash}`,
-        resource_type: 'video', 
+        resource_type: 'video',
         format: 'mp3',
         overwrite: false,
         transformation: [
@@ -113,4 +114,81 @@ const uploadAudioToCloudinary = async (audioSource, voiceLabel) => {
     return await fastUpload(audioSource, options);
 };
 
-module.exports = { uploadProductImage, uploadAudioToCloudinary };
+// ============================================================
+// 🔔 NOTIFICATION / ANNOUNCEMENT IMAGES (admin panel)
+// ============================================================
+const NOTIFICATION_FOLDER = process.env.CLOUDINARY_NOTIFICATION_FOLDER || 'rcm_notifications';
+const NOTIFICATION_UPLOAD_TIMEOUT_MS = 60 * 1000;
+
+/** True when all three Cloudinary credentials are present. */
+const isCloudinaryConfigured = () => {
+    const cfg = cloudinary.config();
+    return Boolean(cfg.cloud_name && cfg.api_key && cfg.api_secret);
+};
+
+/**
+ * Real image type from the first bytes of the file (the mimetype sent by the browser can be faked).
+ * SVG is intentionally NOT allowed (script injection risk).
+ */
+const detectImageType = (buf) => {
+    if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+    if (buf.toString('ascii', 0, 4) === 'GIF8') return 'image/gif';
+    if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+    return null;
+};
+
+// banner : 16:9 (1280x720), smart crop, JPG. Best for the big image in a push notification.
+// poster : keeps the original ratio, max 1600px.
+const NOTIFICATION_PRESETS = {
+    banner: {
+        transformation: [{ width: 1280, height: 720, crop: 'fill', gravity: 'auto' }, { quality: 'auto:good' }],
+        format: 'jpg'
+    },
+    poster: {
+        transformation: [{ width: 1600, height: 1600, crop: 'limit' }, { quality: 'auto:good' }]
+    }
+};
+
+/**
+ * Uploads an image buffer for a notification. Unlike fastUpload, this THROWS on failure,
+ * so the API can tell the admin the real reason.
+ * Resolves: { url, publicId, width, height, bytes, format }
+ */
+const uploadNotificationImage = (buffer, { preset = 'banner' } = {}) =>
+    new Promise((resolve, reject) => {
+        const options = {
+            folder: NOTIFICATION_FOLDER,
+            public_id: crypto.randomUUID(),
+            resource_type: 'image',
+            overwrite: false,
+            unique_filename: false,
+            timeout: NOTIFICATION_UPLOAD_TIMEOUT_MS,
+            tags: ['rcm_notification', preset],
+            ...(NOTIFICATION_PRESETS[preset] || NOTIFICATION_PRESETS.banner)
+        };
+
+        const stream = cloudinary.uploader.upload_stream(options, (error, result) => {
+            if (error) return reject(error);
+            if (!result || !result.secure_url) return reject(new Error('Cloudinary returned no URL'));
+            return resolve({
+                url: result.secure_url,
+                publicId: result.public_id,
+                width: result.width,
+                height: result.height,
+                bytes: result.bytes,
+                format: result.format
+            });
+        });
+        stream.on('error', reject);
+        stream.end(buffer);
+    });
+
+module.exports = {
+    uploadProductImage,
+    uploadAudioToCloudinary,
+    uploadNotificationImage,
+    detectImageType,
+    isCloudinaryConfigured
+};
