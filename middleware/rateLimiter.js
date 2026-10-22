@@ -23,6 +23,11 @@ const getClientIp = (req) => {
 };
 
 const buildStore = (prefix) => {
+    // If Redis is offline or not ready, do not pass rate-limit-redis store config;
+    // express-rate-limit will use its built-in memory store by default.
+    if (!redisClient || redisClient.status !== "ready") {
+        return undefined;
+    }
     try {
         const { RedisStore } = require("rate-limit-redis");
         const sendCommand =
@@ -55,14 +60,14 @@ const createLimiter = ({
     prefix = "rl:custom:",
     message,
     keyGenerator = ipBasedKey,
-} = {}) =>
-    rateLimit({
+} = {}) => {
+    const store = buildStore(prefix);
+    const config = {
         windowMs,
         limit,
         standardHeaders: "draft-7",
         legacyHeaders: false,
         passOnStoreError: true, // a Redis hiccup must not take the API down
-        store: buildStore(prefix),
         keyGenerator,
         skip: (req) => req.method === "OPTIONS",
         handler: (req, res) =>
@@ -70,7 +75,12 @@ const createLimiter = ({
                 success: false,
                 message: message || "Too many requests, please try again later.",
             }),
-    });
+    };
+    if (store) {
+        config.store = store;
+    }
+    return rateLimit(config);
+};
 
 const globalLimiter = createLimiter({ prefix: "rl:global:" });
 

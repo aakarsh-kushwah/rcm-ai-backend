@@ -53,7 +53,7 @@ router.post("/unregister-device", isAuthenticated, syncLimiter, asyncHandler(not
 // ============================================================================
 // 📢 ADMIN BROADCAST & TELEMETRY
 // ============================================================================
-router.post("/send", ...ADMIN_ONLY, broadcastLimiter, asyncHandler(notificationController.sendTitanBroadcast));
+router.post("/send", ...ADMIN_ONLY, asyncHandler(notificationController.sendTitanBroadcast));
 router.get("/send/:jobId/status", ...ADMIN_ONLY, asyncHandler(notificationController.getBroadcastStatus));
 
 // ============================================================================

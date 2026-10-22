@@ -81,13 +81,16 @@ db.connectDB = async (retries = 5) => {
             console.log(`✅ [TITAN DB] Connection Pool Established.`);
             
             // Step B: Environment Specific Logic
-            if (env === 'development') {
-                console.log(`⚙️  [DEV] Synchronizing Schema...`);
-                // 🛑 FORCE SAFE MODE: 'alter: false'
-                await sequelize.sync({ force: false, alter: false });
-                console.log(`✅ [DEV] Database Ready (Safe Mode).`);
+            if (env === 'development' && process.env.ALTER_DB === 'true') {
+                console.log(`⚙️  [DEV] Synchronizing Schema (ALTER_DB=true)...`);
+                try {
+                    await sequelize.sync({ force: false, alter: false });
+                    console.log(`✅ [DEV] Database Ready (Safe Mode).`);
+                } catch (syncErr) {
+                    console.warn(`⚠️ [DEV] Schema sync warning (ignoring to prevent crash): ${syncErr.message}`);
+                }
             } else {
-                console.log(`🛡️ [PROD] Schema Sync DISABLED for Data Safety.`);
+                console.log(`🛡️ [SCHEMA SYNC] Skipped (ALTER_DB not enabled / Production mode). Using existing migrations.`);
             }
             
             console.log(`\n🟢 [SYSTEM ONLINE] TITAN ENGINE IS READY.\n`);

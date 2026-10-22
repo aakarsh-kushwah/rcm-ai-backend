@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const IORedis = require("ioredis");
+
 const { Worker } = require("bullmq");
 const { Op } = require("sequelize");
 
@@ -23,17 +23,7 @@ const STATS_TTL_SECONDS = 24 * 3600;
 const CONCURRENCY = Number(process.env.NOTIF_WORKER_CONCURRENCY) || 10;
 const BATCHES_PER_SEC = Number(process.env.NOTIF_BATCHES_PER_SEC) || 10;
 
-const makeBullConnection = () => {
-    if (typeof redisConfig.createBullConnection === "function") {
-        return redisConfig.createBullConnection("bull-worker");
-    }
-    const url = process.env.REDIS_URL || process.env.REDIS_CLOUD_URL || "redis://127.0.0.1:6379";
-    return new IORedis(url, {
-        maxRetriesPerRequest: null, // required by BullMQ
-        tls: url.startsWith("rediss://") ? {} : undefined,
-        retryStrategy: (times) => Math.min(times * 200, 3000),
-    });
-};
+
 
 const recordStats = async (parentId, result) => {
     try {
@@ -147,7 +137,7 @@ const worker = new Worker(
         }
     },
     {
-        connection: makeBullConnection(),
+        connection: redisConfig.connection,
         concurrency: CONCURRENCY,
         limiter: { max: BATCHES_PER_SEC, duration: 1000 },
         lockDuration: 60 * 1000,

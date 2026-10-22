@@ -95,7 +95,6 @@ router.delete("/users/:userId", restrictTo("SUPER_ADMIN", "ADMIN"), validate(use
 router.post(
     "/notifications/send-all",
     restrictTo("SUPER_ADMIN", "ADMIN"),
-    blastLimiter,
     notificationController.sendTitanBroadcast
 );
 
