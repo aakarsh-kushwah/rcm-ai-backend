@@ -12,7 +12,7 @@ module.exports = (sequelize, DataTypes) => {
         },
         jobId: {
             type: DataTypes.STRING(255),
-            allowNull: false,
+            allowNull: true,
             unique: true
         },
         title: {
@@ -46,6 +46,14 @@ module.exports = (sequelize, DataTypes) => {
         status: {
             type: DataTypes.ENUM('PROCESSING', 'COMPLETED', 'FAILED'),
             defaultValue: 'PROCESSING'
+        },
+        purgedDeadTokens: {
+            type: DataTypes.INTEGER,
+            defaultValue: 0
+        },
+        message: {
+            type: DataTypes.TEXT,
+            allowNull: true
         },
         triggeredBy: {
             type: DataTypes.INTEGER,

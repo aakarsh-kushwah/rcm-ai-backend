@@ -8,16 +8,15 @@
  */
 
 const { NotificationToken, Campaign } = require("../models");
-const { connection: redis } = require("../config/redis");
+const firebaseAdmin = require('../config/firebase'); // Firebase Admin SDK
 const push = require("../services/pushService");
-const queue = require("../queues/notificationQueue");
 
 const PLATFORMS = ["ANDROID", "IOS", "WEB", "DESKTOP"];
 const REFRESH_AFTER_MS = 24 * 60 * 60 * 1000; // Throttle unchanged token writes to max once a day
 const MAX_TITLE = 120;
 const MAX_BODY = 500;
 const MAX_DATA_JSON = 2000; // FCM safe message payload limit (4KB total)
-const STATUS_CACHE_TTL_SEC = 3600; // 1 hour retention for broadcast status keys
+
 
 const isPlainObject = (v) => v && typeof v === "object" && !Array.isArray(v);
 
@@ -34,73 +33,9 @@ const normalizeActionUrl = (value) => {
 // Event-driven internal helpers (invoked by other core modules)
 // ============================================================
 
-/** Queues an automated broadcast asynchronously. Returns control immediately. */
-const broadcastNotification = async ({ title, body, imageUrl, actionUrl, dataPayload }) => {
-    try {
-        const { jobId } = await queue.enqueueBroadcast({ title, body, imageUrl, actionUrl, dataPayload });
-        
-        const totalTokens = await NotificationToken.count({ where: { status: 'ACTIVE' } });
-        await Campaign.create({
-            jobId,
-            title,
-            body,
-            imageUrl,
-            actionUrl,
-            totalTokens,
-            successCount: 0,
-            failureCount: 0,
-            status: 'PROCESSING',
-        }).catch(() => {});
 
-        // Atomically cache default initial/completed state in Redis for rapid tracking
-        if (redis && typeof redis.set === 'function') {
-            await redis.set(
-                `job:status:${jobId}`,
-                JSON.stringify({
-                    status: 'processing',
-                    progress: 0,
-                    progressPercent: 0,
-                    successCount: 0,
-                    failureCount: 0,
-                    success_count: 0,
-                    failure_count: 0,
-                    totalTokens,
-                }),
-                'EX',
-                STATUS_CACHE_TTL_SEC
-            );
-        }
-        return { queued: true, jobId, successCount: 0, failureCount: 0 };
-    } catch (err) {
-        console.error(`🔥 [NOTIF] Automated broadcast queue failure: ${err.message}`);
-        return { queued: false, successCount: 0, failureCount: 0 };
-    }
-};
-exports.broadcastNotification = broadcastNotification;
 
-/** Transactional push to a single user. Queues first; falls back to direct pipeline if queue is under pressure. */
-exports.sendTransactional = async (userId, payload) => {
-    const content = {
-        title: payload.title,
-        body: payload.body,
-        imageUrl: payload.imageUrl,
-        actionUrl: payload.url,
-        dataPayload: payload.data,
-    };
-    try {
-        await queue.enqueueTransactional(userId, content);
-        return true;
-    } catch (queueErr) {
-        console.warn(`⚠️ [NOTIF] Queue congested, executing direct push fallback: ${queueErr.message}`);
-        try {
-            const result = await push.sendToUser(userId, content);
-            return result.successCount > 0;
-        } catch (err) {
-            console.error("🔥 [NOTIF] Direct transactional push failed:", err.message);
-            return false;
-        }
-    }
-};
+
 
 // ============================================================
 // 1. 🛰️ DEVICE REGISTRATION (High-throughput upsert)
@@ -234,61 +169,128 @@ exports.sendTitanBroadcast = async (req, res) => {
         }
     }
 
-    try {
-        const { jobId } = await queue.enqueueBroadcast(
-            {
-                title: title.trim(),
-                body: body.trim(),
-                imageUrl: cleanImage,
-                actionUrl: cleanAction,
-                dataPayload,
-            },
-            req.user ? req.user.id : null
-        );
+    // Return 200 OK immediately
+    res.status(200).json({ success: true, message: "Broadcast initiated" });
 
-        const totalTokens = await NotificationToken.count({ where: { status: 'ACTIVE' } });
-        await Campaign.create({
-            jobId,
+    // Background processing using setImmediate
+    setImmediate(async () => {
+        const campaignRecord = await Campaign.create({
+            jobId: `broadcast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, // Generate a unique jobId
             title: title.trim(),
             body: body.trim(),
             imageUrl: cleanImage,
             actionUrl: cleanAction,
-            totalTokens,
+            totalTokens: 0, // Will be updated after fetching
             successCount: 0,
             failureCount: 0,
             status: 'PROCESSING',
             triggeredBy: req.user ? req.user.id : null,
         }).catch(err => console.error("⚠️ [CAMPAIGN] Failed to create campaign record:", err.message));
 
-        // Pre-initialize Redis job status tracking safely so UI polling never results in cache misses
-        if (redis && typeof redis.set === 'function') {
-            await redis.set(
-                `job:status:${jobId}`,
-                JSON.stringify({
-                    status: "processing",
-                    progress: 0,
-                    progressPercent: 0,
-                    successCount: 0,
-                    failureCount: 0,
-                    success_count: 0,
-                    failure_count: 0,
-                    totalTokens,
-                }),
-                "EX",
-                STATUS_CACHE_TTL_SEC
-            );
-        }
+        try {
+            // 1. Fetch ALL Active Tokens
+            const activeDevices = await NotificationToken.findAll({
+                where: { status: 'ACTIVE' },
+                attributes: ['id', 'token'], // Fetch id to update status if token is invalid
+                raw: true
+            });
 
-        // Return 202 Accepted immediately so HTTP thread remains unblocked under massive concurrent loads
-        return res.status(202).json({
-            success: true,
-            message: "Titan Broadcast accepted. Processing asynchronously in the background queue.",
-            jobId,
-        });
-    } catch (err) {
-        console.error(`🔥 [BROADCAST CRITICAL]: Queue offline or unresponsive: ${err.message}`);
-        return res.status(503).json({ success: false, message: "Notification queue unavailable, please retry shortly" });
-    }
+            const allTokens = activeDevices.map(d => d.token);
+            const tokenMap = new Map(activeDevices.map(d => [d.token, d.id])); // Map token to NotificationToken ID
+
+            if (allTokens.length === 0) {
+                console.log(`📢 [TITAN BLAST] No active devices found to send notifications.`);
+                if (campaignRecord) {
+                    await campaignRecord.update({ status: 'COMPLETED', message: 'No active devices found.' });
+                }
+                return;
+            }
+
+            console.log(`📢 [TITAN BLAST] Targeting ${allTokens.length} devices...`);
+
+            // 2. SMART BATCHING (500 per chunk - Firebase Limit)
+            const BATCH_SIZE = 500;
+            let successCount = 0;
+            let failureCount = 0;
+            let purgedDeadTokens = 0;
+
+            if (campaignRecord) {
+                await campaignRecord.update({ totalTokens: allTokens.length });
+            }
+
+            for (let i = 0; i < allTokens.length; i += BATCH_SIZE) {
+                const batchTokens = allTokens.slice(i, i + BATCH_SIZE);
+                
+                const message = {
+                    notification: {
+                        title: title.trim(),
+                        body: body.trim(),
+                        imageUrl: cleanImage,
+                    },
+                    data: { 
+                        title: title.trim(), 
+                        body: body.trim(), 
+                        image: cleanImage || "", 
+                        url: cleanAction || "/", 
+                        click_action: "FLUTTER_NOTIFICATION_CLICK"
+                    },
+                    tokens: batchTokens
+                };
+
+                try {
+                    const response = await firebaseAdmin.messaging().sendEachForMulticast(message);
+                    
+                    successCount += response.successCount;
+                    failureCount += response.failureCount;
+
+                    // 4. Automatically remove invalid/unregistered tokens
+                    const tokensToRemove = [];
+                    response.responses.forEach((resp, idx) => {
+                        if (resp.success === false && resp.error) {
+                            const token = batchTokens[idx];
+                            // Check for specific error codes that indicate invalid or unregistered tokens
+                            if (resp.error.code === 'messaging/invalid-argument' || 
+                                resp.error.code === 'messaging/registration-token-not-registered') {
+                                tokensToRemove.push(token);
+                            }
+                        }
+                    });
+
+                    if (tokensToRemove.length > 0) {
+                        purgedDeadTokens += tokensToRemove.length;
+                        await NotificationToken.update(
+                            { status: 'INACTIVE', failureCount: NotificationToken.sequelize.literal('failureCount + 1') },
+                            { where: { token: { [NotificationToken.sequelize.Op.in]: tokensToRemove } } }
+                        );
+                        console.log(`🗑️ [TITAN PURGE] Removed ${tokensToRemove.length} invalid tokens.`);
+                    }
+
+                    console.log(`[TITAN BLAST] Delivered batch ${Math.ceil((i + BATCH_SIZE) / BATCH_SIZE)}/${Math.ceil(allTokens.length / BATCH_SIZE)} to ${response.successCount} devices. Failed: ${response.failureCount}.`);
+
+                } catch (batchError) {
+                    console.error(`❌ [TITAN BLAST] Error sending batch ${Math.ceil((i + BATCH_SIZE) / BATCH_SIZE)}:`, batchError);
+                    failureCount += batchTokens.length; // Assume all tokens in this batch failed if the batch send itself failed
+                }
+            }
+
+            console.log(`✅ [BLAST COMPLETE] Success: ${successCount}, Failed: ${failureCount}. Purged: ${purgedDeadTokens} dead tokens.`);
+            if (campaignRecord) {
+                await campaignRecord.update({
+                    successCount,
+                    failureCount,
+                    status: 'COMPLETED',
+                    purgedDeadTokens: purgedDeadTokens,
+                    message: 'Broadcast completed successfully.'
+                });
+            }
+
+        } catch (error) {
+            console.error("🔥 Broadcast System Error (Background Process):", error);
+            if (campaignRecord) {
+                await campaignRecord.update({ status: 'FAILED', message: `Broadcast failed: ${error.message}` });
+            }
+        }
+    });
 };
 
 // ============================================================
@@ -301,59 +303,39 @@ exports.getBroadcastStatus = async (req, res) => {
     res.setHeader('Expires', '0');
 
     const { jobId } = req.params;
-    if (!/^[A-Za-z0-9_-]{1,100}$/.test(jobId)) {
+    if (!/^[A-Za-z0-9_-]+$/.test(jobId)) {
         return res.status(400).json({ success: false, message: "Malformed or invalid job identifier" });
     }
 
     try {
         const campaign = await Campaign.findOne({ where: { jobId }, raw: true });
-        let redisData = null;
-        if (redis && typeof redis.get === 'function') {
-            const rawData = await redis.get(`job:status:${jobId}`);
-            if (rawData) {
-                try {
-                    redisData = JSON.parse(rawData);
-                } catch (parseErr) {
-                    console.warn(`⚠️ [STATUS] Failed to parse job status JSON for ${jobId}: ${parseErr.message}`);
-                }
-            }
+
+        if (!campaign) {
+            return res.status(404).json({ success: false, message: "Campaign not found." });
         }
 
-        const successCount = campaign ? campaign.successCount : (redisData?.successCount || redisData?.success_count || 0);
-        const failureCount = campaign ? campaign.failureCount : (redisData?.failureCount || redisData?.failure_count || 0);
-        const totalTokens = campaign ? campaign.totalTokens : (redisData?.totalTokens || 0);
-        const status = campaign ? campaign.status.toLowerCase() : (redisData?.status || "completed");
-        const isCompleted = status === 'completed';
+        const isCompleted = campaign.status === 'COMPLETED' || campaign.status === 'FAILED';
+        const progressPercent = campaign.totalTokens > 0 
+            ? Math.min(100, Math.floor(((campaign.successCount + campaign.failureCount) / campaign.totalTokens) * 100)) 
+            : (isCompleted ? 100 : 0);
 
         return res.status(200).json({
             success: true,
-            jobId,
+            jobId: campaign.jobId,
             queueState: isCompleted ? "completed" : "active",
-            status,
-            progress: isCompleted ? 100 : 50,
-            progressPercent: isCompleted ? 100 : 50,
-            totalTokens,
-            successCount,
-            failureCount,
-            success_count: successCount,
-            failure_count: failureCount,
-            purged_dead_tokens: 0,
+            status: campaign.status.toLowerCase(),
+            progress: progressPercent,
+            progressPercent: progressPercent,
+            totalTokens: campaign.totalTokens,
+            successCount: campaign.successCount,
+            failureCount: campaign.failureCount,
+            success_count: campaign.successCount,
+            failure_count: campaign.failureCount,
+            purged_dead_tokens: campaign.purgedDeadTokens || 0,
+            message: campaign.message || (isCompleted ? 'Broadcast completed.' : 'Processing broadcast.'),
         });
     } catch (err) {
-        // Fallback safely with HTTP 200 to ensure admin dashboard polling loops never crash or timeout
-        return res.status(200).json({
-            success: true,
-            jobId,
-            queueState: "completed",
-            status: "completed",
-            progress: 100,
-            progressPercent: 100,
-            totalTokens: 0,
-            successCount: 0,
-            failureCount: 0,
-            success_count: 0,
-            failure_count: 0,
-            purged_dead_tokens: 0,
-        });
+        console.error('❌ Get Broadcast Status Error:', err.message);
+        return res.status(500).json({ success: false, message: 'Failed to retrieve broadcast status.' });
     }
 };
