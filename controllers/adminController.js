@@ -6,8 +6,9 @@
 
 const { sequelize } = require('../config/db'); // Imported sequelize instance directly from config/db for transactions
 const { Op } = require('sequelize');
-const admin = require('../config/firebase'); // Firebase Admin SDK
+const firebaseAdmin = require('../config/firebase'); // Firebase Admin SDK
 const { connection: redis } = require('../config/redis');
+const push = require('../services/pushService');
 
 // ✅ CORRECT IMPORT: Models ko seedha central hub se load karein (Faster & Cleaner)
 const { User, Admin, ChatMessage, NotificationToken, PaymentLog } = require('../models');
@@ -179,20 +180,27 @@ const pushNotificationToAll = async (req, res) => {
         for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
             const chunk = tokens.slice(i, i + BATCH_SIZE);
             
+            const cleanedImageUrl = push.sanitizeImageUrl(imageUrl);
+            const absoluteLink = push.toAbsoluteUrl(link);
+
             const message = {
-                notification: { title, body },
+                notification: {
+                    title,
+                    body,
+                    imageUrl: cleanedImageUrl // Set notification.imageUrl
+                },
                 data: { 
                     title, 
                     body, 
-                    image: imageUrl || "", 
-                    url: link || "/",
+                    image: cleanedImageUrl || "", // Set data.image
+                    url: absoluteLink || "/", // Use absolute link
                     click_action: "FLUTTER_NOTIFICATION_CLICK"
                 },
                 tokens: chunk
             };
 
             // Non-blocking Push
-            chunks.push(admin.messaging().sendEachForMulticast(message));
+            chunks.push(firebaseAdmin.messaging().sendEachForMulticast(message));
         }
 
         // 3. Parallel Execution (Wait for all batches to fly)
