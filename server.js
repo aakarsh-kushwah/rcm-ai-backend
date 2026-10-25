@@ -1,12 +1,12 @@
 /**
  * @file server.js
  * @description Core HTTP + Socket.io server. Nothing else.
- *   - CORS config        -> config/cors.js
- *   - Rate limiting      -> middleware/rateLimiter.js
- *   - Metrics            -> middleware/metrics.js
- *   - Cron / sync jobs   -> workers/scheduler.js   (separate process)
- *   - Push fan-out       -> workers/notificationWorker.js (separate process)
- *   - Seeding            -> scripts/seedSuperAdmin.js
+ *   - CORS config         -> config/cors.js
+ *   - Rate limiting       -> middleware/rateLimiter.js
+ *   - Metrics             -> middleware/metrics.js
+ *   - Cron / sync jobs    -> workers/scheduler.js   (separate process)
+ *   - Push notifications  -> In-process direct batching (controllers/notificationController.js)
+ *   - Seeding             -> scripts/seedSuperAdmin.js
  */
 
 require("dotenv").config();
@@ -222,10 +222,6 @@ const apiV1 = express.Router();
 
 // More specific paths MUST be mounted before their parent ("/admin")
 apiV1.use("/admin/instagram", require("./routes/instagramRoutes"));
-
-// 📸 Image upload (enable after routes/uploadRoutes.js is created in Step 1)
-// apiV1.use("/upload", require("./routes/uploadRoutes"));
-
 apiV1.use("/upload", require("./routes/uploadRoutes"));
 apiV1.use("/auth", require("./routes/authRoutes"));
 apiV1.use("/admin", require("./routes/adminRoutes"));
@@ -297,6 +293,32 @@ let healthTimer;
 const startServer = async () => {
     try {
         await connectDB();
+
+        // Cross-platform safe auto-migrations (Windows + Linux)
+        await new Promise((resolve) => {
+            const { spawn } = require("child_process");
+            const envFlag = IS_PROD ? "production" : (process.env.NODE_ENV || "development");
+
+            const migrate = spawn("npx", ["sequelize-cli", "db:migrate", "--env", envFlag], {
+                shell: true,
+                stdio: "inherit",
+            });
+
+            migrate.on("error", (err) => {
+                logger.warn({ err: err.message }, "⚠️ [MIGRATION SKIPPED] Could not trigger migration CLI process.");
+                resolve();
+            });
+
+            migrate.on("close", (code) => {
+                if (code === 0) {
+                    logger.info("✅ [MIGRATION SUCCESS] Database schema is up to date.");
+                } else {
+                    logger.warn(`⚠️ [MIGRATION WARNING] Database migration process exited with code ${code}.`);
+                }
+                resolve();
+            });
+        });
+
         await checkDb(); // so /ready is correct immediately, not after 30s
         await attachSocketRedisAdapter();
 
