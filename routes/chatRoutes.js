@@ -36,7 +36,7 @@ const {
 const {
     isAuthenticated,
     isAdmin,
-    isActiveUser
+    isPremiumUser // Added isPremiumUser
 } = require('../middleware/authMiddleware');
 
 // ============================================================
@@ -48,26 +48,26 @@ const {
  * @desc    Main Titan Interface. Handles:
  * 1. Text Queries (RAG + Groq)
  * 2. Image Analysis (Vision)
- * @access  Private (Active Users Only)
+ * @access  Private (Premium Users Only)
  * @body    { message: "string", image: "base64_string" (optional) }
  */
 router.post(
     '/',
     isAuthenticated,
-    isActiveUser,
-    handleChat // <-- Yeh ASI Controller function ko call karega
+    isPremiumUser, // Changed from isActiveUser to isPremiumUser
+    handleChat 
 );
 
 /**
  * @route   POST /api/chat/speak
  * @desc    Direct Text-to-Speech (Edge TTS)
  * Used when user clicks "Play" on a message manually.
- * @access  Private
+ * @access  Private (Premium Users Only)
  */
 router.post(
     '/speak',
     isAuthenticated,
-    isActiveUser,
+    isPremiumUser, // Changed from isActiveUser to isPremiumUser
     handleSpeak
 );
 
@@ -110,7 +110,7 @@ router.post(
     '/admin/smart-response',
     isAuthenticated,
     isAdmin,
-    upload.single('audioFile'), // Admin can upload custom voice note
+    upload.single('audioFile'), 
     addSmartResponse
 );
 

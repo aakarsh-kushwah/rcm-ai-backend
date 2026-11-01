@@ -24,8 +24,6 @@ module.exports = (sequelize) => {
         field: 'full_name',
       },
 
-
-
       googleId: {
         type: DataTypes.STRING(200),
         allowNull: true,
@@ -52,8 +50,6 @@ module.exports = (sequelize) => {
         allowNull: true,
       },
 
-
-
       role: {
         type: DataTypes.ENUM('USER'),
         defaultValue: 'USER',
@@ -76,6 +72,12 @@ module.exports = (sequelize) => {
         type: DataTypes.STRING(200),
         allowNull: true,
         field: 'razorpay_customer_id',
+      },
+      
+      razorpaySubscriptionId: { // New field for Razorpay subscription ID
+        type: DataTypes.STRING(200),
+        allowNull: true,
+        field: 'razorpay_subscription_id',
       },
 
       // ✅ FIX FOR ERROR: Added 'premium' and 'banned'

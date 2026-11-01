@@ -39,7 +39,7 @@ const createSubscription = async (req, res) => {
             return res.status(404).json({ success: false, message: "User not found" });
         }
 
-        if (user.status === 'PREMIUM' && user.autoPayStatus === true) {
+        if (user.status === 'premium' && user.autoPayStatus === true) {
             await t.rollback();
             return res.status(409).json({ success: false, message: "Subscription already active." });
         }
@@ -62,7 +62,7 @@ const createSubscription = async (req, res) => {
             }
         }
 
-        // 3. â° TIME LOGIC: Start 24 Hours Later
+        // 3. TIME LOGIC: Start 24 Hours Later
         const now = Math.floor(Date.now() / 1000);
         const startAt = now + (24 * 60 * 60); // Current Time + 24 Hours
 
@@ -73,17 +73,17 @@ const createSubscription = async (req, res) => {
             total_count: 120, // 10 Years
             quantity: 1,
             customer_notify: 1,
-            start_at: startAt, // <--- This delays the â‚¹29 charge to tomorrow
-            
-            // âŒ ADDONS REMOVED: No immediate charge. 
-            // Razorpay will handle the bank verification (â‚¹0/â‚¹2 refundable) automatically.
-            
+            start_at: startAt, 
             notes: { 
                 userId: user.id, 
                 ip_address: ip,
                 system: "Titan_Gen6"
             }
         });
+
+        // Save subscriptionId to user
+        user.razorpaySubscriptionId = subscription.id;
+        await user.save({ transaction: t });
 
         // 5. Log Setup
         await PaymentLog.create({
@@ -124,8 +124,7 @@ const verifyPayment = async (req, res) => {
         const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } = req.body;
         const userId = req.user.id;
 
-        // 1. ðŸ›¡ï¸ Validate Signature (CRITICAL SECURITY)
-        // Even for â‚¹0 auth, Razorpay sends a payment_id and signature. We must verify it.
+        // 1. Validate Signature (CRITICAL SECURITY)
         const expectedSignature = crypto
             .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
             .update(razorpay_payment_id + "|" + razorpay_subscription_id)
@@ -139,8 +138,9 @@ const verifyPayment = async (req, res) => {
         // 2. Activate User Immediately
         const user = await User.findByPk(userId, { transaction: t, lock: t.LOCK.UPDATE });
         
-        user.status = 'PREMIUM';
+        user.status = 'premium';
         user.autoPayStatus = true;
+        user.razorpaySubscriptionId = razorpay_subscription_id;
         // Billing starts tomorrow, but give access today
         user.nextBillingDate = new Date(Date.now() + 86400000); 
         await user.save({ transaction: t });
@@ -162,12 +162,12 @@ const verifyPayment = async (req, res) => {
             payerName: user.fullName,
             email: user.email,
             paymentId: razorpay_payment_id,
-            planName: 'â‚¹49 Commander Pro',
+            planName: '₹49 Commander Pro',
             amount: 49,
             expiryDate: user.nextBillingDate
         });
 
-        console.log(`âœ… [FRONTEND VERIFY] User ${userId} activated via Mandate.`);
+        console.log(`✅ [FRONTEND VERIFY] User ${userId} activated via Mandate.`);
         res.status(200).json({ success: true, message: "Mandate Verified. Premium Active." });
 
     } catch (error) {
@@ -184,18 +184,18 @@ const verifyPayment = async (req, res) => {
 const handleWebhook = async (req, res) => {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
-    // 1. ðŸ›¡ï¸ Security: Validate Signature
+    // 1. Security: Validate Signature
     const shasum = crypto.createHmac('sha256', secret);
     shasum.update(JSON.stringify(req.body));
     const digest = shasum.digest('hex');
 
     if (digest !== req.headers['x-razorpay-signature']) {
-        console.error("â›” Invalid Webhook Signature");
+        console.error("⛔ Invalid Webhook Signature");
         return res.status(403).json({ status: 'forbidden' });
     }
 
     const { event, payload } = req.body;
-    console.log(`ðŸ”” Webhook Event Received: ${event}`);
+    console.log(`🔔 Webhook Event Received: ${event}`);
 
     try {
         // ------------------------------------------------------------------
@@ -203,16 +203,18 @@ const handleWebhook = async (req, res) => {
         // ------------------------------------------------------------------
         if (event === 'subscription.authenticated') {
             const userId = payload.subscription.entity.notes?.userId;
+            const subId = payload.subscription.entity.id;
             
             if (userId) {
                 const user = await User.findByPk(userId);
-                if (user && user.status !== 'PREMIUM') {
-                    user.status = 'PREMIUM';
+                if (user) {
+                    user.status = 'premium';
                     user.autoPayStatus = true;
+                    user.razorpaySubscriptionId = subId;
                     // Give 24h grace period until the first charge attempts
                     user.nextBillingDate = new Date(Date.now() + 86400000); 
                     await user.save();
-                    console.log(`âœ… [WEBHOOK AUTH] User ${userId} Activated (Grace Period Started)`);
+                    console.log(`✅ [WEBHOOK AUTH] User ${userId} Activated (Grace Period Started)`);
                 }
             }
         } 
@@ -225,17 +227,19 @@ const handleWebhook = async (req, res) => {
             const amount = payload.payment.entity.amount / 100;
             const subId = payload.subscription.entity.id;
             
-            // Find User via Notes OR Email
+            // Find User via Notes OR Email OR razorpaySubscriptionId
             let user = null;
             const noteUserId = payload.subscription.entity.notes?.userId;
             const email = payload.payment.entity.email;
 
             if (noteUserId) user = await User.findByPk(noteUserId);
             else if (email) user = await User.findOne({ where: { email } });
+            else if (subId) user = await User.findOne({ where: { razorpaySubscriptionId: subId } });
 
             if (user) {
-                user.status = 'PREMIUM';
+                user.status = 'premium';
                 user.autoPayStatus = true;
+                user.razorpaySubscriptionId = subId;
                 
                 // Extend validity by 30 days from NOW
                 const newDate = new Date();
@@ -259,47 +263,51 @@ const handleWebhook = async (req, res) => {
                         payerName: user.fullName,
                         email: user.email,
                         paymentId: paymentId,
-                        planName: 'â‚¹49 Commander Pro',
+                        planName: '₹49 Commander Pro',
                         amount: amount,
                         expiryDate: user.nextBillingDate
                     });
                 }
-                console.log(`ðŸ’° [RECURRING CHARGE] â‚¹${amount} Processed for User ${user.id}`);
+                console.log(`💰 [RECURRING CHARGE] ₹${amount} Processed for User ${user.id}`);
             }
         }
 
         // ------------------------------------------------------------------
-        // CASE C: ðŸš¨ CRITICAL FIX - Handle Cancellations & Failures
+        // CASE C: Handle Cancellations & Failures
         // ------------------------------------------------------------------
         else if (event === 'subscription.cancelled' || event === 'subscription.halted') {
             const subId = payload.subscription.entity.id;
             const userId = payload.subscription.entity.notes?.userId;
             const reason = event === 'subscription.cancelled' ? 'User Cancelled' : 'Payment Failed/Halted';
 
-            console.warn(`âš ï¸ [SUBSCRIPTION STOPPED] ID: ${subId} | Reason: ${reason}`);
+            console.warn(`⚠️ [SUBSCRIPTION STOPPED] ID: ${subId} | Reason: ${reason}`);
 
             // If we can identify the user, REVOKE access immediately
             if (userId) {
                 const user = await User.findByPk(userId);
                 if (user) {
-                    user.status = 'INACTIVE';      // Downgrade status
+                    user.status = 'inactive';      // Downgrade status
                     user.autoPayStatus = false;    // Turn off autopay flag
                     user.nextBillingDate = null;   // Clear future billing
                     await user.save();
                     
-                    console.log(`ðŸ›‘ Access Revoked for User ${userId}`);
+                    console.log(`🛑 Access Revoked for User ${userId}`);
                 }
             } else {
-                // Fallback: Find by subscription ID in logs if userId note is missing
-                const log = await PaymentLog.findOne({ where: { subscriptionId: subId } });
-                if (log) {
-                    const user = await User.findByPk(log.userId);
-                    if (user) {
-                        user.status = 'INACTIVE';
-                        user.autoPayStatus = false;
-                        await user.save();
-                        console.log(`ðŸ›‘ Access Revoked for User ${user.id} (Found via Logs)`);
+                // Fallback: Find by subscription ID in users or logs
+                let user = await User.findOne({ where: { razorpaySubscriptionId: subId } });
+                if (!user) {
+                    const log = await PaymentLog.findOne({ where: { subscriptionId: subId } });
+                    if (log) {
+                        user = await User.findByPk(log.userId);
                     }
+                }
+                if (user) {
+                    user.status = 'inactive';
+                    user.autoPayStatus = false;
+                    user.nextBillingDate = null;
+                    await user.save();
+                    console.log(`🛑 Access Revoked for User ${user.id} (Found via SubId/Logs)`);
                 }
             }
         }
@@ -308,14 +316,14 @@ const handleWebhook = async (req, res) => {
         res.status(200).json({ status: 'ok' });
 
     } catch (e) {
-        console.error("âŒ Webhook Error:", e);
+        console.error("❌ Webhook Error:", e);
         // Still return 200 to prevent Razorpay retry loops on internal logic errors
         res.status(200).json({ status: 'error_logged' });
     }
 };
 
 
-// âœ… SECURE EXPORT
+// SECURE EXPORT
 module.exports = {
     createSubscription,
     verifyPayment,

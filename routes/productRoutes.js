@@ -10,7 +10,7 @@ const router = express.Router();
 const productController = require("../controllers/productController");
 
 // Middleware Imports
-const { isAuthenticated, isActiveUser, isAdmin } = require("../middleware/authMiddleware");
+const { isAuthenticated, isAdmin } = require("../middleware/authMiddleware");
 const validate = require("../middleware/validate");
 const upload = require("../middleware/uploadMiddleware");
 
@@ -20,7 +20,7 @@ const { productSchema, userIdParamSchema } = require("../validations/adminSchema
 // ============================================================
 // 🛡️ AUTHENTICATION & AUTHORIZATION (All routes below are protected)
 // ============================================================
-router.use(isAuthenticated, isActiveUser, isAdmin);
+router.use(isAuthenticated, isAdmin); // Only admins can access product management routes
 
 // ============================================================
 // 🕷️ 1. SCRAPER ROUTE (Admin Only)

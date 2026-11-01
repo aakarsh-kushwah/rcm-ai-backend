@@ -12,7 +12,7 @@ const express = require("express");
 const multer = require("multer");
 const asyncHandler = require("express-async-handler");
 
-const { isAuthenticated, isActiveUser, restrictTo } = require("../middleware/authMiddleware");
+const { isAuthenticated, restrictTo } = require("../middleware/authMiddleware");
 const { createLimiter, userKeyGenerator } = require("../middleware/rateLimiter");
 const cloudinaryService = require("../services/cloudinaryService");
 
@@ -83,7 +83,6 @@ const handleUpload = async (req, res) => {
 router.post(
     "/image",
     isAuthenticated,
-    isActiveUser,
     restrictTo("SUPER_ADMIN", "ADMIN"),
     uploadLimiter,
     receiveImage, // Multer errors go to the global error handler in server.js (413 / 400)

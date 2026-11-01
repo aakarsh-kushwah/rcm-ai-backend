@@ -23,6 +23,7 @@ const {
   getRealtimeActiveUsers, // Added
 } = require("../controllers/adminController");
 const { createChannel, createShortsOnlyChannel } = require("../controllers/channelController");
+const { getIncidentLogs, getSystemHealth } = require("../controllers/adminLifelinesController");
 
 // ✅ Import Middleware
 const { isAuthenticated, isActiveUser, isAdmin, restrictTo } = require("../middleware/authMiddleware");
@@ -125,5 +126,9 @@ router.delete("/shorts/:id", restrictTo("SUPER_ADMIN", "ADMIN"), adminDeleteShor
 
 // 4. Create Shorts-Only Channel
 router.post("/channels/shorts-only", restrictTo("SUPER_ADMIN", "ADMIN"), createShortsOnlyChannel);
+
+// 5. Lifelines admin telemetry
+router.get("/lifelines/incidents", restrictTo("SUPER_ADMIN", "ADMIN"), getIncidentLogs);
+router.get("/lifelines/system-health", restrictTo("SUPER_ADMIN", "ADMIN"), getSystemHealth);
 
 module.exports = router;

@@ -11,6 +11,7 @@ puppeteer.use(StealthPlugin());
 const { Product } = require('../models');
 const { uploadProductImage } = require('./cloudinaryService');
 const { emitProgress } = require('./socketService');
+const { createRcmSession } = require('./rcmSessionService');
 const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
@@ -118,30 +119,60 @@ async function saveProductSafe(data) {
 // ==========================================
 async function performExpertLogin(page) {
     logger.info("Starting Secure Login Sequence...");
-    await loadSession(page);
-    try {
-        await page.goto(`${BASE_URL}/login`, { waitUntil: 'networkidle2', timeout: 90000 });
-        
-        const isLoggedIn = await page.evaluate(() => document.body.innerText.toLowerCase().includes('sign out'));
-        if (isLoggedIn) { logger.info("Already Logged In."); return true; }
+    const buyerId = process.env.RCM_SCRAPER_ID || process.env.RCM_USERNAME || process.env.RCM_BUYER_ID;
+    const password = process.env.RCM_SCRAPER_PASS || process.env.RCM_PASSWORD;
 
-        await page.evaluate(() => {
-            const tabs = Array.from(document.querySelectorAll('li, span, div, a'));
-            const userTab = tabs.find(el => el.innerText?.trim() === 'As User Id');
-            if (userTab) userTab.click();
+    if (!buyerId || !password) {
+        logger.error("RCM scraper credentials are missing from environment variables.");
+        return false;
+    }
+
+    try {
+        const session = createRcmSession({
+            buyerId,
+            password,
+            options: {
+                baseUrl: BASE_URL,
+                timeout: 20000,
+                requestDelayMin: 400,
+                requestDelayMax: 800,
+                maxRetries: 2,
+                retryBackoffMs: 500,
+                maxConcurrency: 1
+            }
         });
 
-        const idSelector = 'input[placeholder*="User ID"], input[type="text"]';
-        await page.waitForSelector(idSelector, { visible: true, timeout: 15000 });
-        await wait(1000);
+        const loggedIn = await session.login();
+        if (!loggedIn) {
+            logger.warn("RCM session service reported login was not successful.");
+            return false;
+        }
 
-        await page.type(idSelector, process.env.RCM_USERNAME, { delay: 50 });
-        await page.type('input[type="password"]', process.env.RCM_PASSWORD, { delay: 50 });
-        await page.keyboard.press('Enter');
+        const authCookies = await session.jar.getCookies(baseUrl);
+        const sessionCookieData = authCookies.map((cookie) => ({
+            name: cookie.key || cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path,
+            expires: cookie.expires,
+            httpOnly: cookie.httpOnly,
+            secure: cookie.secure,
+            sameSite: cookie.sameSite
+        }));
 
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        await saveSession(page);
+        await page.setCookie(...sessionCookieData.map((cookie) => ({
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path || '/',
+            expires: typeof cookie.expires === 'number' ? cookie.expires : undefined,
+            httpOnly: cookie.httpOnly,
+            secure: cookie.secure,
+            sameSite: cookie.sameSite || 'Lax'
+        })));
+        await page.goto(`${BASE_URL}/my-account`, { waitUntil: 'networkidle2', timeout: 90000 });
         logger.info("Login Success.");
+        session.close();
         return true;
     } catch (e) {
         logger.error({ error: e.message }, "Login Failed");

@@ -34,7 +34,7 @@ const { metricsMiddleware, metricsHandler } = require("./middleware/metrics");
 // ⚙️ CONFIG
 // ============================================================
 const IS_PROD = process.env.NODE_ENV === "production";
-const PORT = Number(process.env.PORT) || 10000;
+const PORT = Number(process.env.PORT) || 5000;
 
 // Proxy hops between the socket and the real client.
 // Render(local) -> Cloudflare -> client = 3. Verify after deploy by logging req.ip.
@@ -113,7 +113,11 @@ app.use(helmet({ crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" }
 if (ENABLE_APP_COMPRESSION) app.use(compression());
 
 // 4. CORS (strict allowlist; this middleware also answers preflight OPTIONS)
-app.use(cors(corsOptions));
+app.use(cors({
+  origin: true,
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-lifelines-token', 'X-Requested-With', 'Accept', 'Origin', 'X-Trace-Id']
+}));
 
 // 5. Infra endpoints BEFORE the rate limiter so probes are never throttled
 const checkDb = async () => {
@@ -238,6 +242,10 @@ apiV1.use("/videos", require("./routes/videoRoutes"));
 apiV1.use("/channels", require("./routes/channelRoutes"));
 apiV1.use("/calculator", require("./routes/calculatorRoutes"));
 apiV1.use("/shorts", require("./routes/shortsRoutes"));
+// inside the apiV1 block, with the other apiV1.use(...) lines:
+const lifelinesRoutes = require('./routes/lifelinesRoutes');
+app.use('/api/lifelines', lifelinesRoutes);
+app.use('/lifelines', lifelinesRoutes);
 
 // /api/v1 is canonical; /api kept for backward compatibility
 app.use("/api/v1", apiV1);
@@ -293,6 +301,10 @@ let healthTimer;
 const startServer = async () => {
     try {
         await connectDB();
+
+        // Run patchColumns strictly once at startup
+        const patchColumns = require("./scripts/patchColumns");
+        await patchColumns().catch(err => logger.warn({ err: err.message }, "Startup patchColumns warning"));
 
         // Cross-platform safe auto-migrations (Windows + Linux)
         await new Promise((resolve) => {

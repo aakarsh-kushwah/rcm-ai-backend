@@ -1,8 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-// ✅ Import all necessary middleware
-const { isAuthenticated, isAdmin, isActiveUser, restrictTo } = require('../middleware/authMiddleware'); 
+const { isAuthenticated, isAdmin, restrictTo } = require('../middleware/authMiddleware'); 
 
 const { 
     batchScrapeImport, 
@@ -16,21 +15,17 @@ const {
 } = require('../controllers/videoController'); 
 
 // ============================================================
-// 1. Public Routes (For Users)
+// 1. Public / Authenticated Free Routes (For Users)
 // ============================================================
-// ✅ UPDATE: Added 'isActiveUser' to these routes.
-// Users must be logged in AND have 'active' status to see these.
-router.get('/leaders', isAuthenticated, isActiveUser, getLeaderVideos); 
-router.get('/products', isAuthenticated, isActiveUser, getProductVideos);
-router.get('/products/categories', isAuthenticated, isActiveUser, getProductCategories);
+router.get('/leaders', isAuthenticated, getLeaderVideos); 
+router.get('/products', isAuthenticated, getProductVideos);
+router.get('/products/categories', isAuthenticated, getProductCategories);
 
 // ============================================================
 // 2. Admin Routes (For Admins Only)
 // ============================================================
-// Admin routes require approval and active status
-router.use(isAuthenticated, isActiveUser); 
+router.use(isAuthenticated, isAdmin); 
 
-// ✅ Existing Batch Import Route
 router.post('/batch-scrape-import', restrictTo('SUPER_ADMIN', 'ADMIN'), batchScrapeImport); 
 
 // --- Leader Video Admin ---

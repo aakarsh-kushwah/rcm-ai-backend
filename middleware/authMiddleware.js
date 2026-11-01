@@ -185,10 +185,24 @@ const restrictTo = (...roles) => {
     };
 };
 
+// ============================================================
+// 5. PREMIUM USER GUARD
+// ============================================================
+const isPremiumUser = (req, res, next) => {
+    logger.info(`[AuthMiddleware] isPremiumUser: Checking premium status for user ID: ${req.userId}`);
+    if (req.user && req.user.status === 'premium') {
+        return next();
+    } else {
+        logger.warn(`[AuthMiddleware] isPremiumUser: Access denied for user ID: ${req.userId}. Status: ${req.user ? req.user.status : 'N/A'}`);
+        return res.status(403).json({ success: false, message: "Chat AI requires an active premium subscription", code: "SUBSCRIPTION_REQUIRED" });
+    }
+};
+
 module.exports = {
     verifyToken: verifyTokenLogic,
     isAuthenticated: verifyTokenLogic,
     isActiveUser,
     isAdmin,
-    restrictTo
+    restrictTo,
+    isPremiumUser
 };

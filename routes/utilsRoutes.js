@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { Product } = require('../models');
-const { isAuthenticated, isActiveUser, restrictTo } = require('../middleware/authMiddleware');
+const { isAuthenticated, restrictTo } = require('../middleware/authMiddleware');
 
 // Protected for Admins
-router.use(isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN'));
+router.use(isAuthenticated, restrictTo('SUPER_ADMIN', 'ADMIN'));
 
 /**
  * @route   GET /api/utils/inventory-health
