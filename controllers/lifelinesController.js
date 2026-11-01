@@ -14,6 +14,16 @@ const { searchLifelineMembers } = require('../utils/treeSearchHelper');
 const { emitProgress } = require('../services/socketService');
 const { issueToken, revokeToken, allowAttempt, clearAttempts } = require('../services/lifelinesAuth');
 
+/**
+ * SCHEMA NOTE:
+ * rcm_downline_nodes is a GLOBAL table: one row per RCM buyer_id, no root_buyer_id column.
+ * "Whose tree is this" is never a column - it's computed on read via the recursive
+ * subtree/ancestors CTEs below, walking parent_id from whichever buyer_id the caller is
+ * authorized to see (resolveRoot + isInSubtree). This is intentional: it's what lets an
+ * upline's crawl reuse a downline's already-indexed subtree for free, with no duplicate
+ * rows and no "grafting" step required.
+ */
+
 // ---------------------------------------------------------------------------
 // Resilient Scraper & Session Adapters (Zero-crash fallbacks)
 // ---------------------------------------------------------------------------
@@ -61,7 +71,8 @@ async function fetchMacroSafe(session, buyerId) {
       identity: {
         name: overview.associateName,
         highest_pin: overview.pinLevel,
-        buyer_id: buyerId
+        buyer_id: buyerId,
+        photo_url: overview.photoUrl
       },
       total_pv: overview.totalPv,
       self_pv: overview.selfPv,
@@ -75,7 +86,8 @@ async function fetchMacroSafe(session, buyerId) {
       identity: {
         name: res.associateName,
         highest_pin: res.pinLevel,
-        buyer_id: buyerId
+        buyer_id: buyerId,
+        photo_url: res.photoUrl
       },
       total_pv: res.totalPv,
       self_pv: res.selfPv,
@@ -142,6 +154,15 @@ function getRolling12Months() {
     });
   }
   return months;
+}
+
+/** Current month key and the previous closed month key, computed from the real clock. */
+function getCurrentAndClosedMonthKeys() {
+  const now = new Date();
+  const currentKey = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const closedKey = `${prev.getFullYear()}${String(prev.getMonth() + 1).padStart(2, '0')}`;
+  return { currentKey, closedKey };
 }
 
 function resolveRoot(req, res, suppliedRoot) {
@@ -297,10 +318,21 @@ exports.syncLifelines = async (req, res) => {
       token,
       buyerId,
       identity: macroInfo?.identity || {},
-      macroData: macroInfo
+      macroData: {
+        buyer_id: buyerId,
+        name: macroInfo.associateName,
+        pin: macroInfo.pinLevel,
+        photo_url: macroInfo.photoUrl,
+        total_pv: macroInfo.totalPv,
+        self_pv: macroInfo.selfPv,
+        closed_month_pv: macroInfo.closedMonthPv,
+        closed_self_pv: macroInfo.closedSelfPv,
+        directLegs: macroInfo.directLegs
+      }
     });
 
-    // PHASE 2: deep crawl in the background
+    // PHASE 2: deep crawl in the background (skips automatically if still fresh - see
+    // the TTL guard inside startBackgroundTreeCrawler; this is NOT an unconditional skip)
     setImmediate(async () => {
       try {
         await scrapeGroupSafe(session, buyerId, macroInfo);
@@ -347,14 +379,13 @@ exports.getLifelinesOverview = async (req, res) => {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
-    const [identityMap, rootRows, turnover, counts, legNodes] = await Promise.all([
+    const { currentKey, closedKey } = getCurrentAndClosedMonthKeys();
+
+    const [identityMap, rootRows, turnoverCurrent, turnoverClosed, counts, legNodes] = await Promise.all([
       loadIdentities([rootId]),
       select('SELECT * FROM rcm_downline_nodes WHERE buyer_id = :rootId', { rootId }),
-      RcmMonthlyTurnoverHistory.findOne({
-        where: { buyer_id: rootId },
-        order: [['created_at', 'DESC'], ['id', 'DESC']],
-        raw: true
-      }).catch(() => null),
+      RcmMonthlyTurnoverHistory.findOne({ where: { buyer_id: rootId, year_month: currentKey }, raw: true }).catch(() => null),
+      RcmMonthlyTurnoverHistory.findOne({ where: { buyer_id: rootId, year_month: closedKey }, raw: true }).catch(() => null),
       select(
         `${SUBTREE_CTE}
          SELECT COUNT(*) AS total,
@@ -380,15 +411,20 @@ exports.getLifelinesOverview = async (req, res) => {
     const purchasers = safeNumber(c.purchasers);
     const terminated = safeNumber(c.terminated_count);
 
-    const totalPv = safeNumber(turnover?.total_pv || turnover?.total_group_pv || rootNode.total_group_pv);
-    const selfPv = safeNumber(turnover?.self_pv || rootNode.self_pv || rootNode.current_pv);
+    // Live DownlineNode fields are the most current source (updated by every crawl);
+    // the turnover history row is the authoritative per-month snapshot once it exists.
+    // No hardcoded fallback: an unsynced month genuinely means "no data yet", not a guess.
+    const totalPv = safeNumber(turnoverCurrent?.total_pv ?? rootNode.total_group_pv, 0);
+    const selfPv = safeNumber(turnoverCurrent?.self_pv ?? rootNode.self_pv ?? rootNode.current_pv, 0);
+    const closedTotalPv = turnoverClosed ? safeNumber(turnoverClosed.total_pv) : null;
+    const closedSelfPv = turnoverClosed ? safeNumber(turnoverClosed.self_pv) : null;
 
     const legIdentities = await loadIdentities(legNodes.map((n) => Number(n.buyer_id)));
     const legs = legNodes.map((node, idx) => {
       const legIdentity = legIdentities.get(Number(node.buyer_id)) || {};
-      const fallbackPv = idx === 0 ? turnover?.leg_a_pv : idx === 1 ? turnover?.leg_b_pv : 0;
+      const fallbackPv = idx === 0 ? turnoverCurrent?.leg_a_pv : idx === 1 ? turnoverCurrent?.leg_b_pv : 0;
       return {
-        leg: legLabel(idx),
+        leg: node.leg_type || legLabel(idx),
         head_id: node.buyer_id,
         head_name: legIdentity.name || node.name,
         photo_url: pickPhoto(legIdentity),
@@ -405,9 +441,11 @@ exports.getLifelinesOverview = async (req, res) => {
       data: {
         buyerId: rootId,
         buyer_id: rootId,
-        synced: Boolean(rootRows.length || turnover),
+        synced: Boolean(rootRows.length || turnoverCurrent),
         total_pv: totalPv,
         self_pv: selfPv,
+        closed_month_pv: closedTotalPv,   // null until that month is actually synced
+        closed_self_pv: closedSelfPv,     // null until that month is actually synced
         total_team: totalTeam,
         active_purchasers: purchasers,
         identity: {
