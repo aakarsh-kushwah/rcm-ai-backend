@@ -76,11 +76,14 @@ const getRawId = (obj) => {
 async function safeGet(session, url) {
   try {
     const headers = {
-      'Authorization': session?.client?.defaults?.headers?.common['Authorization'] || '',
+      'Authorization': session?.client?.defaults?.headers?.common['Authorization'] || (session?.token ? `Bearer ${session.token}` : ''),
       'Cookie': session?.client?.defaults?.headers?.common['Cookie'] || '',
       'Origin': 'https://www.rcmworld.com',
       'Referer': 'https://www.rcmworld.com/',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'resource': 'crm',
+      'x-user-type': 'ab',
+      'Accept': 'application/json, text/plain, */*'
     };
 
     if (session?.client) {
