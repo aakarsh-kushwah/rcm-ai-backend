@@ -527,10 +527,12 @@ function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, 
         }
 
         // Mark this node's own children as freshly synced (used by the TTL guard above).
-        await safeUpsert(DownlineNode, {
-          buyer_id: node.distNo,
-          children_synced_at: new Date()
-        }, `DownlineNode freshness ${node.distNo}`);
+        if (DownlineNode && DownlineNode.update) {
+          await DownlineNode.update(
+            { children_synced_at: new Date() },
+            { where: { buyer_id: String(node.distNo) } }
+          ).catch((err) => console.warn(`[FRESHNESS UPDATE WARN] ${node.distNo}:`, err.message));
+        }
       } catch (err) {
         if (err.message === 'SESSION_EXPIRED') {
           aborted = true;
@@ -633,10 +635,12 @@ async function fetchChildrenOnDemand(rootId, parentId) {
       saved++;
     }
 
-    await safeUpsert(DownlineNode, {
-      buyer_id: String(parentId),
-      children_synced_at: new Date()
-    }, `DownlineNode freshness ${parentId}`);
+    if (DownlineNode && DownlineNode.update) {
+      await DownlineNode.update(
+        { children_synced_at: new Date() },
+        { where: { buyer_id: String(parentId) } }
+      ).catch(() => null);
+    }
 
     return { fetched: true, count: saved };
   } catch (err) {
