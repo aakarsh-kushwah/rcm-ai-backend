@@ -70,9 +70,12 @@ async function fetchMacroSafe(session, buyerId) {
     return {
       identity: {
         name: overview.associateName,
-        highest_pin: overview.pinLevel,
+        curr_pin: overview.currPin,
+        highest_pin: overview.maxPin,
         buyer_id: buyerId,
-        photo_url: overview.photoUrl
+        photo_url: overview.photoUrl,
+        kyc_status: overview.kycStatus,
+        join_date: overview.joinDate
       },
       total_pv: overview.totalPv,
       self_pv: overview.selfPv,
@@ -223,7 +226,8 @@ async function getSubtreeIds(rootId, { includeRoot = false } = {}) {
 }
 
 const IDENTITY_WANTED = [
-  'buyer_id', 'name', 'custom_photo_url', 'profile_photo_url', 'photo_url', 'highest_pin', 'pin',
+  'buyer_id', 'name', 'custom_photo_url', 'profile_photo_url', 'photo_url',
+  'highest_pin', 'pin', 'curr_pin', 'max_pin',
   'kyc_status', 'join_date', 'mobile_no', 'mobile', 'state', 'district', 'tehsil', 'city',
   'post_village', 'pincode', 'address', 'sponsor_id', 'sponsor_name', 'proposer_id', 'proposer_name'
 ];
@@ -250,7 +254,11 @@ function formatNode(node, identity = {}) {
     parent_id: node.parent_id,
     name: identity.name || node.name,
     photo_url: pickPhoto(identity),
+    curr_pin: identity.curr_pin || identity.pin || 'ASSOCIATE BUYER',
+    max_pin: identity.max_pin || identity.highest_pin || 'ASSOCIATE BUYER',
     highest_pin: identity.highest_pin || 'ASSOCIATE BUYER',
+    kyc_status: identity.kyc_status || (Number(node.status) === 0 ? 'Terminated' : null),
+    join_date: identity.join_date || null,
     mobile_no: pickMobile(identity) || null,
     status: Number(node.status),
     statusLabel: Number(node.status) === 1 ? 'ACTIVE' : 'TERMINATED',
@@ -309,7 +317,6 @@ exports.syncLifelines = async (req, res) => {
     await persistSessionSafely(buyerId, session);
     const token = issueToken(buyerId);
 
-    // PHASE 1: instant macro numbers (unlocks the UI)
     const macroInfo = await fetchMacroSafe(session, buyerId);
 
     res.status(200).json({
@@ -321,8 +328,11 @@ exports.syncLifelines = async (req, res) => {
       macroData: {
         buyer_id: buyerId,
         name: macroInfo.associateName,
-        pin: macroInfo.pinLevel,
+        curr_pin: macroInfo.currPin,
+        max_pin: macroInfo.maxPin,
         photo_url: macroInfo.photoUrl,
+        kyc_status: macroInfo.kycStatus,
+        join_date: macroInfo.joinDate,
         total_pv: macroInfo.totalPv,
         self_pv: macroInfo.selfPv,
         closed_month_pv: macroInfo.closedMonthPv,
@@ -331,8 +341,6 @@ exports.syncLifelines = async (req, res) => {
       }
     });
 
-    // PHASE 2: deep crawl in the background (skips automatically if still fresh - see
-    // the TTL guard inside startBackgroundTreeCrawler; this is NOT an unconditional skip)
     setImmediate(async () => {
       try {
         await scrapeGroupSafe(session, buyerId, macroInfo);
@@ -351,14 +359,12 @@ exports.syncLifelines = async (req, res) => {
   }
 };
 
-// POST /logout
 exports.logoutLifelines = async (req, res) => {
   if (req.lifelinesRoot) removeSessionSafely(req.lifelinesRoot);
   revokeToken(req.lifelinesToken);
   return res.status(200).json({ success: true });
 };
 
-// GET /status/:buyerId
 exports.getSyncStatus = async (req, res) => {
   const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
   if (!rootId) return undefined;
@@ -372,7 +378,7 @@ exports.getSyncStatus = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// GET /overview/:buyerId
+// GET /overview/:buyerId (With Team ₹ Repurchase Amount & Accurate Subtree PV)
 // ---------------------------------------------------------------------------
 exports.getLifelinesOverview = async (req, res) => {
   try {
@@ -388,11 +394,14 @@ exports.getLifelinesOverview = async (req, res) => {
       RcmMonthlyTurnoverHistory.findOne({ where: { buyer_id: rootId, year_month: closedKey }, raw: true }).catch(() => null),
       select(
         `${SUBTREE_CTE}
-         SELECT COUNT(*) AS total,
+         SELECT COUNT(*) AS total_team,
                 SUM(CASE WHEN n.status = 0 THEN 1 ELSE 0 END) AS terminated_count,
-                SUM(CASE WHEN n.self_pv > 0 THEN 1 ELSE 0 END) AS purchasers,
-                SUM(CASE WHEN n.status = 1 AND n.self_pv = 0 THEN 1 ELSE 0 END) AS zero_pv
-         FROM subtree s JOIN rcm_downline_nodes n ON n.buyer_id = s.buyer_id
+                SUM(CASE WHEN n.status = 1 AND (n.self_pv > 0 OR n.repurchase_amt > 0) THEN 1 ELSE 0 END) AS active_purchasers,
+                SUM(CASE WHEN n.status = 1 AND (n.self_pv = 0 OR n.self_pv IS NULL) AND (n.repurchase_amt = 0 OR n.repurchase_amt IS NULL) THEN 1 ELSE 0 END) AS inactive_count,
+                SUM(COALESCE(n.repurchase_amt, 0)) AS total_team_repurchase_amt,
+                SUM(COALESCE(n.self_pv, 0)) AS total_subtree_pv
+         FROM subtree s 
+         JOIN rcm_downline_nodes n ON n.buyer_id = s.buyer_id
          WHERE s.depth > 0`,
         { rootId }
       ),
@@ -407,15 +416,16 @@ exports.getLifelinesOverview = async (req, res) => {
     const identity = identityMap.get(rootId) || {};
     const rootNode = rootRows[0] || {};
     const c = counts[0] || {};
-    const totalTeam = safeNumber(c.total);
-    const purchasers = safeNumber(c.purchasers);
+    const totalTeam = safeNumber(c.total_team);
+    const activePurchasers = safeNumber(c.active_purchasers);
     const terminated = safeNumber(c.terminated_count);
+    const inactiveCount = safeNumber(c.inactive_count);
+    const totalTeamRepurchaseAmt = safeNumber(c.total_team_repurchase_amt);
+    const totalSubtreePv = safeNumber(c.total_subtree_pv);
 
-    // Live DownlineNode fields are the most current source (updated by every crawl);
-    // the turnover history row is the authoritative per-month snapshot once it exists.
-    // No hardcoded fallback: an unsynced month genuinely means "no data yet", not a guess.
-    const totalPv = safeNumber(turnoverCurrent?.total_pv ?? rootNode.total_group_pv, 0);
     const selfPv = safeNumber(turnoverCurrent?.self_pv ?? rootNode.self_pv ?? rootNode.current_pv, 0);
+    const totalPv = safeNumber(turnoverCurrent?.total_pv ?? rootNode.total_group_pv ?? (totalSubtreePv + selfPv), 0);
+    const selfRepurchaseAmt = safeNumber(rootNode.repurchase_amt, 0);
     const closedTotalPv = turnoverClosed ? safeNumber(turnoverClosed.total_pv) : null;
     const closedSelfPv = turnoverClosed ? safeNumber(turnoverClosed.self_pv) : null;
 
@@ -441,16 +451,27 @@ exports.getLifelinesOverview = async (req, res) => {
       data: {
         buyerId: rootId,
         buyer_id: rootId,
+        name: identity.name || rootNode.name || `Associate #${rootId}`,
+        curr_pin: identity.curr_pin || identity.pin || 'ASSOCIATE BUYER',
+        max_pin: identity.max_pin || identity.highest_pin || 'ASSOCIATE BUYER',
+        highest_pin: identity.highest_pin || 'ASSOCIATE BUYER',
+        photo_url: pickPhoto(identity),
         synced: Boolean(rootRows.length || turnoverCurrent),
         total_pv: totalPv,
         self_pv: selfPv,
-        closed_month_pv: closedTotalPv,   // null until that month is actually synced
-        closed_self_pv: closedSelfPv,     // null until that month is actually synced
+        self_repurchase_amt: selfRepurchaseAmt,
+        total_repurchase_amt: totalTeamRepurchaseAmt,
+        closed_month_pv: closedTotalPv,
+        closed_self_pv: closedSelfPv,
         total_team: totalTeam,
-        active_purchasers: purchasers,
+        active_purchasers: activePurchasers,
+        inactive_members: inactiveCount,
+        terminated_members: terminated,
         identity: {
           buyer_id: rootId,
           name: identity.name || rootNode.name || `Associate #${rootId}`,
+          curr_pin: identity.curr_pin || null,
+          max_pin: identity.max_pin || null,
           highest_pin: identity.highest_pin || null,
           kyc_status: identity.kyc_status || (Number(rootNode.status) === 0 ? 'Terminated' : null),
           photo_url: pickPhoto(identity),
@@ -461,12 +482,14 @@ exports.getLifelinesOverview = async (req, res) => {
         },
         totals: {
           totalMembers: totalTeam,
-          active: purchasers,
+          active: activePurchasers,
+          inactive: inactiveCount,
           terminated,
-          zeroPv: safeNumber(c.zero_pv),
+          zeroPv: inactiveCount,
           totalPv,
           selfPv,
-          activePurchasers: purchasers
+          totalRepurchaseAmt: totalTeamRepurchaseAmt,
+          activePurchasers
         },
         directLegs: legs,
         legs,
@@ -678,6 +701,8 @@ exports.getMemberFullProfile = async (req, res) => {
         applicant_name: name,
         join_date: identity?.join_date || null,
         kyc_status: identity?.kyc_status || (terminated ? 'Terminated' : 'Active'),
+        curr_pin: identity?.curr_pin || null,
+        max_pin: identity?.max_pin || null,
         highest_pin: identity?.highest_pin || 'ASSOCIATE BUYER',
         pin: identity?.highest_pin || 'ASSOCIATE BUYER',
         sponsor_id: identity?.sponsor_id || node?.parent_id || null,
@@ -708,9 +733,6 @@ exports.getMemberFullProfile = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /search
-// ---------------------------------------------------------------------------
 exports.searchLifelines = async (req, res) => {
   try {
     const rootId = resolveRoot(req, res, req.query.rootBuyerId || req.query.rootBuyerID || req.query.buyerId);
@@ -729,9 +751,6 @@ exports.searchLifelines = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /territory/:buyerId
-// ---------------------------------------------------------------------------
 exports.getTerritorySummary = async (req, res) => {
   try {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
@@ -800,9 +819,6 @@ exports.getTerritorySummary = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /followup/:buyerId
-// ---------------------------------------------------------------------------
 exports.getFollowupList = async (req, res) => {
   try {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
@@ -828,6 +844,8 @@ exports.getFollowupList = async (req, res) => {
         district: identity.district || null,
         state: identity.state || null,
         post_village: identity.post_village || null,
+        curr_pin: identity.curr_pin || null,
+        max_pin: identity.max_pin || null,
         highest_pin: identity.highest_pin || 'ASSOCIATE BUYER',
         photo_url: pickPhoto(identity)
       };
@@ -839,9 +857,6 @@ exports.getFollowupList = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /turnover-history
-// ---------------------------------------------------------------------------
 exports.getTurnoverHistory = async (req, res) => {
   try {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
@@ -858,9 +873,6 @@ exports.getTurnoverHistory = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// POST /photo
-// ---------------------------------------------------------------------------
 exports.updateCustomPhoto = async (req, res) => {
   try {
     const rootId = resolveRoot(req, res, null);
@@ -894,7 +906,6 @@ exports.updateCustomPhoto = async (req, res) => {
   }
 };
 
-// Aliases for route compatibility
 exports.getOverview = exports.getLifelinesOverview;
 exports.getTreeChildren = exports.getLifelinesChildren;
 exports.getMemberDetail = exports.getMemberFullProfile;

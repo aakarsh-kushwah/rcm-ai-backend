@@ -22,14 +22,38 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false
       },
       current_pv: {
-        type: DataTypes.DECIMAL(10, 2),
+        type: DataTypes.DECIMAL(14, 2),
         allowNull: false,
+        defaultValue: 0.00
+      },
+      self_pv: {
+        type: DataTypes.DECIMAL(14, 2),
+        allowNull: true,
+        defaultValue: 0.00
+      },
+      total_group_pv: {
+        type: DataTypes.DECIMAL(14, 2),
+        allowNull: true,
         defaultValue: 0.00
       },
       purchase_amt: {
         type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
+      },
+      repurchase_amt: {
+        type: DataTypes.DECIMAL(14, 2),
+        allowNull: true,
+        defaultValue: 0.00
+      },
+      kyc_status: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        defaultValue: 'KYC OK'
+      },
+      leg_type: {
+        type: DataTypes.STRING(10),
+        allowNull: true
       },
       status: {
         type: DataTypes.INTEGER,
@@ -46,7 +70,7 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.INTEGER,
         allowNull: false,
         defaultValue: 0
-      },
+      }
     },
     {
       tableName: 'rcm_downline_nodes',
@@ -54,26 +78,11 @@ module.exports = (sequelize, DataTypes) => {
       charset: 'utf8mb4',
       collate: 'utf8mb4_unicode_ci',
       indexes: [
-        {
-          name: 'idx_parent_id',
-          fields: ['parent_id']
-        },
-        {
-          name: 'idx_name_status',
-          fields: ['name', 'status']
-        },
-        {
-          name: 'idx_current_pv',
-          fields: ['current_pv']
-        },
-        {
-          name: 'idx_status',
-          fields: ['status']
-        },
-        {
-          name: 'idx_level',
-          fields: ['level']
-        }
+        { name: 'idx_parent_id', fields: ['parent_id'] },
+        { name: 'idx_name_status', fields: ['name', 'status'] },
+        { name: 'idx_current_pv', fields: ['current_pv'] },
+        { name: 'idx_status', fields: ['status'] },
+        { name: 'idx_level', fields: ['level'] }
       ]
     }
   );
