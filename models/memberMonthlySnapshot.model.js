@@ -34,6 +34,16 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: 1,
       },
+      total_group_pv: {
+        type: DataTypes.MEDIUMINT.UNSIGNED,
+        allowNull: false,
+        defaultValue: 0,
+      },
+      repurchase_amt: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+      },
     },
     {
       tableName: 'rcm_member_monthly_snapshots',

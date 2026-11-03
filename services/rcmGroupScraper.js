@@ -569,6 +569,17 @@ function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, 
             level: node.depth + 1
           }, `DownlineNode ${childId}`);
 
+          const nowScrape = new Date();
+          const currentMonthKeyScrape = `${nowScrape.getFullYear()}${String(nowScrape.getMonth() + 1).padStart(2, '0')}`;
+          await safeUpsert(MemberMonthlySnapshot, {
+            buyer_id: Number(childId),
+            month_key: currentMonthKeyScrape,
+            pv: selfPv,
+            purchase_amt: repurchaseAmt,
+            leg_type: child.leg || 'Leg A',
+            status
+          }, `MemberMonthlySnapshot ${childId}`);
+
           state.count++;
           queue.push({ distNo: childId, depth: node.depth + 1 });
         }
