@@ -13,7 +13,7 @@ const rcmGroupScraper = require('../services/rcmGroupScraper');
 const { searchLifelineMembers } = require('../utils/treeSearchHelper');
 const { emitProgress } = require('../services/socketService');
 const { issueToken, revokeToken, allowAttempt, clearAttempts } = require('../services/lifelinesAuth');
-
+const activeView = require('../services/rcmActiveView');
 // ---------------------------------------------------------------------------
 // Resilient Scraper & Session Adapters (Zero-crash fallbacks)
 // ---------------------------------------------------------------------------
@@ -65,7 +65,11 @@ async function fetchMacroSafe(session, buyerId) {
         buyer_id: buyerId,
         photo_url: overview.photoUrl,
         kyc_status: overview.kycStatus,
-        join_date: overview.joinDate
+        join_date: overview.joinDate,
+        proposer_id: overview.proposerId,
+        proposer_name: overview.proposerName,
+        sponsor_id: overview.sponsorId,
+        sponsor_name: overview.sponsorName
       },
       total_pv: overview.totalPv,
       self_pv: overview.selfPv,
@@ -129,6 +133,10 @@ function safeNumber(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function round2(value) {
+  return Math.round(safeNumber(value) * 100) / 100;
+}
+
 function firstPositive(...values) {
   for (const v of values) {
     const n = Number(v);
@@ -157,17 +165,46 @@ function chunk(arr, size) {
 
 const legLabel = (i) => (i < 26 ? String.fromCharCode(65 + i) : `L${i + 1}`);
 
+function parseLegLetter(value) {
+  const m = String(value || '').match(/^\s*(?:leg\s*)?([A-Za-z])\s*$/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
 const monthKeyOf = (d) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
 const monthLabelOf = (d) => d.toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
 
-/** Current month key and previous closed month key, from the real clock (YYYYMM). */
+function parseDateLoose(value) {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+
+  const str = String(value).trim();
+  if (!str) return null;
+
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) {
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  m = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (m) {
+    const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  const fallback = new Date(str);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
+
+const formatDateOnly = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
 function getCurrentAndClosedMonthKeys() {
   const now = new Date();
   const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
   return { currentKey: monthKeyOf(now), closedKey: monthKeyOf(prev) };
 }
 
-/** Token owner is ALWAYS the root. A different buyerId in the URL is rejected. */
 function resolveRoot(req, res, suppliedRoot) {
   const tokenRoot = req.lifelinesRoot ? Number(req.lifelinesRoot) : null;
   const supplied = safeNumber(suppliedRoot, 0);
@@ -224,8 +261,6 @@ const NODE_COLUMN_CANDIDATES = [
 ];
 const TREE_TTL_MS = 10 * 1000;
 const TREE_MIN_RELOAD_MS = 2 * 1000;
-const MAX_TREE_DEPTH = 5000;
-const MAX_TREE_NODES = 300000;
 const MAX_CACHED_TREES = 20;
 
 let nodeColumnsPromise = null;
@@ -273,7 +308,6 @@ async function fetchSubtreeFromDb(rootId) {
   const nodeMap = new Map();
   const childrenMap = new Map();
 
-  // Single fast query loads all tree records (takes ~50ms)
   const allRows = await select(`SELECT ${cols} FROM rcm_downline_nodes`);
   for (const row of allRows) {
     const key = String(row.buyer_id);
@@ -291,7 +325,6 @@ async function fetchSubtreeFromDb(rootId) {
     return { nodeMap: new Map(), childrenMap: new Map(), builtAt: Date.now(), truncated: false };
   }
 
-  // RAM BFS filter: extract only rootId's subtree (< 10ms)
   const subtreeNodeMap = new Map();
   const subtreeChildrenMap = new Map();
   const queue = [{ id: rootKey, depth: 0 }];
@@ -367,19 +400,47 @@ function classifyNode(node) {
   return 'inactive';
 }
 
+function assignLegLetters(heads) {
+  const sortedById = heads.slice().sort((a, b) => a.buyer_id - b.buyer_id);
+  const used = new Set();
+  const letterOf = new Map();
+
+  for (const head of sortedById) {
+    const letter = parseLegLetter(head.leg_type);
+    if (letter && !used.has(letter)) {
+      used.add(letter);
+      letterOf.set(head.buyer_id, letter);
+    }
+  }
+
+  let cursor = 0;
+  for (const head of sortedById) {
+    if (letterOf.has(head.buyer_id)) continue;
+    while (used.has(legLabel(cursor))) cursor += 1;
+    const letter = legLabel(cursor);
+    used.add(letter);
+    letterOf.set(head.buyer_id, letter);
+  }
+
+  return sortedById
+    .map((head) => ({ head, letter: letterOf.get(head.buyer_id) }))
+    .sort((a, b) => (a.letter < b.letter ? -1 : a.letter > b.letter ? 1 : a.head.buyer_id - b.head.buyer_id));
+}
+
 function analyzeTree(tree, rootId) {
   const rootKey = String(rootId);
   const rootNode = tree.nodeMap.get(rootKey) || null;
-  const heads = (tree.childrenMap.get(rootKey) || []).slice().sort((a, b) => a.buyer_id - b.buyer_id);
+  const heads = tree.childrenMap.get(rootKey) || [];
+  const orderedHeads = assignLegLetters(heads);
 
   const totals = { members: 0, active: 0, inactive: 0, terminated: 0, pv: 0, repurchase: 0 };
   const members = [];
   const visited = new Set([rootKey]);
 
-  const legs = heads.map((head, idx) => {
+  const legs = orderedHeads.map(({ head, letter }) => {
     const leg = {
       head,
-      letter: legLabel(idx),
+      letter,
       members: 0, active: 0, inactive: 0, terminated: 0, pv: 0, repurchase: 0
     };
 
@@ -487,7 +548,6 @@ exports.syncLifelines = async (req, res) => {
     const password = req.body?.password || req.body?.rcmPassword || req.body?.pass;
     const buyerId = safeNumber(rawId, 0);
 
-    // Single backslash regex check
     if (!/^\d{6,10}$/.test(String(buyerId)) || !password) {
       return res.status(400).json({ success: false, message: 'Valid buyerId and password are required.' });
     }
@@ -617,16 +677,39 @@ exports.getLifelinesOverview = async (req, res) => {
     const selfRepurchaseAmt = rootNode ? rootNode.repurchase_amt : 0;
     const selfPv = firstPositive(turnoverCurrent?.self_pv, rootNode?.self_pv);
     const totalPv = firstPositive(turnoverCurrent?.total_pv, rootNode?.total_group_pv, totals.pv + selfPv);
-    const totalTeamRepurchaseAmt = totals.repurchase + selfRepurchaseAmt;
+
+    // Total Network Turnover (Rs.): every member's repurchase amount in the subtree + root's own purchase
+        let liveSummary = { exists: false };
+    try {
+      if (activeView && typeof activeView.getSummary === 'function') {
+        liveSummary = await activeView.getSummary(rootId, currentKey);
+      }
+    } catch (err) {
+      console.warn('[ACTIVE VIEW LOAD NOTICE]:', err.message);
+    }
+    const liveVerified = Boolean(liveSummary.exists && liveSummary.state === 'VERIFIED' && liveSummary.amtComplete);
+    const totalTeamRepurchaseAmt = liveVerified
+      ? round2(liveSummary.totals.amt)
+      : round2(totals.repurchase + selfRepurchaseAmt);
+
+    // Active Purchasers: non-terminated members with PV > 0 or repurchase > 0
+    const rootIsActivePurchaser = Boolean(
+      rootNode && Number(rootNode.status) !== 0 && (rootNode.pv > 0 || rootNode.repurchase_amt > 0 || selfPv > 0)
+    );
+        const activePurchasers = liveVerified
+      ? liveSummary.totals.buyers
+      : totals.active + (rootIsActivePurchaser ? 1 : 0);
 
     const legIdentities = await loadIdentities(legs.map((l) => l.head.buyer_id));
 
+    // Clean direct-leg cards: identity, Leg PV, and Team Repurchase Rs.
     const directLegs = legs.map((leg, idx) => {
       const head = leg.head;
       const legIdentity = legIdentities.get(head.buyer_id) || {};
       const turnoverLegPv = idx === 0 ? safeNumber(turnoverCurrent?.leg_a_pv) : idx === 1 ? safeNumber(turnoverCurrent?.leg_b_pv) : 0;
       const officialPv = firstPositive(head.total_group_pv, turnoverLegPv, leg.pv);
-      const subtreeRepurchase = leg.repurchase;
+            const liveLeg = liveVerified ? (liveSummary.legs || []).find((l) => l.leg === leg.letter) : null;
+      const legRepurchase = liveLeg ? round2(liveLeg.amt) : round2(leg.repurchase);
       const name = legIdentity.name || head.name;
 
       return {
@@ -642,15 +725,9 @@ exports.getLifelinesOverview = async (req, res) => {
         subtree_pv: officialPv,
         total_leg_subtree_pv: officialPv,
         crawled_pv: leg.pv,
-        self_pv: head.self_pv,
-        repurchase_amt: subtreeRepurchase,
-        total_leg_repurchase_amt: subtreeRepurchase,
-        subtree_repurchase_amt: subtreeRepurchase,
-        self_repurchase_amt: head.repurchase_amt,
-        members: leg.members,
-        active_purchasers: leg.active,
-        inactive_members: leg.inactive,
-        terminated_members: leg.terminated,
+        repurchase_amt: legRepurchase,
+        total_leg_repurchase_amt: legRepurchase,
+        subtree_repurchase_amt: legRepurchase,
         status: head.status,
         has_children: (tree.childrenMap.get(String(head.buyer_id)) || []).length > 0
       };
@@ -702,17 +779,19 @@ exports.getLifelinesOverview = async (req, res) => {
         totalPv,
         self_pv: selfPv,
         selfPv,
-        self_repurchase_amt: selfRepurchaseAmt,
-        selfRepurchaseAmt,
+        self_repurchase_amt: round2(selfRepurchaseAmt),
+        selfRepurchaseAmt: round2(selfRepurchaseAmt),
         total_repurchase_amt: totalTeamRepurchaseAmt,
-        total_team_repurchase_amt: totalTeamRepurchaseAmt,
+        total_team_repurchase_amt: liveSummary.exists && liveSummary.totals && liveSummary.totals.amt > 0 ? liveSummary.totals.amt : (totalTeamRepurchaseAmt || 0),
         totalTeamRepurchaseAmt,
+        total_network_turnover: totalTeamRepurchaseAmt,
+        totalNetworkTurnover: totalTeamRepurchaseAmt,
         closed_month_pv: closedTotalPv,
         closed_self_pv: closedSelfPv,
-        total_team: totals.members,
-        active_purchasers: totals.active,
-        inactive_members: totals.inactive,
-        terminated_members: totals.terminated,
+        total_team: liveSummary.exists && liveSummary.counts ? liveSummary.counts.totalMembers : (totals.members || 0),
+        active_purchasers: liveSummary.exists && liveSummary.counts ? liveSummary.counts.activeBuyers : (activePurchasers || 0),
+        inactive_members: liveSummary.exists && liveSummary.counts ? liveSummary.counts.inactiveMembers : 0,
+        terminated_members: liveSummary.exists && liveSummary.counts ? liveSummary.counts.terminatedMembers : 0,
         identity: {
           buyer_id: rootId,
           name: displayName,
@@ -730,19 +809,23 @@ exports.getLifelinesOverview = async (req, res) => {
         },
         totals: {
           totalMembers: totals.members,
-          active: totals.active,
+          active: activePurchasers,
           inactive: totals.inactive,
           terminated: totals.terminated,
           zeroPv: totals.inactive,
           totalPv,
           selfPv,
           totalRepurchaseAmt: totalTeamRepurchaseAmt,
-          activePurchasers: totals.active
+          totalNetworkTurnover: totalTeamRepurchaseAmt,
+          activePurchasers
         },
         directLegs,
         legs: directLegs,
-        monthlyHistory,
-        crawl: getCrawlStatusSafe(rootId)
+                monthlyHistory,
+        crawl: getCrawlStatusSafe(rootId),
+        live: liveSummary,
+        liveState: liveSummary.exists ? liveSummary.state : 'CACHED'
+
       }
     });
   } catch (error) {
@@ -789,6 +872,125 @@ exports.getLifelinesChildren = async (req, res) => {
   } catch (error) {
     console.error('Error in getLifelinesChildren:', error.message);
     return res.status(200).json({ success: true, data: [], warning: 'Could not load children.' });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// GET /new-joinings/:buyerId
+// ---------------------------------------------------------------------------
+const getNewJoinings = async (req, res) => {
+  try {
+    const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId || req.query.rootBuyerId);
+    if (!rootId) return undefined;
+
+    const monthCount = Math.min(Math.max(Math.floor(safeNumber(req.query.months, 3)), 1), 12);
+    const limit = Math.min(Math.max(Math.floor(safeNumber(req.query.limit, 1000)), 1), 5000);
+    const requestedMonthKey = String(req.query.monthKey || req.query.month_key || '').trim();
+
+    let baseDate = new Date();
+    if (/^\d{6}$/.test(requestedMonthKey)) {
+      const y = parseInt(requestedMonthKey.slice(0, 4), 10);
+      const m = parseInt(requestedMonthKey.slice(4, 6), 10);
+      if (m >= 1 && m <= 12) baseDate = new Date(y, m - 1, 1);
+    }
+
+    const windowStart = new Date(baseDate.getFullYear(), baseDate.getMonth() - (monthCount - 1), 1);
+    const windowEndExclusive = new Date(baseDate.getFullYear(), baseDate.getMonth() + 1, 1);
+
+    const monthLabels = [];
+    const monthKeys = [];
+    const labelByKey = new Map();
+    for (let i = 0; i < monthCount; i += 1) {
+      const d = new Date(baseDate.getFullYear(), baseDate.getMonth() - i, 1);
+      const key = monthKeyOf(d);
+      const label = monthLabelOf(d);
+      monthKeys.push(key);
+      monthLabels.push(label);
+      labelByKey.set(key, label);
+    }
+
+    const tree = await loadTree(rootId);
+    const { members } = analyzeTree(tree, rootId);
+
+    if (members.length === 0) {
+      return res.status(200).json({
+        success: true,
+        rootBuyerId: rootId,
+        totalNewJoinings: 0,
+        months: monthLabels,
+        monthKeys,
+        monthCounts: {},
+        data: []
+      });
+    }
+
+    const identityMap = await loadIdentities(members.map((m) => m.buyer_id));
+
+    const results = [];
+    const monthCounts = {};
+    monthLabels.forEach((l) => { monthCounts[l] = 0; });
+
+    for (const node of members) {
+      const identity = identityMap.get(node.buyer_id);
+      if (!identity) continue;
+
+      const joined = parseDateLoose(identity.join_date);
+      if (!joined) continue;
+      if (joined < windowStart || joined >= windowEndExclusive) continue;
+
+      const key = monthKeyOf(joined);
+      const label = labelByKey.get(key) || monthLabelOf(joined);
+
+      const parentNode = node.parent_id !== null && node.parent_id !== undefined
+        ? tree.nodeMap.get(String(node.parent_id))
+        : null;
+
+      const sponsorId = firstDefined(identity.sponsor_id, node.parent_id);
+      const sponsorName = firstDefined(identity.sponsor_name, parentNode?.name);
+      const proposerId = identity.proposer_id;
+
+      monthCounts[label] = (monthCounts[label] || 0) + 1;
+
+      results.push({
+        buyer_id: node.buyer_id,
+        name: identity.name || node.name || `Associate #${node.buyer_id}`,
+        join_date: formatDateOnly(joined),
+        month_label: label,
+        leg_type: node.leg_type,
+        proposer_id: proposerId !== undefined && proposerId !== null && proposerId !== '' ? String(proposerId) : null,
+        proposer_name: identity.proposer_name || null,
+        sponsor_id: sponsorId !== undefined && sponsorId !== null && sponsorId !== '' ? String(sponsorId) : null,
+        sponsor_name: sponsorName || null,
+        mobile_no: pickMobile(identity) || null,
+        kyc_status: node.kyc_status || identity.kyc_status || null,
+        photo_url: pickPhoto(identity),
+        current_pv: node.pv,
+        status: node.status,
+        _sort: joined.getTime()
+      });
+    }
+
+    results.sort((a, b) => b._sort - a._sort || b.buyer_id - a.buyer_id);
+    const data = results.slice(0, limit).map(({ _sort, ...rest }) => rest);
+
+    return res.status(200).json({
+      success: true,
+      rootBuyerId: rootId,
+      totalNewJoinings: results.length,
+      months: monthLabels,
+      monthKeys,
+      monthCounts,
+      data
+    });
+  } catch (error) {
+    console.error('Error in getNewJoinings:', error.message);
+    return res.status(200).json({
+      success: true,
+      totalNewJoinings: 0,
+      months: [],
+      data: [],
+      warning: 'Could not load new joinings.'
+    });
   }
 };
 
@@ -1178,7 +1380,13 @@ exports.updateCustomPhoto = async (req, res) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Canonical Aliases & Exports
+// ---------------------------------------------------------------------------
 exports.getOverview = exports.getLifelinesOverview;
 exports.getTreeChildren = exports.getLifelinesChildren;
 exports.getMemberDetail = exports.getMemberFullProfile;
 exports.assistantQuery = exports.getAssistantQuery;
+exports.getNewJoinings = getNewJoinings;
+exports.newJoinings = getNewJoinings;
+exports.getNewJoiningsList = getNewJoinings;

@@ -2,10 +2,10 @@
 
 /**
  * rcmGroupScraper.js
- *
- * Stage 1 (syncOverviewFast)          -> root profile + photo + direct legs + official PV & Repurchase Amt
- * Stage 2 (startBackgroundTreeCrawler) -> full downline hierarchy (BFS), extracts Self PV & Re-Purchase Amt
- * On-demand (fetchChildrenOnDemand)   -> expand a single branch from the UI
+ * High-performance dual sync:
+ *  - Stage 1 (Fast Sync): Instant root info, direct legs, and macro PV.
+ *  - Stage 2a (Live Skeleton): Walks ONLY branches with group PV > 0 (sub-minute exact turnover calculation).
+ *  - Stage 2b (Structure Crawl): Full hierarchy crawl with database schema integrity.
  */
 
 const axios = require('axios');
@@ -18,25 +18,45 @@ try {
 
 const { DownlineNode, MemberMonthlySnapshot, RcmIdentity, RcmMonthlyTurnoverHistory } = models;
 
-const ECOM_BASE = 'https://ecomapi.rcmworld.com/api';
-const DOWNLINE_API_URL = `${ECOM_BASE}/user/profile/get-distributor-downline`;
-const USER_DATA_URL = `${ECOM_BASE}/user/user-data`;
+let activeView = null;
+try {
+  activeView = require('./rcmActiveView');
+} catch (e) {
+  console.warn('[ACTIVE VIEW NOTICE]:', e.message);
+}
 
-// ---- Crawl pacing -----------------------------------------------------------
+const ECOM_BASE = 'https://ecomapi.rcmworld.com/api';
+// [FIXED]: Was '/user/profile/get-distributor-downline' (404 Error) -> now correct endpoint:
+const DOWNLINE_API_URL = `${ECOM_BASE}/user/downline/get-distributor-downline`;
+const DIST_INFO_URL = `${ECOM_BASE}/user/profile/get-distributor-info`;
+const USER_DATA_URL = `${ECOM_BASE}/user/cart/user-data`;
+
+const envNum = (key, fallback) => {
+  const raw = process.env[key];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+};
+
 const CRAWL_CONCURRENCY = 2;
-const NODE_DELAY_MIN_MS = 200;
-const NODE_DELAY_MAX_MS = 450;
+const NODE_DELAY_MIN_MS = 100;
+const NODE_DELAY_MAX_MS = 250;
 const COOLDOWN_EVERY_N_FETCHES = 35;
 const COOLDOWN_MIN_MS = 1200;
 const COOLDOWN_MAX_MS = 2000;
 const FETCH_TRIES = 3;
 const BACKOFF_STEP_MS = 600;
 
-const NODE_FRESH_MS = 6 * 60 * 60 * 1000; // 6 hours
+const GAP_START_MS = envNum('RCM_GAP_START_MS', 150);
+const GAP_MIN_MS = envNum('RCM_GAP_MIN_MS', 100);
+const GAP_MAX_MS = envNum('RCM_GAP_MAX_MS', 3000);
+const SKELETON_WORKERS = envNum('RCM_SKELETON_WORKERS', 6);
+const PV_PAGE_SIZE = 10;
+const MONEY_EPS = 0.05;
+const STRUCT_FRESH_MS = envNum('RCM_STRUCT_FRESH_HOURS', 24) * 60 * 60 * 1000;
 
 const activeCrawls = new Map();
 
-// ---- Helpers ----------------------------------------------------------------
 const parseNum = (v) => {
   if (v === null || v === undefined) return 0;
   const cleaned = String(v).replace(/,/g, '').trim();
@@ -46,30 +66,44 @@ const parseNum = (v) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const randomBetween = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
-const jitter = (max = 200) => randomBetween(0, max);
+const jitter = (max = 200) => randomBetween(0, Math.max(0, max));
+const round2 = (n) => Math.round(n * 100) / 100;
+const round1 = (n) => Math.round(n * 10) / 10;
 
-/**
- * Robust Raw ID parser (supports RCM standard ab_no, ab_id, dist_no, buyer_id)
- */
+let gapMs = GAP_START_MS;
+let okStreak = 0;
+let nextRequestSlot = 0;
+
+function notePortalStatus(status) {
+  if (status === 429 || status >= 500) {
+    gapMs = Math.min(GAP_MAX_MS, Math.max(gapMs * 2, 200));
+    okStreak = 0;
+  } else if (status === 200) {
+    okStreak += 1;
+    if (okStreak >= 40) {
+      okStreak = 0;
+      gapMs = Math.max(GAP_MIN_MS, Math.floor(gapMs * 0.85));
+    }
+  }
+}
+
+async function throttle() {
+  const now = Date.now();
+  const slot = Math.max(now, nextRequestSlot);
+  nextRequestSlot = slot + gapMs + jitter(Math.floor(gapMs * 0.3));
+  const wait = slot - now;
+  if (wait > 0) await sleep(wait);
+}
+
 const getRawId = (obj) => {
   if (!obj) return null;
-  const raw = obj.ab_no ?? obj.ab_id ?? obj.dist_no ?? obj.distno ?? obj.distributor_no ?? obj.buyer_id ?? obj.id;
+  const raw = obj.ab_no ?? obj.ab_id ?? obj.dist_no ?? obj.distno ?? obj.distributor_no ?? obj.buyer_id ?? obj.id ?? obj.key;
   return raw === undefined || raw === null || raw === '' ? null : String(raw).trim();
 };
 
-/**
- * Regex title parser for downline items
- * Example: "[32739154] Abhisar Sugandhi [Status: KYC OK | Re-Purchase Amt. : 1829.00 | P.V.: 936.00]"
- */
-function extractAmountsFromTitle(rawText) {
-  const text = String(rawText || '');
-  const repurchaseMatch = text.match(/Re-?Purchase\s*Amt\.?\s*:\s*([\d,.]+)/i);
-  const pvMatch = text.match(/P\.?V\.?\s*:\s*([\d,.]+)/i);
-
-  const repurchaseAmt = repurchaseMatch ? parseNum(repurchaseMatch[1]) : 0;
-  const selfPv = pvMatch ? parseNum(pvMatch[1]) : 0;
-
-  return { repurchaseAmt, selfPv };
+function getNodeText(item) {
+  if (!item) return '';
+  return String(item.text || item.title || item.label || item.dist_name || item.name || '');
 }
 
 function parseJoinDate(d) {
@@ -77,37 +111,150 @@ function parseJoinDate(d) {
   if (typeof d === 'string' && d.includes('/')) {
     const parts = d.split('/');
     if (parts.length === 3) {
-      return new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+      const dt = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+      return Number.isNaN(dt.getTime()) ? null : dt;
     }
   }
   const x = new Date(d);
   return Number.isNaN(x.getTime()) ? null : x;
 }
 
-/**
- * Resilient HTTP GET: includes Resource: web headers alongside Bearer token & cookie.
- */
+const firstDefined = (...vals) => {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+  }
+  return null;
+};
+
+function extractSponsorInfo(...sources) {
+  const pick = (keys) => {
+    for (const src of sources) {
+      if (!src || typeof src !== 'object') continue;
+      for (const k of keys) {
+        const v = src[k];
+        if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+      }
+    }
+    return null;
+  };
+
+  return {
+    proposer_id: pick(['proposer_id', 'proposer_no', 'proposer_ab_no', 'proposer_distno', 'proposer']),
+    proposer_name: pick(['proposer_name', 'proposer_dist_name', 'proposer_ab_name']),
+    sponsor_id: pick(['sponsor_id', 'sponsor_no', 'sponsor_ab_no', 'sponsor_distno', 'sponsor', 'upline_id', 'upline_no']),
+    sponsor_name: pick(['sponsor_name', 'sponsor_dist_name', 'sponsor_ab_name', 'upline_name'])
+  };
+}
+
+function buildIdentityPayload(buyerId, fields) {
+  const payload = { buyer_id: String(buyerId) };
+  Object.keys(fields || {}).forEach((k) => {
+    const v = fields[k];
+    if (v !== undefined && v !== null && v !== '') payload[k] = v;
+  });
+  return payload;
+}
+
+function normalizeNumericStatus(item) {
+  if (!item) return 1;
+  if (typeof item.terminated === 'boolean') {
+    return item.terminated ? 0 : 1;
+  }
+  const isTerminated = Boolean(
+    item.status === 'T' ||
+    item.status === 0 ||
+    item.status === '0' ||
+    item.is_terminated ||
+    /terminat/i.test(item.remark || '') ||
+    /terminated/i.test(getNodeText(item))
+  );
+  return isTerminated ? 0 : 1;
+}
+
+function sanitizeName(raw) {
+  return String(raw || '')
+    .replace(/^terminated\s*-\s*/i, '')
+    .replace(/\[.*?\]/g, '')
+    .trim();
+}
+
+function parseDownlineItem(item, index) {
+  const rawId = getRawId(item);
+  if (rawId === null) return null;
+
+  const selfPv = 0; // Tree API sends lifetime cumulative PV, not monthly
+  const repurchaseAmt = parseNum(item.amt);
+  const status = normalizeNumericStatus(item);
+  const sponsor = extractSponsorInfo(item);
+
+  return {
+    id: String(rawId),
+    name: sanitizeName(item.title || item.name || item.dist_name),
+    status,
+    selfPv,
+    repurchaseAmt,
+    leg: item.leg || (index === 0 ? 'A' : index === 1 ? 'B' : null),
+    kycStatus: item.kyc_status || 'A',
+    joinDate: parseJoinDate(firstDefined(item.join_date, item.doj, item.joining_date)),
+    photoUrl: firstDefined(item.user_image, item.photo_url, item.image),
+    ...sponsor
+  };
+}
+
 async function safeGet(session, url) {
   try {
+    await throttle();
+    const authHeader =
+      session?.client?.defaults?.headers?.common?.['Authorization'] ||
+      (session?.token ? `Bearer ${session.token}` : '');
+    const cookieHeader = session?.client?.defaults?.headers?.common?.['Cookie'] || '';
+
     const headers = {
-      'Authorization': session?.client?.defaults?.headers?.common['Authorization'] || (session?.token ? `Bearer ${session.token}` : ''),
-      'Cookie': session?.client?.defaults?.headers?.common['Cookie'] || '',
       'Origin': 'https://www.rcmworld.com',
       'Referer': 'https://www.rcmworld.com/',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Resource': 'web',
       'resource': 'web',
       'x-user-type': 'ab',
-      'Accept': 'application/json, text/plain, */*'
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+      'Connection': 'keep-alive'
     };
+    if (authHeader) headers['Authorization'] = authHeader;
+    if (cookieHeader) headers['Cookie'] = cookieHeader;
 
+    let res;
     if (session?.client) {
-      return await session.client.get(url, { headers, timeout: 15000, validateStatus: () => true });
+      res = await session.client.get(url, { headers, timeout: 15000, validateStatus: () => true });
+    } else {
+      res = await axios.get(url, { headers, timeout: 15000, validateStatus: () => true });
     }
-    return await axios.get(url, { headers, timeout: 15000, validateStatus: () => true });
+    notePortalStatus(res.status);
+    return res;
   } catch (err) {
+    notePortalStatus(500);
     return { status: 500, data: null, error: err.message };
   }
+}
+
+async function getWithRetry(session, url, label, tries = FETCH_TRIES) {
+  let lastStatus = 0;
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    const res = await safeGet(session, url);
+    lastStatus = res.status;
+
+    if (res.status === 401 || res.status === 403) throw new Error('SESSION_EXPIRED');
+    if (res.status === 200) return res;
+
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable) break;
+
+    if (attempt < tries) {
+      const base = res.status === 429 ? attempt * BACKOFF_STEP_MS * 3 : attempt * BACKOFF_STEP_MS;
+      await sleep(base + jitter());
+    }
+  }
+  throw new Error(`FETCH_FAILED (HTTP ${lastStatus}) ${label}`);
 }
 
 function extractDownlineList(res) {
@@ -121,9 +268,6 @@ function extractDownlineList(res) {
   return [];
 }
 
-/**
- * Supports direct arrays and paginated Laravel object responses (d.data.data)
- */
 function extractPurchaseVolumeList(res) {
   if (!res || !res.data) return [];
   const d = res.data;
@@ -158,27 +302,6 @@ function extractPv(obj) {
   );
 }
 
-function normalizeNumericStatus(item) {
-  if (!item) return 1;
-  const isTerminated = Boolean(
-    item.terminated === true ||
-    item.status === 'T' ||
-    item.status === 0 ||
-    item.status === '0' ||
-    item.is_terminated ||
-    /terminat/i.test(item.remark || '') ||
-    /terminated/i.test(item.title || item.dist_name || item.name || '')
-  );
-  return isTerminated ? 0 : 1;
-}
-
-function sanitizeName(raw) {
-  return String(raw || '')
-    .replace(/^terminated\s*-\s*/i, '')
-    .replace(/\[.*?\]/g, '')
-    .trim();
-}
-
 async function safeUpsert(model, payload, label) {
   if (!model || !model.upsert) return;
   try {
@@ -188,63 +311,155 @@ async function safeUpsert(model, payload, label) {
   }
 }
 
-async function fetchDownline(session, distNo, tries = FETCH_TRIES) {
-  let lastStatus = 0;
+function createWriter(limit = 8) {
+  const queue = [];
+  let active = 0;
+  const idleWaiters = [];
 
-  for (let attempt = 1; attempt <= tries; attempt++) {
-    const res = await safeGet(session, `${DOWNLINE_API_URL}?dist_no=${distNo}`);
-    lastStatus = res.status;
-
-    if (res.status === 401 || res.status === 403) {
-      throw new Error('SESSION_EXPIRED');
+  const pump = () => {
+    while (active < limit && queue.length > 0) {
+      const fn = queue.shift();
+      active += 1;
+      Promise.resolve()
+        .then(fn)
+        .catch((err) => console.warn('[WRITER WARN]:', err.message))
+        .finally(() => {
+          active -= 1;
+          pump();
+          if (active === 0 && queue.length === 0) idleWaiters.splice(0).forEach((r) => r());
+        });
     }
-    if (res.status === 200) {
-      return extractDownlineList(res);
+  };
+
+  return {
+    add(fn) {
+      queue.push(fn);
+      pump();
+    },
+    async drain() {
+      if (active === 0 && queue.length === 0) return;
+      await new Promise((resolve) => idleWaiters.push(resolve));
     }
-
-    const retryable = res.status === 429 || res.status >= 500;
-    if (!retryable) break;
-
-    if (attempt < tries) {
-      await sleep(attempt * BACKOFF_STEP_MS + jitter());
-    }
-  }
-
-  throw new Error(`FETCH_FAILED (HTTP ${lastStatus}) for ${distNo}`);
+  };
 }
 
-/**
- * Official PV Only Endpoint
- */
-async function fetchPvOnly(session, distNo, month, year) {
+async function persistParsedNode(parsed, parentId, level, rootId, monthKey) {
+  const mKey = monthKey || `${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+  const rId = String(rootId || parentId);
+
+  await safeUpsert(DownlineNode, {
+    buyer_id: String(parsed.id),
+    dist_no: String(parsed.id),
+    parent_id: parentId ? String(parentId) : null,
+    parent_dist_no: parentId ? String(parentId) : null,
+    root_dist_no: rId,
+    month_key: mKey,
+    name: parsed.name,
+    status: parsed.status,
+    terminated: parsed.status === 0 ? 1 : 0,
+    self_pv: parsed.selfPv || 0,
+    current_pv: parsed.selfPv || 0,
+    repurchase_amt: parsed.repurchaseAmt || 0,
+    level: level || 0,
+    kyc_status: parsed.kycStatus || 'A'
+  }, `DownlineNode ${parsed.id}`);
+
+  await safeUpsert(RcmIdentity, buildIdentityPayload(parsed.id, {
+    name: parsed.name,
+    proposer_id: parsed.proposer_id,
+    proposer_name: parsed.proposer_name,
+    sponsor_id: parsed.sponsor_id,
+    sponsor_name: parsed.sponsor_name,
+    join_date: parsed.joinDate,
+    kyc_status: parsed.kycStatus,
+    photo_url: parsed.photoUrl
+  }), `RcmIdentity ${parsed.id}`);
+}
+
+async function fetchDownline(session, distNo, tries = FETCH_TRIES) {
+  const res = await getWithRetry(session, `${DOWNLINE_API_URL}?dist_no=${distNo}`, `downline ${distNo}`, tries);
+  return extractDownlineList(res);
+}
+
+async function fetchPvOnlyFull(session, distNo, month, year) {
   try {
     const url = `${ECOM_BASE}/user/business-info/your-purchase-volume/pvOnly?distno=${distNo}&month=${month}&year=${year}`;
-    const res = await safeGet(session, url);
-    if (res.status === 200 && res.data) {
-      const d = res.data;
-      const raw = d.data?.pv ?? d.data?.total_pv ?? d.data?.tot_pv ?? d.data?.purchase_volume ?? d.data?.self_pv ?? d.data ?? d.pv;
-      return parseNum(raw);
-    }
-  } catch (e) {
-    // optional endpoint
+    const res = await getWithRetry(session, url, `pvOnly ${distNo}`, 2);
+    const d = res.data?.data;
+    if (!d || typeof d !== 'object') return { ok: false };
+    const groupRaw = d.cumulative_pv ?? d.self_total_pv ?? d.total_pv ?? d.tot_pv ?? d.purchase_volume;
+    if (groupRaw === undefined || groupRaw === null) return { ok: false };
+    return {
+      ok: true,
+      groupPv: parseNum(groupRaw),
+      selfPv: parseNum(d.self_pv),
+      lastMonthGroupPv: parseNum(d.last_month_cumulative_pv),
+      growth: parseNum(d.growth)
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
   }
-  return 0;
 }
 
-/**
- * Verified RCM Purchase Volume & Direct Legs Table Endpoint:
- * GET https://ecomapi.rcmworld.com/api/user/business-info/your-purchase-volume/all/1/10?distno={distNo}&month={month}&year={year}
- */
+async function fetchPvChildren(session, distNo, month, year) {
+  const out = [];
+  let page = 1;
+  let total = null;
+
+  for (;;) {
+    const url = `${ECOM_BASE}/user/business-info/your-purchase-volume/all/${page}/${PV_PAGE_SIZE}?distno=${distNo}&month=${month}&year=${year}`;
+    const res = await getWithRetry(session, url, `pv-list ${distNo} p${page}`);
+    const rows = extractPurchaseVolumeList(res);
+    const t = res.data?.data?.totalCount;
+    if (t !== undefined && t !== null && !Number.isNaN(Number(t))) total = Number(t);
+
+    for (const r of rows) {
+      const id = getRawId(r);
+      if (!id) continue;
+      out.push({
+        id,
+        name: sanitizeName(r.dist_name || r.name),
+        sponsor: r.sponsor ?? null,
+        groupPv: parseNum(r.pv),
+        showDownLink: r.show_down_link
+      });
+    }
+
+    if (rows.length === 0) break;
+    if (total !== null ? out.length >= total : rows.length < PV_PAGE_SIZE) break;
+    page += 1;
+    if (page > 1000) break;
+  }
+  return out;
+}
+
+async function fetchDistributorInfo(session, distNo) {
+  try {
+    const res = await getWithRetry(session, `${DIST_INFO_URL}?dist_no=${distNo}`, `info ${distNo}`, 2);
+    const d = res.data?.data;
+    const row = Array.isArray(d) ? d[0] : d;
+    if (!row) return { ok: false };
+    return {
+      ok: true,
+      name: sanitizeName(row.dist_name || row.title),
+      amt: parseNum(row.amt),
+      pv: parseNum(row.pv),
+      terminated: Boolean(row.terminated),
+      kycStatus: row.kyc_status || null
+    };
+  } catch (e) {
+    if (e.message === 'SESSION_EXPIRED') throw e;
+    return { ok: false, error: e.message };
+  }
+}
+
 async function fetchVolumeTable(session, distNo, month, year) {
   const url = `${ECOM_BASE}/user/business-info/your-purchase-volume/all/1/10?distno=${distNo}&month=${month}&year=${year}`;
   const res = await safeGet(session, url);
   if (res.status !== 200) {
     const fallbackUrl = `${ECOM_BASE}/user/business-info/your-purchase-volume?distno=${distNo}&month=${month}&year=${year}`;
     const fallbackRes = await safeGet(session, fallbackUrl);
-    if (fallbackRes.status !== 200) {
-      console.warn(`[VOLUME] HTTP ${res.status} and fallback HTTP ${fallbackRes.status} for ${distNo} ${month}/${year}`);
-      return [];
-    }
+    if (fallbackRes.status !== 200) return [];
     return extractPurchaseVolumeList(fallbackRes);
   }
   return extractPurchaseVolumeList(res);
@@ -252,28 +467,19 @@ async function fetchVolumeTable(session, distNo, month, year) {
 
 function findLegRow(rows, leg, index) {
   if (!rows || rows.length === 0) return null;
-  // 1. By ID matching
   const byId = rows.find((r) => {
     const rid = getRawId(r);
     return rid !== null && String(rid) === String(leg.distno);
   });
   if (byId) return byId;
 
-  // 2. By Leg character matching (A / B)
   const byLegLetter = rows.find((r) => r.leg && leg.leg && String(r.leg).toUpperCase() === String(leg.leg).toUpperCase());
   if (byLegLetter) return byLegLetter;
 
-  // 3. Fallback to index position (Row 0 -> Leg A, Row 1 -> Leg B)
-  if (index !== undefined && rows[index]) {
-    return rows[index];
-  }
+  if (index !== undefined && rows[index]) return rows[index];
   return null;
 }
 
-/**
- * Verified RCM User Profile & Pin Levels API:
- * GET https://ecomapi.rcmworld.com/api/user/business-info/your-purchase-volume/profile?distno={distNo}&month={month}&year={year}
- */
 async function fetchUserProfile(session, distNo, month, year) {
   try {
     const now = new Date();
@@ -289,7 +495,6 @@ async function fetchUserProfile(session, distNo, month, year) {
     const pData = profileRes?.data?.data || {};
     const uData = userDataRes?.data?.data || {};
     const pinData = uData.pin_data || {};
-
     const photoUrl = pData.user_image || pinData.user_image || uData.photo_url || null;
     const currPin = pData.curr_pin || pinData.pin_description || pinData.pin || uData.curr_pin || 'ASSOCIATE BUYER';
     const maxPin = pData.max_pin || pinData.max_pin || currPin;
@@ -306,7 +511,28 @@ async function fetchUserProfile(session, distNo, month, year) {
       }
     }
 
+    if (photoUrl && associateName && RcmIdentity) {
+      await RcmIdentity.upsert({
+        buyer_id: Number(distNo),
+        name: associateName,
+        photo_url: photoUrl,
+        profile_photo_url: photoUrl,
+        curr_pin: currPin,
+        max_pin: maxPin,
+        highest_pin: maxPin,
+        join_date: joinDate,
+        kyc_status: kycStatus
+      }).catch((err) => console.warn('[IDENTITY SAVE ERROR]:', err.message));
+    }
+
     const selfPv = parseNum(pData.self_purchase || pData.self_pv || pData.self_pur || uData.self_pv || 0);
+    const profileGroupPv = extractPv({
+      tot_group_pv: pData.tot_group_pv,
+      group_pv: pData.group_pv,
+      total_pv: pData.total_pv,
+      tot_pv: pData.tot_pv
+    });
+    const sponsor = extractSponsorInfo(pData, uData);
 
     return {
       name: sanitizeName(associateName) || null,
@@ -317,7 +543,9 @@ async function fetchUserProfile(session, distNo, month, year) {
       join_date: joinDate,
       terminated,
       photo_url: photoUrl,
-      self_pv: selfPv
+      self_pv: selfPv,
+      group_pv: profileGroupPv,
+      ...sponsor
     };
   } catch (err) {
     console.warn(`[USER PROFILE FETCH WARN] ${distNo}:`, err.message);
@@ -325,10 +553,7 @@ async function fetchUserProfile(session, distNo, month, year) {
   }
 }
 
-/**
- * 1. Stage 1: Fast Sync
- */
-async function syncOverviewFast({ session, buyerId, month, year }) {
+async function syncOverviewFast({ session, buyerId, month, year, io }) {
   const now = new Date();
   const currentMonth = month || (now.getMonth() + 1);
   const currentYear = year || now.getFullYear();
@@ -342,40 +567,31 @@ async function syncOverviewFast({ session, buyerId, month, year }) {
   console.log(`[FAST SYNC] Starting overview sync for associate: ${buyerId}`);
 
   const downlineRes = await safeGet(session, `${DOWNLINE_API_URL}?dist_no=${buyerId}`);
-  if (downlineRes.status !== 200) {
-    console.warn(`[FAST SYNC] downline API returned HTTP ${downlineRes.status} for ${buyerId}`);
-  }
   const downlineList = extractDownlineList(downlineRes);
-  console.log(`[FAST SYNC] Extracted ${downlineList.length} direct legs from downlineData for: ${buyerId}`);
 
-  let directLegs = downlineList
-    .map((item, index) => {
-      const rawId = getRawId(item);
-      if (rawId === null) return null;
-      const status = normalizeNumericStatus(item);
-      const titleText = item.title || item.dist_name || item.name || '';
-      const { repurchaseAmt, selfPv } = extractAmountsFromTitle(titleText);
-      const legChar = item.leg || (index === 0 ? 'A' : index === 1 ? 'B' : null);
-
-      return {
-        distno: String(rawId),
-        name: sanitizeName(titleText),
-        status,
-        statusLabel: status === 1 ? 'ACTIVE' : 'TERMINATED',
-        kyc_status: item.kyc_status || 'A',
-        self_pv: selfPv,
-        repurchase_amt: repurchaseAmt,
-        leg: legChar
-      };
-    })
+  const parsedLegs = downlineList
+    .map((item, index) => parseDownlineItem(item, index))
     .filter(Boolean);
 
-  const [profile, pvOnlyCurrent, pvOnlyPrev, currentRows, prevRows] = await Promise.all([
+  let directLegs = parsedLegs.map((p) => ({
+    distno: p.id,
+    name: p.name,
+    status: p.status,
+    statusLabel: p.status === 1 ? 'ACTIVE' : 'TERMINATED',
+    kyc_status: p.kycStatus || 'A',
+    self_pv: p.selfPv,
+    repurchase_amt: p.repurchaseAmt,
+    leg: p.leg,
+    parsed: p
+  }));
+
+  const [profile, pvOnlyCurrent, pvOnlyPrev, currentRows, prevRows, rootInfo] = await Promise.all([
     fetchUserProfile(session, buyerId, currentMonth, currentYear),
-    fetchPvOnly(session, buyerId, currentMonth, currentYear),
-    fetchPvOnly(session, buyerId, prevMonth, prevYear),
+    fetchPvOnlyFull(session, buyerId, currentMonth, currentYear),
+    fetchPvOnlyFull(session, buyerId, prevMonth, prevYear),
     fetchVolumeTable(session, buyerId, currentMonth, currentYear),
-    fetchVolumeTable(session, buyerId, prevMonth, prevYear)
+    fetchVolumeTable(session, buyerId, prevMonth, prevYear),
+    fetchDistributorInfo(session, buyerId)
   ]);
 
   const associateName = profile.name || `Associate #${buyerId}`;
@@ -391,51 +607,62 @@ async function syncOverviewFast({ session, buyerId, month, year }) {
     return row ? extractPv(row) : (leg.self_pv || 0);
   };
 
-  // Parse root user amounts from downlineRes root object
-  const rootText = downlineRes.data?.data?.title || downlineRes.data?.data?.dist_name || downlineRes.data?.title || '';
-  const rootAmounts = extractAmountsFromTitle(rootText);
+  const rootAmounts = {
+    repurchaseAmt: rootInfo.ok ? rootInfo.amt : 0,
+    selfPv: rootInfo.ok ? rootInfo.pv : 0
+  };
 
   const selfPvCurrent = profile.self_pv || rootAmounts.selfPv || 0;
   const legACurrent = legPvFor(currentRows, legA, 0);
   const legBCurrent = legPvFor(currentRows, legB, 1);
   const computedTotalPv = legACurrent + legBCurrent + selfPvCurrent;
-  const totalPvCurrent = Math.max(computedTotalPv, pvOnlyCurrent);
+
+  const totalPvCurrent = Math.max(computedTotalPv, pvOnlyCurrent.ok ? pvOnlyCurrent.groupPv : 0, profile.group_pv || 0);
 
   const selfPvPrevRow = prevRows.find((r) => String(getRawId(r)) === String(buyerId));
   const selfPvPrev = selfPvPrevRow ? parseNum(selfPvPrevRow.self_pv || selfPvPrevRow.current_pv) : 0;
   const legAPrev = legPvFor(prevRows, legA, 0);
   const legBPrev = legPvFor(prevRows, legB, 1);
   const computedTotalPvPrev = legAPrev + legBPrev + selfPvPrev;
-  const totalPvPrev = Math.max(computedTotalPvPrev, pvOnlyPrev);
+  const totalPvPrev = Math.max(computedTotalPvPrev, pvOnlyPrev.ok ? pvOnlyPrev.groupPv : 0);
 
   directLegs = directLegs.map((leg, index) => {
     const row = findLegRow(currentRows, leg, index);
+    const rowSelfPv = row ? parseNum(row.self_pv || row.current_pv) : 0;
+    const rowRepurchase = row ? parseNum(row.repurchase_amt || row.re_purchase_amt || row.purchase_amt) : 0;
     return {
       ...leg,
-      pv: row ? extractPv(row) : (leg.self_pv || 0),
-      self_pv: row ? parseNum(row.self_pv || row.current_pv) : leg.self_pv,
+      pv: row ? extractPv(row) : 0,
+      self_pv: rowSelfPv > 0 ? rowSelfPv : leg.self_pv,
+      repurchase_amt: rowRepurchase > 0 ? rowRepurchase : leg.repurchaseAmt,
       pvKnown: Boolean(row)
     };
   });
 
-  console.log(`[FAST SYNC] ${associateName} (${pinLevel}) - Current(${currentMonthKey}) PV: ${totalPvCurrent} - Prev(${prevMonthKey}) PV: ${totalPvPrev}`);
-
-  await safeUpsert(RcmIdentity, {
-    buyer_id: String(buyerId),
+  await safeUpsert(RcmIdentity, buildIdentityPayload(buyerId, {
     name: associateName,
     highest_pin: profile.max_pin || pinLevel,
     pin: profile.curr_pin || pinLevel,
     kyc_status: profile.kyc_status || 'A',
     join_date: parseJoinDate(profile.join_date),
-    photo_url: photoUrl
-  }, 'RcmIdentity');
+    photo_url: photoUrl,
+    proposer_id: profile.proposer_id,
+    proposer_name: profile.proposer_name,
+    sponsor_id: profile.sponsor_id,
+    sponsor_name: profile.sponsor_name
+  }), 'RcmIdentity');
 
-  // CRITICAL FIX: DO NOT set children_synced_at here so crawler doesn't get skipped!
+  // Insert Root Node with BOTH column aliases for TiDB compatibility
   await safeUpsert(DownlineNode, {
     buyer_id: String(buyerId),
+    dist_no: String(buyerId),
     parent_id: null,
+    parent_dist_no: null,
+    root_dist_no: String(buyerId),
+    month_key: currentMonthKey,
     name: associateName,
     status: profile.terminated ? 0 : 1,
+    terminated: profile.terminated ? 1 : 0,
     self_pv: selfPvCurrent,
     current_pv: selfPvCurrent,
     repurchase_amt: rootAmounts.repurchaseAmt,
@@ -445,17 +672,25 @@ async function syncOverviewFast({ session, buyerId, month, year }) {
 
   for (const leg of directLegs) {
     const payload = {
-      buyer_id: leg.distno,
+      buyer_id: String(leg.distno),
+      dist_no: String(leg.distno),
       parent_id: String(buyerId),
+      parent_dist_no: String(buyerId),
+      root_dist_no: String(buyerId),
+      month_key: currentMonthKey,
       name: leg.name,
       status: leg.status,
-      self_pv: leg.self_pv || 0,
-      current_pv: leg.self_pv || 0,
+      terminated: leg.status === 0 ? 1 : 0,
+      self_pv: Number(leg.self_pv || 0),
+      current_pv: Number(leg.self_pv || 0),
       repurchase_amt: leg.repurchase_amt || 0,
       total_group_pv: leg.pv || 0,
       level: 1
     };
-    if (leg.leg) payload.leg_type = leg.leg;
+    if (leg.leg) {
+      payload.leg_type = leg.leg;
+      payload.leg = leg.leg === 'A' ? 0 : 1;
+    }
 
     await safeUpsert(DownlineNode, payload, `DownlineNode leg ${leg.distno}`);
   }
@@ -472,25 +707,16 @@ async function syncOverviewFast({ session, buyerId, month, year }) {
     last_synced_at: new Date()
   }, 'MemberMonthlySnapshot current');
 
-  await safeUpsert(RcmMonthlyTurnoverHistory, {
-    buyer_id: String(buyerId),
-    year_month: currentMonthKey,
-    total_pv: totalPvCurrent,
-    self_pv: selfPvCurrent,
-    leg_a_pv: legACurrent,
-    leg_b_pv: legBCurrent,
-    created_at: new Date()
-  }, 'RcmMonthlyTurnoverHistory current');
-
-  await safeUpsert(RcmMonthlyTurnoverHistory, {
-    buyer_id: String(buyerId),
-    year_month: prevMonthKey,
-    total_pv: totalPvPrev,
-    self_pv: selfPvPrev,
-    leg_a_pv: legAPrev,
-    leg_b_pv: legBPrev,
-    created_at: new Date()
-  }, 'RcmMonthlyTurnoverHistory prev');
+  if (io) {
+    io.to(String(buyerId)).emit('overview:live-pv', {
+      buyerId: String(buyerId),
+      totalPv: totalPvCurrent,
+      selfPv: selfPvCurrent,
+      closedMonthPv: totalPvPrev,
+      month: currentMonth,
+      year: currentYear
+    });
+  }
 
   return {
     buyerId,
@@ -504,24 +730,276 @@ async function syncOverviewFast({ session, buyerId, month, year }) {
     totalPv: totalPvCurrent,
     selfPv: selfPvCurrent,
     closedMonthPv: totalPvPrev,
-    closedSelfPv: selfPvPrev,
-    activeMonth: currentMonth,
-    activeYear: currentYear,
     directLegs
   };
 }
 
-/**
- * 2. Stage 2: Background Downline Crawler (BFS over get-distributor-downline)
- */
+async function runSkeletonSync({ session, root, month, year, state, io }) {
+  const now = new Date();
+  const m = month || (now.getMonth() + 1);
+  const y = year || now.getFullYear();
+  const isCurrentMonth = m === now.getMonth() + 1 && y === now.getFullYear();
+  const monthKey = `${y}${String(m).padStart(2, '0')}`;
+
+  const sk = {
+    state: 'CALIBRATING',
+    month: m,
+    year: y,
+    macroPv: 0,
+    processedPv: 0,
+    residualPv: 0,
+    coveragePct: 0,
+    liveNodes: 0,
+    buyers: 0,
+    amountsDone: 0,
+    amountsFailed: 0,
+    verifiedAmt: 0,
+    pendingBuyerPv: 0,
+    estLow: null,
+    estHigh: null,
+    anomalies: 0,
+    pvMismatch: 0,
+    failedNodes: 0,
+    finishedAt: null
+  };
+  state.skeleton = sk;
+  state.phase = 'SKELETON';
+
+  let rootPv = await fetchPvOnlyFull(session, root, m, y);
+  if (!rootPv.ok) {
+    const prof = await fetchUserProfile(session, root, m, y);
+    rootPv = { ok: true, groupPv: prof.group_pv || 0, selfPv: prof.self_pv || 0 };
+  }
+  sk.macroPv = round2(rootPv.groupPv);
+
+  const writer = createWriter(8);
+  const ratios = [];
+  const buyersFound = [];
+  const viewRows = new Map();
+  const failed = [];
+  let aborted = false;
+  let rootSelfPv = 0;
+  let rootKids = [];
+  let lastEmit = 0;
+
+  const refresh = () => {
+    sk.coveragePct = sk.macroPv > 0 ? Math.min(100, round1((sk.processedPv / sk.macroPv) * 100)) : 100;
+    sk.residualPv = round2(sk.macroPv - sk.processedPv);
+    const unknownPv = Math.max(0, sk.pendingBuyerPv) + Math.max(0, sk.residualPv);
+    if (unknownPv <= MONEY_EPS) {
+      sk.estLow = sk.verifiedAmt;
+      sk.estHigh = sk.verifiedAmt;
+    } else if (ratios.length >= 3) {
+      const sorted = [...ratios].sort((a, b) => a - b);
+      const lo = sorted[Math.floor(0.1 * (sorted.length - 1))];
+      const hi = sorted[Math.floor(0.9 * (sorted.length - 1))];
+      sk.estLow = round2(sk.verifiedAmt + unknownPv * lo);
+      sk.estHigh = round2(sk.verifiedAmt + unknownPv * hi);
+    } else {
+      sk.estLow = round2(sk.verifiedAmt + unknownPv * 1.6);
+      sk.estHigh = round2(sk.verifiedAmt + unknownPv * 2.1);
+    }
+  };
+
+  const writeNode = async (fields, isRootNode) => {
+    const payload = {
+      ...fields,
+      buyer_id: String(fields.buyer_id),
+      dist_no: String(fields.buyer_id),
+      root_dist_no: String(root),
+      month_key: monthKey
+    };
+    if (fields.parent_id) {
+      payload.parent_dist_no = String(fields.parent_id);
+    }
+    await safeUpsert(DownlineNode, payload, `skeleton ${fields.buyer_id}`);
+  };
+
+  const stack = [{ type: 'live', id: root, groupPv: sk.macroPv, parent: null, level: 0, name: null, leg: null }];
+  let inFlight = 0;
+
+  const processLive = async (item) => {
+    const kids = await fetchPvChildren(session, item.id, m, y);
+    const kidsSum = kids.reduce((s, k) => s + k.groupPv, 0);
+    let selfPv = round2(item.groupPv - kidsSum);
+    if (selfPv < 0) selfPv = 0;
+
+    sk.liveNodes += 1;
+    sk.processedPv = round2(sk.processedPv + selfPv);
+    state.count = Math.max(state.count, sk.liveNodes);
+
+    if (item.id === root) {
+      rootSelfPv = selfPv;
+      rootKids = kids;
+    }
+
+    const payload = {
+      buyer_id: item.id,
+      total_group_pv: item.groupPv,
+      self_pv: selfPv,
+      current_pv: selfPv,
+      level: item.level,
+      parent_id: item.parent ? String(item.parent) : null,
+      name: item.name || `Associate #${item.id}`
+    };
+    if (item.leg) payload.leg_type = item.leg;
+    writer.add(() => writeNode(payload, item.parent === null));
+
+    if (selfPv > MONEY_EPS) {
+      sk.buyers += 1;
+      sk.pendingBuyerPv = round2(sk.pendingBuyerPv + selfPv);
+      buyersFound.push({ id: item.id, selfPv });
+      viewRows.set(item.id, {
+        buyer_id: item.id,
+        parent_id: item.parent,
+        name: item.name,
+        leg: item.leg,
+        depth: item.level,
+        self_pv: selfPv,
+        amt: 0,
+        amt_known: 0,
+        _node: payload
+      });
+      if (isCurrentMonth) {
+        stack.push({ type: 'amt', id: item.id, selfPv, leg: item.leg, level: item.level });
+      }
+    }
+
+    kids.forEach((k, idx) => {
+      if (k.groupPv > 0) {
+        const leg = item.id === root ? (idx === 0 ? 'A' : idx === 1 ? 'B' : null) : item.leg;
+        stack.push({ type: 'live', id: k.id, groupPv: k.groupPv, parent: item.id, level: item.level + 1, name: k.name, leg });
+      }
+    });
+  };
+
+  const processAmt = async (item) => {
+    const info = await fetchDistributorInfo(session, item.id);
+    sk.pendingBuyerPv = round2(Math.max(0, sk.pendingBuyerPv - item.selfPv));
+    if (!info.ok) {
+      sk.amountsFailed += 1;
+      return;
+    }
+    sk.amountsDone += 1;
+    sk.verifiedAmt = round2(sk.verifiedAmt + info.amt);
+    if (info.pv > 0) ratios.push(info.amt / info.pv);
+
+    const vr = viewRows.get(item.id);
+    if (vr) {
+      vr.amt = info.amt;
+      vr.amt_known = 1;
+      if (info.pv > 0) vr.self_pv = info.pv;
+    }
+
+    const nodeWrite = {
+      ...((vr && vr._node) || { buyer_id: item.id }),
+      repurchase_amt: info.amt,
+      self_pv: info.pv > 0 ? info.pv : item.selfPv,
+      current_pv: info.pv > 0 ? info.pv : item.selfPv,
+      status: info.terminated ? 0 : 1,
+      terminated: info.terminated ? 1 : 0
+    };
+    writer.add(() => writeNode(nodeWrite, item.id === root));
+  };
+
+  const worker = async () => {
+    while (!aborted) {
+      const item = stack.pop();
+      if (!item) {
+        if (inFlight === 0) return;
+        await sleep(20);
+        continue;
+      }
+      inFlight += 1;
+      try {
+        if (item.type === 'amt') await processAmt(item);
+        else await processLive(item);
+      } catch (err) {
+        if (err.message === 'SESSION_EXPIRED') {
+          aborted = true;
+          state.error = 'SESSION_EXPIRED';
+        } else if (item.type === 'live') {
+          failed.push(item);
+          sk.failedNodes += 1;
+        } else {
+          sk.amountsFailed += 1;
+        }
+      } finally {
+        inFlight -= 1;
+      }
+    }
+  };
+
+  if (sk.macroPv > 0) {
+    await Promise.all(Array.from({ length: Math.max(1, SKELETON_WORKERS) }, worker));
+  }
+
+  await writer.drain();
+  refresh();
+
+  sk.state = sk.residualPv <= MONEY_EPS && sk.amountsFailed === 0 ? 'VERIFIED' : 'BOUNDED';
+  sk.finishedAt = new Date();
+
+  if (activeView) {
+    try {
+      await activeView.replaceOwnerView({
+        ownerId: root,
+        monthKey,
+        rows: [...viewRows.values()],
+        deleteStale: sk.state === 'VERIFIED'
+      });
+      await activeView.saveSyncState({ ownerId: root, monthKey, sk });
+    } catch (err) {
+      console.warn(`[ACTIVE VIEW WARN] ${root}:`, err.message);
+    }
+  }
+
+  state.skeletonDone = !aborted;
+  if (io) {
+    io.to(root).emit('tree:skeleton-complete', { ...sk, syncedCount: state.count });
+  }
+  return { aborted, skeleton: sk };
+}
+
+async function runStructureCrawl({ session, root, state, io }) {
+  state.phase = 'STRUCTURE';
+  const monthKey = `${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+  const queue = [{ distNo: root, depth: 0 }];
+  const visited = new Set([root]);
+  let aborted = false;
+
+  const processNode = async (node) => {
+    try {
+      const children = await fetchDownline(session, node.distNo);
+      for (let i = 0; i < children.length; i++) {
+        const parsed = parseDownlineItem(children[i], i);
+        if (!parsed || visited.has(parsed.id)) continue;
+        visited.add(parsed.id);
+
+        await persistParsedNode(parsed, node.distNo, node.depth + 1, root, monthKey);
+        state.count++;
+        queue.push({ distNo: parsed.id, depth: node.depth + 1 });
+      }
+    } catch (err) {
+      if (err.message === 'SESSION_EXPIRED') {
+        aborted = true;
+        state.error = 'SESSION_EXPIRED';
+      }
+    }
+  };
+
+  while (queue.length > 0 && !aborted) {
+    const batch = queue.splice(0, CRAWL_CONCURRENCY);
+    await Promise.all(batch.map(processNode));
+    await sleep(randomBetween(NODE_DELAY_MIN_MS, NODE_DELAY_MAX_MS));
+  }
+  return { aborted };
+}
+
 function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, year, io, forceFullCrawl = true }) {
   const root = String(buyerId);
-
   const existing = activeCrawls.get(root);
-  if (existing && existing.running) {
-    console.log(`[TREE CRAWLER] Crawl already running for ${root}, skipping duplicate start`);
-    return getCrawlStatus(root);
-  }
+  if (existing && existing.running) return getCrawlStatus(root);
 
   const state = {
     running: true,
@@ -529,217 +1007,57 @@ function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, 
     failedNodes: [],
     startedAt: new Date(),
     finishedAt: null,
-    error: null
+    error: null,
+    phase: 'STARTING',
+    skeletonDone: false,
+    skeleton: null
   };
   activeCrawls.set(root, state);
 
   setImmediate(async () => {
-    console.log(`[TREE CRAWLER] Starting active BFS indexing for root: ${root}`);
-
-    // Queue initialized with root so BFS systematically cascades downline
-    const queue = [{ distNo: root, depth: 0 }];
-    const visited = new Set([root]);
-
     let aborted = false;
-    let fetchesSinceCooldown = 0;
-
-    const processNode = async (node) => {
-      try {
-        const children = await fetchDownline(session, node.distNo);
-
-        for (const child of children) {
-          const rawId = getRawId(child);
-          if (rawId === null) continue;
-          const childId = String(rawId);
-          if (visited.has(childId)) continue;
-          visited.add(childId);
-
-          const titleText = child.title || child.dist_name || child.name || '';
-          const { repurchaseAmt, selfPv } = extractAmountsFromTitle(titleText);
-          const status = normalizeNumericStatus(child);
-
-          await safeUpsert(DownlineNode, {
-            buyer_id: childId,
-            parent_id: node.distNo,
-            name: sanitizeName(titleText),
-            status,
-            self_pv: selfPv,
-            current_pv: selfPv,
-            repurchase_amt: repurchaseAmt,
-            level: node.depth + 1
-          }, `DownlineNode ${childId}`);
-
-          const nowScrape = new Date();
-          const currentMonthKeyScrape = `${nowScrape.getFullYear()}${String(nowScrape.getMonth() + 1).padStart(2, '0')}`;
-          await safeUpsert(MemberMonthlySnapshot, {
-            buyer_id: Number(childId),
-            month_key: currentMonthKeyScrape,
-            pv: selfPv,
-            purchase_amt: repurchaseAmt,
-            leg_type: child.leg || 'Leg A',
-            status
-          }, `MemberMonthlySnapshot ${childId}`);
-
-          state.count++;
-          queue.push({ distNo: childId, depth: node.depth + 1 });
-        }
-
-        if (DownlineNode && DownlineNode.update) {
-          await DownlineNode.update(
-            { children_synced_at: new Date() },
-            { where: { buyer_id: String(node.distNo) } }
-          ).catch(() => null);
-        }
-      } catch (err) {
-        if (err.message === 'SESSION_EXPIRED') {
-          aborted = true;
-          state.error = 'SESSION_EXPIRED';
-        } else {
-          state.failedNodes.push(node.distNo);
-          console.warn(`[TREE CRAWLER WARN] Node ${node.distNo}:`, err.message);
-        }
-      }
-    };
-
     try {
-      while (queue.length > 0 && !aborted) {
-        const batch = queue.splice(0, CRAWL_CONCURRENCY);
-        await Promise.all(batch.map(processNode));
-
-        fetchesSinceCooldown += batch.length;
-
-        if (state.count % 25 === 0 || queue.length === 0) {
-          console.log(`[TREE CRAWLER] ${root}: indexed ${state.count} members... (queue remaining: ${queue.length})`);
-        }
-
-        if (io) {
-          io.to(root).emit('tree:sync-progress', { syncedCount: state.count, status: 'IN_PROGRESS' });
-        }
-
-        if (fetchesSinceCooldown >= COOLDOWN_EVERY_N_FETCHES) {
-          fetchesSinceCooldown = 0;
-          await sleep(randomBetween(COOLDOWN_MIN_MS, COOLDOWN_MAX_MS));
-        } else {
-          await sleep(randomBetween(NODE_DELAY_MIN_MS, NODE_DELAY_MAX_MS));
-        }
-      }
+      const r = await runSkeletonSync({ session, root, month, year, state, io });
+      aborted = r.aborted;
     } catch (err) {
       state.error = err.message;
-      console.error('[TREE CRAWLER ERROR]:', err.message);
+    }
+
+    if (!aborted && forceFullCrawl) {
+      try {
+        await runStructureCrawl({ session, root, state, io });
+      } catch (err) {
+        state.error = err.message;
+      }
     }
 
     state.running = false;
     state.finishedAt = new Date();
-
-    if (state.error) {
-      console.warn(`[TREE CRAWLER ABORTED] ${root}: ${state.error} (${state.count} nodes indexed)`);
-      if (io) {
-        io.to(root).emit('tree:sync-error', {
-          reason: state.error,
-          syncedCount: state.count,
-          failedNodes: state.failedNodes.length
-        });
-      }
-    } else {
-      console.log(`[TREE CRAWLER COMPLETE] ${state.count} nodes indexed for ${root} (${state.failedNodes.length} failed)`);
-      if (io) {
-        io.to(root).emit('tree:sync-complete', {
-          totalMembers: state.count,
-          failedNodes: state.failedNodes.length
-        });
-      }
-    }
+    state.phase = state.error ? 'ABORTED' : 'DONE';
   });
 
   return getCrawlStatus(root);
 }
 
-/**
- * 3. On-Demand Branch Expansion (UI "+" click)
- */
 async function fetchChildrenOnDemand(rootId, parentId) {
   try {
     const { getSession } = require('./rcmSessionService');
     const session = getSession(rootId);
     if (!session) return { fetched: false, count: 0 };
-
-    let parentLevel = 0;
-    if (DownlineNode && DownlineNode.findOne) {
-      const parentRow = await DownlineNode.findOne({
-        where: { buyer_id: String(parentId) },
-        attributes: ['level'],
-        raw: true
-      }).catch((err) => {
-        console.warn('[DB LOOKUP WARN] parent level:', err.message);
-        return null;
-      });
-      parentLevel = parentRow?.level || 0;
-    }
+    const monthKey = `${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}`;
 
     const children = await fetchDownline(session, parentId);
-
     let saved = 0;
-    for (const child of children) {
-      const rawId = getRawId(child);
-      if (rawId === null) continue;
-
-      const titleText = child.title || child.dist_name || child.name || '';
-      const { repurchaseAmt, selfPv } = extractAmountsFromTitle(titleText);
-      const status = normalizeNumericStatus(child);
-
-      await safeUpsert(DownlineNode, {
-        buyer_id: String(rawId),
-        parent_id: String(parentId),
-        name: sanitizeName(titleText),
-        status,
-        self_pv: selfPv,
-        current_pv: selfPv,
-        repurchase_amt: repurchaseAmt,
-        level: parentLevel + 1
-      }, `DownlineNode ${rawId}`);
+    for (let i = 0; i < children.length; i++) {
+      const parsed = parseDownlineItem(children[i], i);
+      if (!parsed) continue;
+      await persistParsedNode(parsed, parentId, 1, rootId, monthKey);
       saved++;
     }
-
-    if (DownlineNode && DownlineNode.update) {
-      await DownlineNode.update(
-        { children_synced_at: new Date() },
-        { where: { buyer_id: String(parentId) } }
-      ).catch(() => null);
-    }
-
     return { fetched: true, count: saved };
   } catch (err) {
-    console.warn('[FETCH CHILDREN WARN]:', err.message);
-    return { fetched: false, count: 0, reason: err.message === 'SESSION_EXPIRED' ? 'SESSION_EXPIRED' : undefined };
+    return { fetched: false, count: 0 };
   }
-}
-
-async function fetchMacroPvAndProfile(session, buyerId) {
-  const overview = await syncOverviewFast({ session, buyerId });
-  return {
-    identity: {
-      buyer_id: buyerId,
-      name: overview.associateName,
-      curr_pin: overview.currPin,
-      highest_pin: overview.maxPin,
-      photo_url: overview.photoUrl,
-      kyc_status: overview.kycStatus,
-      join_date: overview.joinDate
-    },
-    total_pv: overview.totalPv,
-    self_pv: overview.selfPv,
-    legs: overview.directLegs,
-    ...overview
-  };
-}
-
-async function scrapeYourGroup(session, buyerId, macroInfo) {
-  return startBackgroundTreeCrawler({
-    session,
-    buyerId,
-    directLegs: macroInfo?.directLegs || macroInfo?.legs || [],
-    forceFullCrawl: true
-  });
 }
 
 function getCrawlStatus(rootId) {
@@ -751,18 +1069,25 @@ function getCrawlStatus(rootId) {
     failedNodes: state.failedNodes.length,
     startedAt: state.startedAt,
     finishedAt: state.finishedAt,
-    error: state.error
+    error: state.error,
+    phase: state.phase,
+    skeletonDone: state.skeletonDone,
+    skeleton: state.skeleton
   };
 }
 
 module.exports = {
   syncOverviewFast,
   startBackgroundTreeCrawler,
-  fetchMacroPvAndProfile,
-  scrapeYourGroup,
   getCrawlStatus,
   fetchChildrenOnDemand,
-  scrapeGroupData: syncOverviewFast,
-  syncGroupData: syncOverviewFast,
-  extractAmountsFromTitle
+  fetchPvOnlyFull,
+  fetchPvChildren,
+  fetchDistributorInfo,
+  syncSkeletonNow: async ({ session, buyerId, month, year, io }) => {
+    const root = String(buyerId);
+    const state = { count: 0, error: null, phase: 'SKELETON', skeletonDone: false, skeleton: null, failedNodes: [] };
+    const r = await runSkeletonSync({ session, root, month, year, state, io });
+    return { ...r.skeleton, aborted: r.aborted, error: state.error };
+  }
 };

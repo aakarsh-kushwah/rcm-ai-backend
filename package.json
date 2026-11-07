@@ -9,7 +9,7 @@
     "npm": ">=10.0.0"
   },
   "scripts": {
-    "start": "node server.js",
+    "start": "node --max-old-space-size=2048 server.js",
     "dev": "cross-env NODE_ENV=development nodemon server.js",
     "worker": "cross-env NODE_ENV=production node workers/ai-processor.js",
     "worker:scheduler": "cross-env NODE_ENV=production node workers/scheduler.js",
