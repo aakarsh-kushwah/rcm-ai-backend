@@ -80,6 +80,7 @@
     "uuid": "^9.0.1",
     "validator": "^13.11.0",
     "ws": "^8.19.0",
+    "yargs": "^18.2.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

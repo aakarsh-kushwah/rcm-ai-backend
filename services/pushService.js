@@ -8,7 +8,7 @@ const { NotificationToken } = require("../models");
 
 const DEFAULT_TITLE = "RCM AI Update";
 const DEFAULT_ACTION_PATH = "/dashboard";
-const SITE_URL = (process.env.FRONTEND_URL || process.env.CLIENT_URL || "https://rcmai.in").replace(/\/+$/, "");
+const SITE_URL = (process.env.FRONTEND_URL || process.env.CLIENT_URL || "https://teamdekho.in").replace(/\/+$/, "");
 
 // Lazy Firebase loader: never crashes the server on boot
 const getFirebase = () => {

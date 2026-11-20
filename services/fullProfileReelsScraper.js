@@ -1,135 +1,213 @@
-/**
- * @file rcm-ai-backend/services/fullProfileReelsScraper.js
- * @description Unlimited Instagram profile reels scraper using Puppeteer infinite scroll pagination & dynamic API extraction with zero mock arrays.
- */
+'use strict';
 
+const fs = require('fs');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 
 const axios = require('axios');
+const { Op } = require('sequelize');
 const { logger } = require('../utils/logger');
-const InstagramReel = require('../models/InstagramReel');
+const { InstagramReel } = require('../models');
+
+const BROWSER_CANDIDATES = [
+  process.env.PUPPETEER_EXECUTABLE_PATH,
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/google-chrome',
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+].filter(Boolean);
+
+function resolveBrowserExecutable() {
+  for (const candidate of BROWSER_CANDIDATES) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch (_) {
+      // Ignore invalid path check
+    }
+  }
+  return undefined; // Let Puppeteer use its bundled browser if present
+}
+
+function getLaunchOptions() {
+  const executablePath = resolveBrowserExecutable();
+  const opts = {
+    headless: 'new',
+    protocolTimeout: 300000,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--window-size=1280,800',
+    ],
+  };
+  if (executablePath) {
+    opts.executablePath = executablePath;
+  }
+  return opts;
+}
 
 /**
- * Exhaustively scrapes all reels from a public Instagram profile using infinite scroll pagination.
- * @param {string} username - Instagram account handle (without @)
- * @param {Object} options - Options object { accountId, category }
- * @returns {Promise<Array>} Array of normalized reel objects
+ * Scrapes reels from an Instagram profile.
+ * - mode: 'full' (thorough scroll for new / 0-reel accounts)
+ * - mode: 'incremental' (top scrolls + early stop once consecutive known reels are found)
  */
 async function fetchFullProfileReels(username, options = {}) {
-  const { accountId = null, category = 'Motivation' } = options;
+  const {
+    accountId = null,
+    category = 'Motivation',
+    mode = 'full',
+    onProgress = null,
+  } = options;
+
   const cleanUsername = String(username || '').replace(/^@/, '').trim();
   if (!cleanUsername) {
     logger.warn('[FullProfileReelsScraper] Invalid username provided.');
     return [];
   }
 
-  logger.info(`[FullProfileReelsScraper] Starting unlimited scraper for @${cleanUsername}...`);
-  let reelsMap = new Map();
+  const isIncremental = mode === 'incremental';
+  const maxScrollAttempts = isIncremental ? 4 : 50;
+  const earlyStopThreshold = isIncremental ? 2 : 4;
+
+  logger.info(
+    `[FullProfileReelsScraper] Starting ${mode.toUpperCase()} scraper for @${cleanUsername}...`
+  );
+
+  const reelsMap = new Map();
   let browser = null;
 
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1920,1080',
-      ],
-    });
+    const launchOpts = getLaunchOptions();
+    browser = await puppeteer.launch(launchOpts);
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
+    );
 
-    // Intercept responses to catch GraphQL / Clips API payload packets & direct video responses
+    // Block heavy non-essential images/fonts/media to keep RAM & bandwidth low
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      if (type === 'image' || type === 'font' || type === 'media') {
+        req.abort().catch(() => {});
+      } else {
+        req.continue().catch(() => {});
+      }
+    });
+
     page.on('response', async (response) => {
       try {
         const url = response.url();
         const contentType = response.headers()['content-type'] || '';
-        if (contentType.includes('video/mp4') || (url.includes('.mp4') && url.includes('cdninstagram.com'))) {
-          for (const [shortcode, reel] of reelsMap.entries()) {
-            if (!reel.videoUrl) {
-              reel.videoUrl = url;
-              break;
-            }
-          }
-        }
-        if (url.includes('/graphql/query') || url.includes('/api/v1/clips') || url.includes('clips/tab') || url.includes('graphql')) {
+        if (
+          url.includes('/graphql/query') ||
+          url.includes('/api/v1/clips') ||
+          url.includes('clips/tab') ||
+          url.includes('graphql')
+        ) {
           if (contentType.includes('application/json')) {
             const data = await response.json();
             extractReelsFromJson(data, cleanUsername, reelsMap);
           }
         }
-      } catch (err) {
-        // Ignore response parse errors
+      } catch (_) {
+        // Ignore non-JSON or closed target responses
       }
     });
 
     const profileUrl = `https://www.instagram.com/${cleanUsername}/reels/`;
     logger.info(`[FullProfileReelsScraper] Navigating to ${profileUrl}`);
-    
+
     const sessionId = process.env.INSTAGRAM_SESSION_ID;
     if (sessionId) {
       await page.setCookie({
         name: 'sessionid',
-        value: sessionId,
+        value: sessionId.trim(),
         domain: '.instagram.com',
         path: '/',
         httpOnly: true,
-        secure: true
+        secure: true,
       });
-      logger.info(`[FullProfileReelsScraper] Injected INSTAGRAM_SESSION_ID cookie for authenticated request.`);
     }
 
-    await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 45000 });
-    await new Promise((res) => setTimeout(res, 3000));
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await new Promise((res) => setTimeout(res, 2500));
 
-    // Infinite scroll loop until no new reels or max attempts reached
     let previousReelCount = 0;
     let consecutiveNoNewReels = 0;
-    let consecutiveExistingReels = 0; // New counter for early stop
-    const maxScrollAttempts = 50; // Safeguard against infinite loops
+    let consecutiveKnownBatches = 0;
 
     for (let scrollAttempt = 1; scrollAttempt <= maxScrollAttempts; scrollAttempt++) {
-      // Extract shortcodes and data from current DOM HTML as well
+      const beforeSize = reelsMap.size;
       const pageHtml = await page.content();
-      const extractedShortcodes = new Set();
-      extractReelsFromHtml(pageHtml, cleanUsername, reelsMap, extractedShortcodes); // Modified to pass extractedShortcodes
-      
-      // Check if any of the newly extracted reels already exist in the DB
-      const newShortcodes = Array.from(extractedShortcodes).filter(sc => !reelsMap.has(sc));
-      
-      let allNewShortcodesExist = true;
-      for (const shortcode of newShortcodes) {
-        const existsInDb = await InstagramReel.exists({ shortcode });
-        if (!existsInDb) {
-          allNewShortcodesExist = false;
-          break;
+      const batchShortcodes = new Set();
+      extractReelsFromHtml(pageHtml, cleanUsername, reelsMap, batchShortcodes);
+
+      const newlyAddedCodes = Array.from(batchShortcodes).filter((sc) => {
+        const item = reelsMap.get(sc);
+        return item && !item._seenInEarlierScroll;
+      });
+
+      if (newlyAddedCodes.length > 0 && InstagramReel) {
+        const existingInDb = await InstagramReel.findAll({
+          where: { shortcode: { [Op.in]: newlyAddedCodes } },
+          attributes: ['shortcode'],
+        });
+        const dbSet = new Set(existingInDb.map((r) => String(r.shortcode)));
+        const allAlreadyInDb = newlyAddedCodes.every((code) => dbSet.has(code));
+
+        if (allAlreadyInDb) {
+          consecutiveKnownBatches += 1;
+          if (isIncremental && consecutiveKnownBatches >= earlyStopThreshold) {
+            logger.info(
+              `[FullProfileReelsScraper] Incremental early stop for @${cleanUsername}: ${consecutiveKnownBatches} batches already in DB.`
+            );
+            break;
+          }
+        } else {
+          consecutiveKnownBatches = 0;
         }
       }
 
-      if (newShortcodes.length > 0 && allNewShortcodesExist) {
-        consecutiveExistingReels++;
-        if (consecutiveExistingReels >= 2) { // Changed from 3 to 2 for testing
-          logger.info(`[FullProfileReelsScraper] Early stop: 2 consecutive batches of existing reels found for @${cleanUsername}.`);
-          break;
-        }
-      } else {
-        consecutiveExistingReels = 0;
-      }
+      newlyAddedCodes.forEach((sc) => {
+        const item = reelsMap.get(sc);
+        if (item) item._seenInEarlierScroll = true;
+      });
 
       const currentCount = reelsMap.size;
-      logger.info(`[FullProfileReelsScraper] @${cleanUsername} - Scroll ${scrollAttempt}: found ${currentCount} unique reels so far.`);
+      logger.info(
+        `[FullProfileReelsScraper] @${cleanUsername} [${mode}] - Scroll ${scrollAttempt}/${maxScrollAttempts}: ${currentCount} unique reels.`
+      );
 
-      if (currentCount === previousReelCount) {
-        consecutiveNoNewReels++;
+      if (typeof onProgress === 'function') {
+        try {
+          onProgress({
+            username: cleanUsername,
+            scroll: scrollAttempt,
+            maxScrolls: maxScrollAttempts,
+            scrapedCount: currentCount,
+            mode,
+          });
+        } catch (_) {}
+      }
+
+      if (currentCount === previousReelCount && currentCount === beforeSize) {
+        consecutiveNoNewReels += 1;
         if (consecutiveNoNewReels >= 3) {
-          logger.info(`[FullProfileReelsScraper] Reached end of archive for @${cleanUsername} after 3 consecutive scrolls with no new reels.`);
+          logger.info(
+            `[FullProfileReelsScraper] Reached end of archive for @${cleanUsername} after 3 empty scrolls.`
+          );
           break;
         }
       } else {
@@ -137,49 +215,53 @@ async function fetchFullProfileReels(username, options = {}) {
         previousReelCount = currentCount;
       }
 
-      // Scroll down
       await page.evaluate(() => {
         window.scrollTo(0, document.body.scrollHeight);
       });
-      await new Promise((res) => setTimeout(res, 2500));
+      await new Promise((res) => setTimeout(res, 2200));
     }
-
-    await browser.close();
-    browser = null;
   } catch (puppeteerErr) {
-    logger.warn(`[FullProfileReelsScraper] Puppeteer scraping encountered issue for @${cleanUsername}: ${puppeteerErr.message}. Falling back to Axios HTTP parsing.`);
-    if (browser) {
-      try { await browser.close(); } catch (e) {}
-    }
-
-    // Fallback Axios scraping
+    logger.warn(
+      `[FullProfileReelsScraper] Puppeteer issue for @${cleanUsername}: ${puppeteerErr.message}. Trying HTTP fallback...`
+    );
     try {
       const fallbackReels = await fetchProfileReelsAxios(cleanUsername);
-      fallbackReels.forEach(r => reelsMap.set(r.shortcode, r));
+      fallbackReels.forEach((r) => {
+        if (!reelsMap.has(r.shortcode)) reelsMap.set(r.shortcode, r);
+      });
     } catch (fallbackErr) {
-      logger.error(`[FullProfileReelsScraper] Axios fallback failed for @${cleanUsername}: ${fallbackErr.message}`);
+      logger.error(
+        `[FullProfileReelsScraper] HTTP fallback failed for @${cleanUsername}: ${fallbackErr.message}`
+      );
+    }
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (_) {}
+      browser = null;
     }
   }
 
-  const finalReels = Array.from(reelsMap.values()).map(reel => ({
+  const finalReels = Array.from(reelsMap.values()).map((reel) => ({
     shortcode: reel.shortcode,
     url: reel.url || `https://www.instagram.com/reel/${reel.shortcode}/`,
-    thumbnailUrl: reel.thumbnailUrl || `https://www.instagram.com/reel/${reel.shortcode}/media/?size=l`,
+    thumbnailUrl:
+      reel.thumbnailUrl || `https://www.instagram.com/reel/${reel.shortcode}/media/?size=l`,
     videoUrl: reel.videoUrl || null,
-    title: String(reel.title || `Instagram Reel ${shortcode}`).trim().slice(0, 500),
+    title: String(reel.title || `Instagram Reel ${reel.shortcode}`).trim().slice(0, 500),
     creatorHandle: cleanUsername,
-    category: category,
+    category,
     accountId: accountId || null,
     isActive: true,
   }));
 
-  logger.info(`[FullProfileReelsScraper] Successfully scraped ${finalReels.length} unique reels for @${cleanUsername}.`);
+  logger.info(
+    `[FullProfileReelsScraper] Finished @${cleanUsername}: ${finalReels.length} unique reels (${mode}).`
+  );
   return finalReels;
 }
 
-/**
- * Helper to recursively extract reels from JSON payloads
- */
 function extractReelsFromJson(obj, username, reelsMap) {
   if (!obj || typeof obj !== 'object') return;
 
@@ -190,29 +272,35 @@ function extractReelsFromJson(obj, username, reelsMap) {
     return;
   }
 
-  // Check if object is a media node containing shortcode or code
-  const shortcode = obj.shortcode || obj.code;
-  if (shortcode && typeof shortcode === 'string' && shortcode.length >= 5) {
-    const caption = obj.title || (obj.edge_media_to_caption?.edges?.[0]?.node?.text) || obj.caption?.text || '';
+  const rawCode = obj.shortcode || obj.code;
+  if (rawCode && typeof rawCode === 'string' && /^[A-Za-z0-9_-]{6,20}$/.test(rawCode)) {
+    const caption =
+      obj.title ||
+      obj.edge_media_to_caption?.edges?.[0]?.node?.text ||
+      obj.caption?.text ||
+      '';
     const thumbnailUrl = obj.thumbnail_src || obj.display_url || obj.thumbnailUrl || '';
-    const videoUrl = obj.video_url || obj.videoUrl || obj.video_versions?.[0]?.url || obj.edge_media_to_parent_video?.video_url || '';
-    const existing = reelsMap.get(shortcode) || {};
-    reelsMap.set(shortcode, {
-      shortcode,
-      url: `https://www.instagram.com/reel/${shortcode}/`,
+    const rawVideo =
+      obj.video_url ||
+      obj.videoUrl ||
+      obj.video_versions?.[0]?.url ||
+      obj.edge_media_to_parent_video?.video_url ||
+      '';
+    const validVideoUrl =
+      rawVideo && (rawVideo.includes('.mp4') || rawVideo.includes('cdninstagram.com'))
+        ? rawVideo
+        : null;
+
+    const existing = reelsMap.get(rawCode) || {};
+    reelsMap.set(rawCode, {
+      ...existing,
+      shortcode: rawCode,
+      url: existing.url || `https://www.instagram.com/reel/${rawCode}/`,
       thumbnailUrl: thumbnailUrl || existing.thumbnailUrl,
-      videoUrl: (videoUrl && (videoUrl.includes('.mp4') || videoUrl.includes('cdninstagram.com')) ? videoUrl : '') || existing.videoUrl,
-      title: caption || existing.title || `Instagram Reel ${shortcode}`,
+      videoUrl: validVideoUrl || existing.videoUrl || null,
+      title: caption || existing.title || `Instagram Reel ${rawCode}`,
       creatorHandle: username,
     });
-  }
-
-  if (obj.video_url && obj.shortcode) {
-    const existing = reelsMap.get(obj.shortcode) || {};
-    if (obj.video_url.includes('.mp4') || obj.video_url.includes('cdninstagram.com')) {
-      existing.videoUrl = obj.video_url;
-      reelsMap.set(obj.shortcode, existing);
-    }
   }
 
   for (const key of Object.keys(obj)) {
@@ -222,78 +310,47 @@ function extractReelsFromJson(obj, username, reelsMap) {
   }
 }
 
-/**
- * Helper to extract shortcodes from HTML string via regex and sharedData
- */
-function extractReelsFromHtml(html, username, reelsMap, extractedShortcodes = new Set()) {
+function extractReelsFromHtml(html, username, reelsMap, batchShortcodes = new Set()) {
   if (!html || typeof html !== 'string') return;
 
-  // Regex matching /reel/shortcode or /p/shortcode
-  const regex = /\/(?:reel|p)\/([A-Za-z0-9_-]{10,13})\//g;
+  const regex = /\/(?:reel|reels|p)\/([A-Za-z0-9_-]{8,16})\//g;
   let match;
   while ((match = regex.exec(html)) !== null) {
     const shortcode = match[1];
-    extractedShortcodes.add(shortcode); // Add to the set of extracted shortcodes
+    batchShortcodes.add(shortcode);
     if (!reelsMap.has(shortcode)) {
       reelsMap.set(shortcode, {
         shortcode,
         url: `https://www.instagram.com/reel/${shortcode}/`,
         thumbnailUrl: `https://www.instagram.com/reel/${shortcode}/media/?size=l`,
+        videoUrl: null,
         title: `Instagram Reel ${shortcode}`,
         creatorHandle: username,
       });
     }
   }
-
-  // Try to extract _sharedData from HTML
-  const sharedDataRegex = /window\._sharedData\s*=\s*({.*?});/;
-  const sharedDataMatch = html.match(sharedDataRegex);
-  if (sharedDataMatch && sharedDataMatch[1]) {
-    try {
-      const sharedData = JSON.parse(sharedDataMatch[1]);
-      // Pass the extracted sharedData to extractReelsFromJson
-      extractReelsFromJson(sharedData, username, reelsMap);
-      logger.info(`[FullProfileReelsScraper] Extracted reels from _sharedData in HTML for @${username}.`);
-    } catch (e) {
-      logger.warn(`[FullProfileReelsScraper] Failed to parse _sharedData for @${username}: ${e.message}`);
-    }
-  }
 }
 
-/**
- * Fallback Axios profile fetcher
- */
 async function fetchProfileReelsAxios(username) {
   const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
   };
   if (process.env.INSTAGRAM_SESSION_ID) {
-    headers['Cookie'] = `sessionid=${process.env.INSTAGRAM_SESSION_ID.trim()}`;
+    headers.Cookie = `sessionid=${process.env.INSTAGRAM_SESSION_ID.trim()}`;
   }
 
-  const res = await axios.get(`https://www.instagram.com/${username}/reels/`, { headers, timeout: 15000 });
+  const res = await axios.get(`https://www.instagram.com/${username}/reels/`, {
+    headers,
+    timeout: 15000,
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+
   const html = typeof res.data === 'string' ? res.data : '';
   const reelsMap = new Map();
-  // Use the enhanced extractReelsFromHtml to also get data from _sharedData
   extractReelsFromHtml(html, username, reelsMap);
-
-  // Also look for meta tags for individual reel URLs
-  const metaRegex = /<meta property="og:url" content="https:\/\/www\.instagram\.com\/p\/([A-Za-z0-9_-]+)\//g;
-  let metaMatch;
-  while ((metaMatch = metaRegex.exec(html)) !== null) {
-    const shortcode = metaMatch[1];
-    if (!reelsMap.has(shortcode)) {
-      reelsMap.set(shortcode, {
-        shortcode,
-        url: `https://www.instagram.com/p/${shortcode}/`,
-        thumbnailUrl: `https://www.instagram.com/p/${shortcode}/media/?size=l`,
-        title: `Instagram Post ${shortcode}`,
-        creatorHandle: username,
-      });
-    }
-  }
-
   return Array.from(reelsMap.values());
 }
 
