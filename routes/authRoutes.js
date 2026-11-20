@@ -1,24 +1,24 @@
 const express = require("express");
 const router = express.Router();
 const rateLimit = require("express-rate-limit");
-const { 
-    googleAuthLogin, 
-    adminSignup, 
-    adminVerify, 
-    refreshToken, 
+const {
+    googleAuthLogin,
+    adminSignup,
+    adminVerify,
+    refreshToken,
     adminRefresh,
     logout,
-    adminGooglePhaseOne, 
-    adminMasterPasswordPhaseTwo, 
-    adminLogin 
+    adminGooglePhaseOne,
+    adminMasterPasswordPhaseTwo,
+    adminLogin
 } = require("../controllers/authController");
 const validate = require("../middleware/validate");
 const { adminSignupSchema, adminVerifySchema } = require("../validations/adminSchema");
 
-// 🛡️ SECURITY: Rate Limiter (Brute Force Protection)
+// 🛡️ SECURITY: Rate Limiter (Brute Force Protection) - login / signup / verify only
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 Minutes
-    max: 20, 
+    max: 20,
     message: { success: false, message: "Too many attempts. Please try again after 15 minutes." },
     standardHeaders: true,
     legacyHeaders: false,
@@ -29,6 +29,17 @@ const googleAuthLimiter = rateLimit({
     windowMs: 60 * 1000, // 1 Minute
     max: 10,
     message: { success: false, message: "Too many Google login attempts. Please try again shortly." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// Refresh is called automatically (every access-token expiry, on tab focus, on reconnect) by every logged-in
+// user, and many users can share one IP (office WiFi, mobile carrier NAT). It needs a far higher ceiling than
+// login. The refresh token itself is a 80-char random secret, so guessing it is not a realistic attack.
+const refreshLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 Minutes
+    max: Number(process.env.REFRESH_RATE_LIMIT_MAX) || 600,
+    message: { success: false, message: "Too many refresh requests. Please retry shortly." },
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -52,14 +63,14 @@ router.post("/admin/signup", authLimiter, validate(adminSignupSchema), adminSign
  * @desc    Refresh Token (User)
  * @access  Public
  */
-router.post("/refresh", authLimiter, refreshToken);
+router.post("/refresh", refreshLimiter, refreshToken);
 
 /**
  * @route   POST /api/auth/admin/refresh
  * @desc    Refresh Token (Admin)
  * @access  Public
  */
-router.post("/admin/refresh", authLimiter, adminRefresh);
+router.post("/admin/refresh", refreshLimiter, adminRefresh);
 
 /**
  * @route   POST /api/auth/logout

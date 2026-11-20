@@ -14,7 +14,7 @@ const crypto = require("crypto");
 const { sendNewUserAlert, sendAdminAlert } = require("../utils/emailService");
 
 // ⚙️ CONFIGURATION
-const JWT_ACCESS_EXPIRY = "15m";
+const JWT_ACCESS_EXPIRY = process.env.JWT_ACCESS_EXPIRY || "15m";
 const SALT_ROUNDS = 10;
 const isProduction = process.env.NODE_ENV === "production";
 const COOKIE_OPTIONS = {
@@ -23,6 +23,19 @@ const COOKIE_OPTIONS = {
     sameSite: isProduction ? "none" : "lax",
     maxAge: 90 * 24 * 60 * 60 * 1000 // 90-day persistent sliding window
 };
+
+// Express 4 turns maxAge into a fresh `expires`, so clearCookie() with maxAge never actually clears.
+// Always clear with options that have no maxAge.
+const { maxAge: _unusedMaxAge, ...CLEAR_COOKIE_OPTIONS } = COOKIE_OPTIONS;
+
+// Separate cookies so an admin login can never overwrite a user's refresh token (and vice versa).
+const USER_REFRESH_COOKIE = "userRefreshToken";
+const ADMIN_REFRESH_COOKIE = "adminRefreshToken";
+const LEGACY_REFRESH_COOKIE = "refreshToken"; // still read so already-logged-in sessions survive the deploy
+const REUSE_GRACE_MS = 60 * 1000; // parallel requests / multiple tabs may legitimately reuse a just-rotated token
+
+const clearRefreshCookies = (res, ...names) =>
+    names.forEach((name) => res.clearCookie(name, CLEAR_COOKIE_OPTIONS));
 
 // Helper: Token Generator (Access Token JWT)
 const generateToken = (user, expiresIn) => {
@@ -161,7 +174,7 @@ exports.googleAuthLogin = async (req, res) => {
         }
 
         // Set HttpOnly Cookie
-        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(USER_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, userId: user.id, role: user.role }, "Google authentication successful");
 
@@ -241,7 +254,7 @@ exports.adminSignup = async (req, res) => {
 // 3. REFRESH TOKEN (Automated User Rotation & Reuse Detection)
 // ============================================================
 exports.refreshToken = async (req, res) => {
-    const rawToken = req.cookies?.refreshToken;
+    const rawToken = req.cookies?.[USER_REFRESH_COOKIE] || req.cookies?.[LEGACY_REFRESH_COOKIE];
 
     if (!rawToken) {
         return res.status(401).json({ success: false, message: "Refresh token not provided in cookie." });
@@ -265,7 +278,7 @@ exports.refreshToken = async (req, res) => {
         if (tokenRecord.revokedAt) {
             const revokedTime = new Date(tokenRecord.revokedAt).getTime();
             const currentTime = Date.now();
-            const gracePeriod = 60 * 1000; // 60 seconds
+            const gracePeriod = REUSE_GRACE_MS;
 
             if ((currentTime - revokedTime) <= gracePeriod) {
                 // Within grace period, do NOT terminate sessions, issue new token
@@ -278,14 +291,14 @@ exports.refreshToken = async (req, res) => {
                     { revokedAt: new Date() },
                     { where: { userId: tokenRecord.userId, userType: "USER", revokedAt: null } }
                 );
-                res.clearCookie("refreshToken", COOKIE_OPTIONS);
+                clearRefreshCookies(res, USER_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
                 return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All sessions revoked." });
             }
         }
 
         const user = await User.findByPk(tokenRecord.userId);
         if (!user) {
-            return res.status(404).json({ success: false, message: "User not found." });
+            return res.status(401).json({ success: false, message: "User not found." });
         }
 
         // Rotate: Revoke current token
@@ -295,7 +308,7 @@ exports.refreshToken = async (req, res) => {
         const newAccessToken = generateToken(user, JWT_ACCESS_EXPIRY);
         const newRefreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"], tokenRecord.firstIssuedAt || tokenRecord.createdAt);
 
-        res.cookie("refreshToken", newRefreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(USER_REFRESH_COOKIE, newRefreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, userId: user.id }, "User access token refreshed successfully with rotation");
 
@@ -317,7 +330,7 @@ exports.refreshToken = async (req, res) => {
 
     } catch (error) {
         logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Refresh Token Error");
-        return res.status(403).json({ success: false, message: "Invalid or expired token.", error: error.message });
+        return res.status(500).json({ success: false, message: "Could not refresh session right now. Please retry." });
     }
 };
 
@@ -325,7 +338,7 @@ exports.refreshToken = async (req, res) => {
 // 3.1. ADMIN REFRESH TOKEN (Automated Admin Rotation & Reuse Detection)
 // ============================================================
 exports.adminRefresh = async (req, res) => {
-    const rawToken = req.cookies?.refreshToken;
+    const rawToken = req.cookies?.[ADMIN_REFRESH_COOKIE] || req.cookies?.[LEGACY_REFRESH_COOKIE];
 
     if (!rawToken) {
         return res.status(401).json({ success: false, message: "Admin refresh token not provided in cookie." });
@@ -345,13 +358,19 @@ exports.adminRefresh = async (req, res) => {
         }
 
         if (tokenRecord.revokedAt) {
-            logger.error({ traceId: req.id, adminId: tokenRecord.adminId }, "🚨 Admin Refresh Token Reuse Detected! Revoking all sessions.");
-            await RefreshToken.update(
-                { revokedAt: new Date() },
-                { where: { adminId: tokenRecord.adminId, userType: "ADMIN", revokedAt: null } }
-            );
-            res.clearCookie("refreshToken", COOKIE_OPTIONS);
-            return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All admin sessions revoked." });
+            const sinceRevokedMs = Date.now() - new Date(tokenRecord.revokedAt).getTime();
+            if (sinceRevokedMs <= REUSE_GRACE_MS) {
+                // Parallel request or second tab raced the rotation: not an attack, just issue a fresh token.
+                logger.warn({ traceId: req.id, adminId: tokenRecord.adminId }, "Admin refresh token reuse within grace period. Issuing new token.");
+            } else {
+                logger.error({ traceId: req.id, adminId: tokenRecord.adminId }, "🚨 Admin Refresh Token Reuse Detected! Revoking all sessions.");
+                await RefreshToken.update(
+                    { revokedAt: new Date() },
+                    { where: { adminId: tokenRecord.adminId, userType: "ADMIN", revokedAt: null } }
+                );
+                clearRefreshCookies(res, ADMIN_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
+                return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All admin sessions revoked." });
+            }
         }
 
         const admin = await Admin.findByPk(tokenRecord.adminId);
@@ -364,7 +383,7 @@ exports.adminRefresh = async (req, res) => {
         const newAccessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const newRefreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"], tokenRecord.firstIssuedAt || tokenRecord.createdAt);
 
-        res.cookie("refreshToken", newRefreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, newRefreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin access token refreshed successfully");
 
@@ -386,7 +405,7 @@ exports.adminRefresh = async (req, res) => {
 
     } catch (error) {
         logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Admin Refresh Error");
-        return res.status(403).json({ success: false, message: "Invalid or expired admin token.", error: error.message });
+        return res.status(500).json({ success: false, message: "Could not refresh admin session right now. Please retry." });
     }
 };
 
@@ -395,17 +414,21 @@ exports.adminRefresh = async (req, res) => {
 // ============================================================
 exports.logout = async (req, res) => {
     try {
-        const rawToken = req.cookies?.refreshToken;
-        if (rawToken) {
+        const rawTokens = [
+            req.cookies?.[USER_REFRESH_COOKIE],
+            req.cookies?.[ADMIN_REFRESH_COOKIE],
+            req.cookies?.[LEGACY_REFRESH_COOKIE],
+        ].filter(Boolean);
+
+        for (const rawToken of rawTokens) {
             const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
-            await RefreshToken.update({ revokedAt: new Date() }, { where: { tokenHash } });
+            await RefreshToken.update({ revokedAt: new Date() }, { where: { tokenHash, revokedAt: null } });
         }
-        res.clearCookie("refreshToken", COOKIE_OPTIONS);
-        res.json({ success: true, message: "Logged out successfully." });
     } catch (error) {
-        res.clearCookie("refreshToken", COOKIE_OPTIONS);
-        res.json({ success: true, message: "Logged out successfully." });
+        logger.error({ traceId: req.id, error: error.message }, "Logout: failed to revoke refresh token");
     }
+    clearRefreshCookies(res, USER_REFRESH_COOKIE, ADMIN_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
+    res.json({ success: true, message: "Logged out successfully." });
 };
 
 /**
@@ -437,7 +460,7 @@ exports.adminVerify = async (req, res) => {
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
 
-        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, adminId: admin.id, email: admin.email }, "Admin account verified and activated");
 
@@ -564,7 +587,7 @@ exports.adminMasterPasswordPhaseTwo = async (req, res) => {
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
 
-        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin authenticated successfully via 2-step verification");
 
@@ -632,7 +655,7 @@ exports.adminLogin = async (req, res) => {
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
 
-        res.cookie("refreshToken", refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin logged in successfully via direct credentials");
 

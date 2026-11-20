@@ -17,7 +17,8 @@ const verifyTokenLogic = (req, res, next) => {
         let token = req.headers.authorization?.split(' ')[1] || req.headers.Authorization?.split(' ')[1];
 
         if (!token && req.cookies) {
-            token = req.cookies.token || req.cookies.accessToken || req.cookies.refreshToken;
+            // never treat the opaque refresh token as an access token
+            token = req.cookies.token || req.cookies.accessToken;
         }
 
         if (!token) {
@@ -37,8 +38,14 @@ const verifyTokenLogic = (req, res, next) => {
         logger.info(`[AuthMiddleware] verifyTokenLogic: Token decoded for user ID: ${req.userId}, role: ${req.user.role}`);
         next();
     } catch (error) {
-        logger.error({ err: error.message }, '[AuthMiddleware] verifyTokenLogic: Token verification failed.');
-        return res.status(403).json({ success: false, message: '🚫 Session Expired. Please Login Again.' });
+        // 401 (not 403) so the frontend interceptor knows it should refresh and retry.
+        // 403 is reserved for "authenticated but not allowed".
+        if (error.name === 'TokenExpiredError') {
+            logger.info('[AuthMiddleware] verifyTokenLogic: Access token expired.');
+            return res.status(401).json({ success: false, code: 'TOKEN_EXPIRED', message: 'Access token expired.' });
+        }
+        logger.warn({ err: error.message }, '[AuthMiddleware] verifyTokenLogic: Token verification failed.');
+        return res.status(401).json({ success: false, code: 'TOKEN_INVALID', message: '🚫 Invalid token.' });
     }
 };
 

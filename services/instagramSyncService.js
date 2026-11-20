@@ -7,19 +7,46 @@ const { logger } = require('../utils/logger');
 
 const CONFIG = {
   SCRAPER_TIMEOUT_MS: 300000,
-  ACCOUNT_CONCURRENCY: 1, // Strictly 1 browser at a time to protect RAM
   INSERT_CHUNK_SIZE: 200,
   MAX_ERROR_LENGTH: 500,
   COOLDOWN_MS: 2500,
+  MAX_QUEUE_SIZE: 50,
 };
 
 const syncState = {
+  scraperEnabled: null,
   activeAccountId: null,
   activeUsername: null,
-  status: 'idle', // 'idle' | 'syncing' | 'completed' | 'failed'
+  status: 'idle', // 'idle' | 'syncing'
+  queuedCount: 0,
+  queuedItems: [],
+  currentProgress: {
+    scroll: 0,
+    maxScrolls: 0,
+    scrapedCount: 0,
+    mode: null,
+  },
+  lastJob: null,
   lastUpdatedAt: null,
   recentLogs: [],
 };
+
+function isScraperEnabled() {
+  const raw = String(process.env.SCRAPER_ENABLED || '').trim().toLowerCase();
+  if (raw === 'true' || raw === '1' || raw === 'yes') return true;
+  if (raw === 'false' || raw === '0' || raw === 'no') return false;
+  // Default: allow unless explicitly disabled on Render
+  return process.env.DISABLE_SCRAPER !== 'true';
+}
+
+function syncQueueMeta() {
+  syncState.scraperEnabled = isScraperEnabled();
+  syncState.queuedCount = jobQueue.length;
+  syncState.queuedItems = jobQueue.map((j) => ({
+    accountId: j.accountId,
+    enqueuedAt: j.enqueuedAt,
+  }));
+}
 
 function pushLog(level, message, meta = {}) {
   const entry = {
@@ -29,7 +56,7 @@ function pushLog(level, message, meta = {}) {
     message,
     ...meta,
   };
-  syncState.recentLogs = [entry, ...syncState.recentLogs].slice(0, 60);
+  syncState.recentLogs = [entry, ...syncState.recentLogs].slice(0, 80);
   syncState.lastUpdatedAt = entry.timestamp;
 }
 
@@ -175,9 +202,80 @@ async function writeAccountState(account, { status, error, totalReels, scrapedCo
   }
 }
 
-const inFlight = new Map();
+// Strict global FIFO queue: concurrency = 1 across entire process to protect tablet RAM
+const jobQueue = [];
+let queueDraining = false;
 
-async function runAccountSync(accountId, options = {}) {
+function drainQueue() {
+  if (queueDraining) return;
+  queueDraining = true;
+
+  (async () => {
+    while (jobQueue.length > 0) {
+      syncQueueMeta();
+      const job = jobQueue.shift();
+      syncQueueMeta();
+
+      try {
+        const result = await executeSingleSync(job.accountId, job.options);
+        job.resolve(result);
+      } catch (err) {
+        job.reject(err);
+      }
+
+      if (jobQueue.length > 0) {
+        await new Promise((r) => setTimeout(r, CONFIG.COOLDOWN_MS));
+      }
+    }
+  })()
+    .catch((err) => {
+      logger.error(`[InstagramSyncService] Queue loop error: ${errorMessage(err)}`);
+    })
+    .finally(() => {
+      queueDraining = false;
+      syncQueueMeta();
+    });
+}
+
+function enqueueSyncJob(accountId, options = {}) {
+  if (!isScraperEnabled()) {
+    const disabledErr = new Error('Scraping is disabled on this server (SCRAPER_ENABLED is false). Use tablet worker.');
+    disabledErr.code = 'SCRAPER_DISABLED';
+    return Promise.reject(disabledErr);
+  }
+
+  const normalizedId = String(accountId);
+  if (
+    String(syncState.activeAccountId) === normalizedId ||
+    jobQueue.some((item) => String(item.accountId) === normalizedId)
+  ) {
+    pushLog('info', `Account ${normalizedId} is already active or queued; skipping duplicate job.`, {
+      accountId,
+    });
+  }
+
+  if (jobQueue.length >= CONFIG.MAX_QUEUE_SIZE) {
+    return Promise.reject(new Error('Sync queue is full. Please wait for current jobs to finish.'));
+  }
+
+  return new Promise((resolve, reject) => {
+    jobQueue.push({
+      accountId,
+      options,
+      enqueuedAt: new Date().toISOString(),
+      resolve,
+      reject,
+    });
+    syncQueueMeta();
+    pushLog('info', `Queued account ${accountId} for sequential scraping (queue size: ${jobQueue.length})`, {
+      accountId,
+      queuedCount: jobQueue.length,
+    });
+    drainQueue();
+  });
+}
+
+async function executeSingleSync(accountId, options = {}) {
   const account = await InstagramAccount.findByPk(accountId);
   if (!account) {
     return { success: false, totalReels: 0, created: 0, updated: 0, scraped: 0 };
@@ -199,6 +297,14 @@ async function runAccountSync(accountId, options = {}) {
   syncState.activeAccountId = account.id;
   syncState.activeUsername = cleanUsername;
   syncState.status = 'syncing';
+  syncState.currentProgress = {
+    scroll: 0,
+    maxScrolls: 0,
+    scrapedCount: 0,
+    mode,
+  };
+  syncState.lastUpdatedAt = new Date().toISOString();
+
   pushLog('info', `Scraping @${cleanUsername} (${mode})...`, {
     accountId: account.id,
     username: cleanUsername,
@@ -212,6 +318,12 @@ async function runAccountSync(accountId, options = {}) {
         category: account.category || 'Motivation',
         mode,
         onProgress: (prog) => {
+          syncState.currentProgress = {
+            scroll: prog.scroll || 0,
+            maxScrolls: prog.maxScrolls || 0,
+            scrapedCount: prog.scrapedCount || 0,
+            mode: prog.mode || mode,
+          };
           pushLog(
             'progress',
             `@${cleanUsername} Scroll ${prog.scroll}/${prog.maxScrolls}: ${prog.scrapedCount} reels found`,
@@ -239,46 +351,68 @@ async function runAccountSync(accountId, options = {}) {
       global.invalidateFeedCandidateCache();
     }
 
+    const summary = {
+      success: true,
+      accountId: account.id,
+      username: cleanUsername,
+      mode,
+      scraped: rows.length,
+      created,
+      updated,
+      totalReels,
+      error: null,
+      completedAt: new Date().toISOString(),
+    };
+    syncState.lastJob = summary;
+
     pushLog(
       'success',
       `Completed @${cleanUsername}: scraped ${rows.length}, +${created} new, updated ${updated}, DB total ${totalReels}`,
-      {
-        accountId: account.id,
-        username: cleanUsername,
-        scraped: rows.length,
-        created,
-        updated,
-        totalReels,
-      }
+      summary
     );
 
     return { success: true, totalReels, created, updated, scraped: rows.length };
   } catch (err) {
     const msg = errorMessage(err);
+    const dbTotal = await countAccountReels(account.id);
     await writeAccountState(account, {
       status: 'FAILED',
       error: err,
-      totalReels: await countAccountReels(account.id),
+      totalReels: dbTotal,
     });
-    pushLog('error', `Failed @${cleanUsername}: ${msg}`, {
+
+    const summary = {
+      success: false,
       accountId: account.id,
       username: cleanUsername,
+      mode,
+      scraped: syncState.currentProgress.scrapedCount || 0,
+      created: 0,
+      updated: 0,
+      totalReels: dbTotal,
       error: msg,
-    });
-    return { success: false, totalReels: 0, created: 0, updated: 0, scraped: 0 };
+      completedAt: new Date().toISOString(),
+    };
+    syncState.lastJob = summary;
+
+    pushLog('error', `Failed @${cleanUsername}: ${msg}`, summary);
+    return { success: false, totalReels: dbTotal, created: 0, updated: 0, scraped: 0, error: msg };
   } finally {
     syncState.activeAccountId = null;
     syncState.activeUsername = null;
     syncState.status = 'idle';
+    syncState.currentProgress = {
+      scroll: 0,
+      maxScrolls: 0,
+      scrapedCount: 0,
+      mode: null,
+    };
+    syncQueueMeta();
   }
 }
 
 function syncAccountDetailed(accountId, options = {}) {
-  const key = String(accountId);
-  if (inFlight.has(key)) return inFlight.get(key);
-  const promise = runAccountSync(accountId, options).finally(() => inFlight.delete(key));
-  inFlight.set(key, promise);
-  return promise;
+  return enqueueSyncJob(accountId, options);
 }
 
 async function syncAccount(accountId, options = {}) {
@@ -289,6 +423,12 @@ async function syncAccount(accountId, options = {}) {
 let batchRunning = false;
 
 async function syncAllAccounts(options = {}) {
+  if (!isScraperEnabled()) {
+    const disabledErr = new Error('Scraping is disabled on this server (SCRAPER_ENABLED is false). Use tablet worker.');
+    disabledErr.code = 'SCRAPER_DISABLED';
+    throw disabledErr;
+  }
+
   if (batchRunning) return null;
   batchRunning = true;
 
@@ -307,7 +447,6 @@ async function syncAllAccounts(options = {}) {
       if (res && res.success) succeeded += 1;
       else failed += 1;
       totalReels += res ? res.totalReels : 0;
-      await new Promise((r) => setTimeout(r, CONFIG.COOLDOWN_MS));
     }
 
     return { total: accounts.length, succeeded, failed, totalReels };
@@ -317,7 +456,14 @@ async function syncAllAccounts(options = {}) {
 }
 
 function getSyncActivity() {
-  return { ...syncState };
+  syncQueueMeta();
+  return {
+    ...syncState,
+    currentProgress: { ...syncState.currentProgress },
+    queuedItems: [...syncState.queuedItems],
+    lastJob: syncState.lastJob ? { ...syncState.lastJob } : null,
+    recentLogs: [...syncState.recentLogs],
+  };
 }
 
 module.exports = {
@@ -325,5 +471,6 @@ module.exports = {
   syncAccountDetailed,
   syncAllAccounts,
   getSyncActivity,
+  isScraperEnabled,
   sanitizeHandle,
 };
