@@ -13,40 +13,55 @@ const { connection: redis } = require('../config/redis'); // Redis connection fo
 // ============================================================
 const verifyTokenLogic = (req, res, next) => {
     logger.info('[AuthMiddleware] verifyTokenLogic: Starting token verification.');
+
+    let token = req.headers.authorization?.split(' ')[1] || req.headers.Authorization?.split(' ')[1];
+
+    if (!token && req.cookies) {
+        // never treat the opaque refresh token as an access token
+        token = req.cookies.token || req.cookies.accessToken;
+    }
+
+    if (!token) {
+        logger.warn('[AuthMiddleware] verifyTokenLogic: No authentication token found.');
+        return res.status(401).json({ success: false, code: 'TOKEN_MISSING', message: '🚫 Access Denied: Authentication Token Missing.' });
+    }
+
+    // Step 1: verify the JWT. ONLY genuine JWT problems may be reported as a token error.
+    // 401 (not 403) so the frontend interceptor knows it should refresh and retry.
+    // 403 is reserved for "authenticated but not allowed".
+    let decoded;
     try {
-        let token = req.headers.authorization?.split(' ')[1] || req.headers.Authorization?.split(' ')[1];
-
-        if (!token && req.cookies) {
-            // never treat the opaque refresh token as an access token
-            token = req.cookies.token || req.cookies.accessToken;
-        }
-
-        if (!token) {
-            logger.warn('[AuthMiddleware] verifyTokenLogic: No authentication token found.');
-            return res.status(401).json({ success: false, message: '🚫 Access Denied: Authentication Token Missing.' });
-        }
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
-        req.userId = decoded.id || decoded.userId || decoded._id;
-
-        // Task 4.1: Track active user in Redis (TTL: 2 minutes)
-        if (req.userId) {
-            redis.setex(`active_user:${req.userId}`, 120, 'online').catch(() => {});
-        }
-
-        logger.info(`[AuthMiddleware] verifyTokenLogic: Token decoded for user ID: ${req.userId}, role: ${req.user.role}`);
-        next();
+        decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     } catch (error) {
-        // 401 (not 403) so the frontend interceptor knows it should refresh and retry.
-        // 403 is reserved for "authenticated but not allowed".
         if (error.name === 'TokenExpiredError') {
             logger.info('[AuthMiddleware] verifyTokenLogic: Access token expired.');
             return res.status(401).json({ success: false, code: 'TOKEN_EXPIRED', message: 'Access token expired.' });
         }
-        logger.warn({ err: error.message }, '[AuthMiddleware] verifyTokenLogic: Token verification failed.');
+        // error.message tells the real reason: "invalid signature" (JWT_SECRET differs between nodes),
+        // "jwt malformed" (a non-JWT string such as "null"/"undefined" was sent), ...
+        logger.warn({ err: error.message, name: error.name }, '[AuthMiddleware] verifyTokenLogic: Token verification failed.');
         return res.status(401).json({ success: false, code: 'TOKEN_INVALID', message: '🚫 Invalid token.' });
     }
+
+    req.user = decoded;
+    req.userId = decoded.id || decoded.userId || decoded._id;
+
+    // Step 2: best-effort presence tracking. It must NEVER be able to fail a request
+    // (Redis missing / stubbed / down used to surface as a fake "Invalid token").
+    if (req.userId) {
+        try {
+            const pending = redis && typeof redis.setex === 'function'
+                ? redis.setex(`active_user:${req.userId}`, 120, 'online')
+                : null;
+            if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+        } catch (_) { /* presence tracking is optional */ }
+    }
+
+    logger.info(`[AuthMiddleware] verifyTokenLogic: Token decoded for user ID: ${req.userId}, role: ${req.user.role}`);
+
+    // next() is deliberately OUTSIDE any try/catch: an error thrown later by a route handler
+    // must not be mistaken for a token problem.
+    return next();
 };
 
 // ============================================================

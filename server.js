@@ -60,6 +60,14 @@ const SOCKET_TRANSPORTS = (process.env.SOCKET_TRANSPORTS || "websocket,polling")
 // ============================================================
 const app = express();
 app.disable("x-powered-by");
+
+// Which machine answered this request? Set NODE_NAME=tablet on the tablet and NODE_NAME=render on Render,
+// then look at the `x-served-by` response header in DevTools -> Network.
+const NODE_NAME = process.env.NODE_NAME || "unknown";
+app.use((req, res, next) => {
+    res.setHeader("X-Served-By", NODE_NAME);
+    next();
+});
 app.set("trust proxy", TRUST_PROXY_HOPS); // must be before any middleware
 
 const server = http.createServer(app);
@@ -399,6 +407,7 @@ const startServer = async () => {
             );
         });
     } catch (err) {
+        console.error("❌ STARTUP FAILURE:", err); // logger may not flush before exit
         logger.fatal({ err: err.message, stack: err.stack }, "Startup failure");
         process.exit(1);
     }
