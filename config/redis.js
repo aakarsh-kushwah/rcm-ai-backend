@@ -1,71 +1,84 @@
 /**
- * @file [`rcm-ai-backend/config/redis.js`](rcm-ai-backend/config/redis.js)
- * @description Titan Centralized Redis Core (Safe Offline/Cloud Fallback with In-Memory Dev Store)
+ * @file rcm-ai-backend/config/redis.js
+ * @description Titan Centralized Redis Core (Safe Offline/Cloud Fallback with In-Memory Store)
  */
 require('dotenv').config();
 const IORedis = require('ioredis');
 
-let actualRedisUrl;
-const cloudRedisUrl = process.env.REDIS_URL || process.env.REDIS_CLOUD_URL || process.env.REDIS_PUBLIC_URL;
+let actualRedisUrl = '';
+const cloudRedisUrl =
+    process.env.REDIS_URL || process.env.REDIS_CLOUD_URL || process.env.REDIS_PUBLIC_URL;
 
 if (cloudRedisUrl && typeof cloudRedisUrl === 'string' && cloudRedisUrl.trim() !== '') {
-    actualRedisUrl = cloudRedisUrl;
+    actualRedisUrl = cloudRedisUrl.trim();
     const maskedUrl = actualRedisUrl.replace(/:([^:]*)@/, ':*****@');
     console.log(`✅ [TITAN-REDIS] Cloud URL Detected: ${maskedUrl}`);
+} else if (process.env.NODE_ENV !== 'production') {
+    actualRedisUrl = 'redis://127.0.0.1:6379';
+    console.log(`⚠️ [TITAN-REDIS] Using Localhost (Dev Mode): ${actualRedisUrl}`);
 } else {
-    if (process.env.NODE_ENV !== 'production') {
-        actualRedisUrl = 'redis://127.0.0.1:6379';
-        console.log(`⚠️ [TITAN-REDIS] Using Localhost (Dev Mode): ${actualRedisUrl}`);
-    } else {
-        actualRedisUrl = '';
-        console.error("❌ [TITAN-REDIS] No Redis URL provided in production environment. Connection will likely fail.");
-    }
+    actualRedisUrl = '';
+    console.log('ℹ️ [TITAN-REDIS] No REDIS_URL set in production. Running in In-Memory Fallback mode.');
 }
 
-const redisClient = new IORedis(actualRedisUrl, {
-    enableOfflineQueue: true,
-    maxRetriesPerRequest: null,
-    lazyConnect: true,
-    tls: actualRedisUrl && actualRedisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
-    retryStrategy(times) {
-        if (times > 3) {
-            console.warn('⚠️ [TITAN-REDIS] Max reconnect attempts reached. Continuing in robust offline memory fallback mode.');
-            return null; // STOP infinite retrying
-        }
-        return Math.min(times * 200, 1000);
-    }
-});
-
-redisClient.connect().catch((e) => {
-    console.error("⚠️ [TITAN-REDIS] Initial connection attempt failed (offline fallback active):", e.message);
-});
-
-let redisConnectionErrorLogged = false;
-
-redisClient.on('error', (err) => {
-    if (!redisConnectionErrorLogged) {
-        console.warn('⚠️ [TITAN-REDIS] Connection error (running offline fallback):', err.message);
-        redisConnectionErrorLogged = true;
-    }
-});
-
-redisClient.on('connect', () => {
-    console.log('🔌 [TITAN-REDIS] Connected successfully.');
-    redisConnectionErrorLogged = false;
-});
-
-// In-memory fallback store for offline development
+// In-memory fallback store
 const memStore = new Map();
 const memExpiry = new Map();
 
+let redisClient = null;
+let redisConnectionErrorLogged = false;
+
 function isOffline() {
+    if (!redisClient) return true;
     return redisClient.status !== 'ready' && redisClient.status !== 'connecting';
+}
+
+if (actualRedisUrl) {
+    redisClient = new IORedis(actualRedisUrl, {
+        enableOfflineQueue: true,
+        maxRetriesPerRequest: null,
+        lazyConnect: true,
+        tls: actualRedisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+        retryStrategy(times) {
+            if (times > 3) {
+                if (!redisConnectionErrorLogged) {
+                    console.warn(
+                        '⚠️ [TITAN-REDIS] Max reconnect attempts reached. Continuing in in-memory fallback mode.'
+                    );
+                    redisConnectionErrorLogged = true;
+                }
+                return null;
+            }
+            return Math.min(times * 200, 1000);
+        },
+    });
+
+    redisClient.connect().catch((e) => {
+        if (!redisConnectionErrorLogged) {
+            console.warn(
+                '⚠️ [TITAN-REDIS] Initial Redis connection skipped/failed (in-memory fallback active):',
+                e.message
+            );
+            redisConnectionErrorLogged = true;
+        }
+    });
+
+    redisClient.on('error', (err) => {
+        if (!redisConnectionErrorLogged) {
+            console.warn('⚠️ [TITAN-REDIS] Connection warning (in-memory fallback active):', err.message);
+            redisConnectionErrorLogged = true;
+        }
+    });
+
+    redisClient.on('connect', () => {
+        console.log('🔌 [TITAN-REDIS] Connected successfully.');
+        redisConnectionErrorLogged = false;
+    });
 }
 
 // Pipeline/Multi stub support
 class InMemoryPipeline {
-    constructor(client) {
-        this.client = client;
+    constructor() {
         this.commands = [];
     }
     get(key) { this.commands.push(['get', key]); return this; }
@@ -80,26 +93,19 @@ class InMemoryPipeline {
     hset(key, ...args) { this.commands.push(['hset', key, args]); return this; }
     hget(key, field) { this.commands.push(['hget', key, field]); return this; }
     exec() {
-        const results = [];
-        for (const cmd of this.commands) {
-            try {
-                // Execute on memory store simulation or return success
-                results.push([null, 'OK']);
-            } catch (err) {
-                results.push([err, null]);
-            }
-        }
+        const results = this.commands.map(() => [null, 'OK']);
         return Promise.resolve(results);
     }
 }
 
-// Robust Proxy wrapper around redisClient to guarantee fail-safe offline operation
-const connection = new Proxy(redisClient, {
+const fallbackTarget = redisClient || {};
+
+const connection = new Proxy(fallbackTarget, {
     get(target, prop, receiver) {
         if (isOffline()) {
             if (prop === 'status') return 'offline';
             if (prop === 'pipeline' || prop === 'multi') {
-                return () => new InMemoryPipeline(target);
+                return () => new InMemoryPipeline();
             }
             if (prop === 'get') {
                 return async (key) => {
@@ -161,7 +167,7 @@ const connection = new Proxy(redisClient, {
                             memExpiry.delete(k);
                         }
                     }
-                    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+                    const regex = new RegExp('^' + String(pattern || '*').replace(/\*/g, '.*') + '$');
                     for (const k of memStore.keys()) {
                         if (regex.test(k)) results.push(k);
                     }
@@ -169,23 +175,22 @@ const connection = new Proxy(redisClient, {
                 };
             }
             if (prop === 'call' || prop === 'sendCommand') {
-                return async (...args) => null;
+                return async () => null;
             }
-            // Fallback for any other method: return safe default or no-op function
             const orig = Reflect.get(target, prop, receiver);
             if (typeof orig === 'function') {
                 return async (...args) => {
                     try {
                         return await orig.apply(target, args);
-                    } catch (e) {
-                        // Suppress offline connection errors
+                    } catch (_) {
                         return null;
                     }
                 };
             }
+            return orig;
         }
         return Reflect.get(target, prop, receiver);
-    }
+    },
 });
 
 const getSmartCache = async (key) => {
@@ -202,7 +207,7 @@ const getSmartCache = async (key) => {
         }
         const data = await redisClient.get(key);
         return data ? JSON.parse(data) : null;
-    } catch (e) {
+    } catch (_) {
         return null;
     }
 };
@@ -216,9 +221,7 @@ const setSmartCache = async (key, value, ttl = 3600) => {
             return;
         }
         await redisClient.set(key, jsonVal, 'EX', ttl);
-    } catch (e) {
-        // Ignore cache write errors when offline
-    }
+    } catch (_) {}
 };
 
 const delSmartCache = async (key) => {
@@ -229,9 +232,7 @@ const delSmartCache = async (key) => {
             return;
         }
         await redisClient.del(key);
-    } catch (e) {
-        // Ignore
-    }
+    } catch (_) {}
 };
 
 module.exports = { connection, getSmartCache, setSmartCache, delSmartCache };
