@@ -37,17 +37,34 @@ function resolveBrowserExecutable() {
   return undefined;
 }
 
-function buildHttpHeaders() {
+function buildHttpHeaders(username) {
+  const cleanUser = encodeURIComponent(String(username || '').trim());
   const headers = {
     'User-Agent': DEFAULT_UA,
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
+    Accept:
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
     'X-IG-App-ID': '936619743392459',
     'X-Requested-With': 'XMLHttpRequest',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    Referer: `https://www.instagram.com/${cleanUser}/reels/`,
   };
-  if (process.env.INSTAGRAM_SESSION_ID) {
-    headers.Cookie = `sessionid=${process.env.INSTAGRAM_SESSION_ID.trim()}`;
+
+  const cookies = [];
+  if (process.env.INSTAGRAM_SESSION_ID && process.env.INSTAGRAM_SESSION_ID.trim()) {
+    cookies.push(`sessionid=${process.env.INSTAGRAM_SESSION_ID.trim()}`);
   }
+  if (process.env.INSTAGRAM_CSRF_TOKEN && process.env.INSTAGRAM_CSRF_TOKEN.trim()) {
+    const csrf = process.env.INSTAGRAM_CSRF_TOKEN.trim();
+    cookies.push(`csrftoken=${csrf}`);
+    headers['X-CSRFToken'] = csrf;
+  }
+  if (cookies.length > 0) {
+    headers.Cookie = cookies.join('; ');
+  }
+
   return headers;
 }
 
@@ -151,7 +168,7 @@ async function fetchFullProfileReels(username, options = {}) {
 }
 
 async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
-  const headers = buildHttpHeaders();
+  const headers = buildHttpHeaders(username);
   const reelsMap = new Map();
 
   const targets = [
@@ -181,26 +198,41 @@ async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
   for (let i = 0; i < targets.length; i++) {
     const step = i + 1;
     const target = targets[i];
+    const beforeCount = reelsMap.size;
 
     try {
       const res = await axios.get(target.url, {
-        headers: {
-          ...headers,
-          Referer: `https://www.instagram.com/${encodeURIComponent(username)}/`,
-        },
+        headers,
         timeout: 15000,
+        maxRedirects: 5,
         validateStatus: (status) => status >= 200 && status < 400,
       });
+
+      const finalUrl = res.request?.res?.responseUrl || target.url;
+      const redirectedToLogin =
+        typeof finalUrl === 'string' && finalUrl.includes('/accounts/login');
 
       if (target.isJson && res.data && typeof res.data === 'object') {
         extractReelsFromJson(res.data, username, reelsMap);
       } else if (typeof res.data === 'string' && res.data.length > 0) {
+        if (redirectedToLogin) {
+          logger.warn(
+            `[FullProfileReelsScraper] Step ${step} (${target.label}) redirected to login for @${username}.`
+          );
+        }
         extractReelsFromHtml(res.data, username, reelsMap);
         extractEmbeddedJsonReels(res.data, username, reelsMap);
       }
+
+      logger.info(
+        `[FullProfileReelsScraper] Step ${step} (${target.label}) status=${res.status} for @${username}: +${
+          reelsMap.size - beforeCount
+        } reels (total=${reelsMap.size})`
+      );
     } catch (err) {
+      const status = err.response?.status || 'ERR';
       logger.warn(
-        `[FullProfileReelsScraper] Step ${step} (${target.label}) failed for @${username}: ${err.message}`
+        `[FullProfileReelsScraper] Step ${step} (${target.label}) failed [status=${status}] for @${username}: ${err.message}`
       );
     }
 
@@ -344,17 +376,36 @@ function extractEmbeddedJsonReels(html, username, reelsMap) {
   let match;
   while ((match = scriptRegex.exec(html)) !== null) {
     const raw = (match[1] || '').trim();
-    if (!raw || raw.length > 2000000) continue;
+    if (!raw || raw.length > 3000000) continue;
+
     if (raw.startsWith('{') || raw.startsWith('[')) {
       try {
         extractReelsFromJson(JSON.parse(raw), username, reelsMap);
+        continue;
       } catch (_) {}
+    }
+
+    // Fallback for escaped JSON inside inline scripts
+    const escapedCodeRegex = /\\"(?:shortcode|code)\\"\s*:\s*\\"([A-Za-z0-9_-]{6,20})\\"/g;
+    let escMatch;
+    while ((escMatch = escapedCodeRegex.exec(raw)) !== null) {
+      const shortcode = escMatch[1];
+      if (!reelsMap.has(shortcode)) {
+        reelsMap.set(shortcode, {
+          shortcode,
+          url: `https://www.instagram.com/reel/${shortcode}/`,
+          thumbnailUrl: `https://www.instagram.com/reel/${shortcode}/media/?size=l`,
+          videoUrl: null,
+          title: `Instagram Reel ${shortcode}`,
+          creatorHandle: username,
+        });
+      }
     }
   }
 }
 
 function extractReelsFromJson(obj, username, reelsMap, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 12) return;
+  if (!obj || typeof obj !== 'object' || depth > 14) return;
 
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) {
@@ -363,19 +414,27 @@ function extractReelsFromJson(obj, username, reelsMap, depth = 0) {
     return;
   }
 
-  const rawCode = obj.shortcode || obj.code;
+  // Unwrap Instagram media container if present
+  const candidate = obj.media && typeof obj.media === 'object' ? obj.media : obj;
+  const rawCode = candidate.shortcode || candidate.code;
+
   if (rawCode && typeof rawCode === 'string' && /^[A-Za-z0-9_-]{6,20}$/.test(rawCode)) {
     const caption =
-      obj.title ||
-      obj.edge_media_to_caption?.edges?.[0]?.node?.text ||
-      obj.caption?.text ||
+      candidate.title ||
+      candidate.edge_media_to_caption?.edges?.[0]?.node?.text ||
+      candidate.caption?.text ||
       '';
-    const thumbnailUrl = obj.thumbnail_src || obj.display_url || obj.thumbnailUrl || '';
+    const thumbnailUrl =
+      candidate.thumbnail_src ||
+      candidate.display_url ||
+      candidate.thumbnailUrl ||
+      candidate.image_versions2?.candidates?.[0]?.url ||
+      '';
     const rawVideo =
-      obj.video_url ||
-      obj.videoUrl ||
-      obj.video_versions?.[0]?.url ||
-      obj.edge_media_to_parent_video?.video_url ||
+      candidate.video_url ||
+      candidate.videoUrl ||
+      candidate.video_versions?.[0]?.url ||
+      candidate.edge_media_to_parent_video?.video_url ||
       '';
     const validVideoUrl =
       rawVideo && (rawVideo.includes('.mp4') || rawVideo.includes('cdninstagram.com'))
@@ -405,7 +464,7 @@ function extractReelsFromJson(obj, username, reelsMap, depth = 0) {
 function extractReelsFromHtml(html, username, reelsMap) {
   if (!html || typeof html !== 'string') return;
 
-  const regex = /\/(?:reel|reels|p)\/([A-Za-z0-9_-]{8,16})\//g;
+  const regex = /\/(?:reel|reels|p)\/([A-Za-z0-9_-]{6,20})(?:\/|["'?#\\]|$)/g;
   let match;
   while ((match = regex.exec(html)) !== null) {
     const shortcode = match[1];
