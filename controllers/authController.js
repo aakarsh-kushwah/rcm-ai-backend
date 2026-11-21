@@ -17,16 +17,28 @@ const { sendNewUserAlert, sendAdminAlert } = require("../utils/emailService");
 const JWT_ACCESS_EXPIRY = process.env.JWT_ACCESS_EXPIRY || "15m";
 const SALT_ROUNDS = 10;
 const isProduction = process.env.NODE_ENV === "production";
-const COOKIE_OPTIONS = {
-    httpOnly: true,
-    secure: isProduction, // Allows cookies over local LAN/HTTP during development/testing
-    sameSite: isProduction ? "none" : "lax",
-    maxAge: 90 * 24 * 60 * 60 * 1000 // 90-day persistent sliding window
+const REFRESH_COOKIE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90-day persistent sliding window
+
+// Decided per request instead of trusting NODE_ENV alone. When the frontend and the API live on
+// different domains the cookie MUST be Secure + SameSite=None, otherwise the browser never sends it
+// on cross-site XHR/fetch and every refresh fails. `req.secure` is correct behind Render/Cloudflare
+// because `trust proxy` is set in server.js.
+const getCookieOptions = (req) => {
+    const secure = isProduction || !!req.secure;
+    return {
+        httpOnly: true,
+        secure,
+        sameSite: secure ? "none" : "lax",
+        maxAge: REFRESH_COOKIE_MAX_AGE_MS,
+    };
 };
 
 // Express 4 turns maxAge into a fresh `expires`, so clearCookie() with maxAge never actually clears.
 // Always clear with options that have no maxAge.
-const { maxAge: _unusedMaxAge, ...CLEAR_COOKIE_OPTIONS } = COOKIE_OPTIONS;
+const getClearCookieOptions = (req) => {
+    const { maxAge, ...rest } = getCookieOptions(req);
+    return rest;
+};
 
 // Separate cookies so an admin login can never overwrite a user's refresh token (and vice versa).
 const USER_REFRESH_COOKIE = "userRefreshToken";
@@ -34,8 +46,8 @@ const ADMIN_REFRESH_COOKIE = "adminRefreshToken";
 const LEGACY_REFRESH_COOKIE = "refreshToken"; // still read so already-logged-in sessions survive the deploy
 const REUSE_GRACE_MS = 60 * 1000; // parallel requests / multiple tabs may legitimately reuse a just-rotated token
 
-const clearRefreshCookies = (res, ...names) =>
-    names.forEach((name) => res.clearCookie(name, CLEAR_COOKIE_OPTIONS));
+const clearRefreshCookies = (req, res, ...names) =>
+    names.forEach((name) => res.clearCookie(name, getClearCookieOptions(req)));
 
 // Helper: Token Generator (Access Token JWT)
 const generateToken = (user, expiresIn) => {
@@ -174,7 +186,7 @@ exports.googleAuthLogin = async (req, res) => {
         }
 
         // Set HttpOnly Cookie
-        res.cookie(USER_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(USER_REFRESH_COOKIE, refreshTokenVal, getCookieOptions(req));
 
         logger.info({ traceId: req.id, userId: user.id, role: user.role }, "Google authentication successful");
 
@@ -291,7 +303,7 @@ exports.refreshToken = async (req, res) => {
                     { revokedAt: new Date() },
                     { where: { userId: tokenRecord.userId, userType: "USER", revokedAt: null } }
                 );
-                clearRefreshCookies(res, USER_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
+                clearRefreshCookies(req, res, USER_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
                 return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All sessions revoked." });
             }
         }
@@ -308,7 +320,7 @@ exports.refreshToken = async (req, res) => {
         const newAccessToken = generateToken(user, JWT_ACCESS_EXPIRY);
         const newRefreshTokenVal = await generateOpaqueRefreshToken(user.id, null, "USER", req.headers["user-agent"], tokenRecord.firstIssuedAt || tokenRecord.createdAt);
 
-        res.cookie(USER_REFRESH_COOKIE, newRefreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(USER_REFRESH_COOKIE, newRefreshTokenVal, getCookieOptions(req));
 
         logger.info({ traceId: req.id, userId: user.id }, "User access token refreshed successfully with rotation");
 
@@ -368,7 +380,7 @@ exports.adminRefresh = async (req, res) => {
                     { revokedAt: new Date() },
                     { where: { adminId: tokenRecord.adminId, userType: "ADMIN", revokedAt: null } }
                 );
-                clearRefreshCookies(res, ADMIN_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
+                clearRefreshCookies(req, res, ADMIN_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
                 return res.status(401).json({ success: false, message: "Security Alert: Token reuse detected. All admin sessions revoked." });
             }
         }
@@ -383,7 +395,7 @@ exports.adminRefresh = async (req, res) => {
         const newAccessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const newRefreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"], tokenRecord.firstIssuedAt || tokenRecord.createdAt);
 
-        res.cookie(ADMIN_REFRESH_COOKIE, newRefreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, newRefreshTokenVal, getCookieOptions(req));
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin access token refreshed successfully");
 
@@ -427,7 +439,7 @@ exports.logout = async (req, res) => {
     } catch (error) {
         logger.error({ traceId: req.id, error: error.message }, "Logout: failed to revoke refresh token");
     }
-    clearRefreshCookies(res, USER_REFRESH_COOKIE, ADMIN_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
+    clearRefreshCookies(req, res, USER_REFRESH_COOKIE, ADMIN_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE);
     res.json({ success: true, message: "Logged out successfully." });
 };
 
@@ -460,7 +472,7 @@ exports.adminVerify = async (req, res) => {
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
 
-        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, getCookieOptions(req));
 
         logger.info({ traceId: req.id, adminId: admin.id, email: admin.email }, "Admin account verified and activated");
 
@@ -587,7 +599,7 @@ exports.adminMasterPasswordPhaseTwo = async (req, res) => {
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
 
-        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, getCookieOptions(req));
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin authenticated successfully via 2-step verification");
 
@@ -655,7 +667,7 @@ exports.adminLogin = async (req, res) => {
         const accessToken = generateToken(admin, JWT_ACCESS_EXPIRY);
         const refreshTokenVal = await generateOpaqueRefreshToken(null, admin.id, "ADMIN", req.headers["user-agent"]);
 
-        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, COOKIE_OPTIONS);
+        res.cookie(ADMIN_REFRESH_COOKIE, refreshTokenVal, getCookieOptions(req));
 
         logger.info({ traceId: req.id, adminId: admin.id }, "Admin logged in successfully via direct credentials");
 

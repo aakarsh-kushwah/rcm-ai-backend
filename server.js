@@ -26,7 +26,7 @@ const { logger } = require("./utils/logger");
 const { connectDB, sequelize } = require("./models");
 const { connection: redisClient } = require("./config/redis");
 const { setIoInstance } = require("./services/socketService");
-const { allowedOrigins, corsOptions } = require("./config/cors");
+const { allowedOrigins } = require("./config/cors");
 const { globalLimiter, getClientIp } = require("./middleware/rateLimiter");
 const { metricsMiddleware, metricsHandler } = require("./middleware/metrics");
 
@@ -37,13 +37,14 @@ const IS_PROD = process.env.NODE_ENV === "production";
 const PORT = Number(process.env.PORT) || 5000;
 
 // Proxy hops between the socket and the real client.
-// Render(local) -> Cloudflare -> client = 3. Verify after deploy by logging req.ip.
+// Client -> Cloudflare -> Edge/Render/Tablet = verify req.ip in production.
 const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS ?? 3);
 
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 25 * 1000;
 // Time to keep serving while the load balancer notices /ready is failing.
 const DRAIN_DELAY_MS = Number(process.env.DRAIN_DELAY_MS ?? 5000);
 const REDIS_WAIT_MS = Number(process.env.REDIS_WAIT_MS) || 5000;
+const DB_HEALTH_INTERVAL_MS = Number(process.env.DB_HEALTH_INTERVAL_MS) || 30 * 1000;
 
 // Cloudflare already compresses responses for free. Enable only if you run without it.
 const ENABLE_APP_COMPRESSION = process.env.ENABLE_COMPRESSION === "true";
@@ -71,6 +72,8 @@ server.requestTimeout = 120 * 1000;
 
 let isShuttingDown = false;
 let dbHealthy = false;
+let isCheckingDb = false;
+let healthTimer = null;
 
 const isInfraPath = (req) =>
     req.path === "/health" || req.path === "/ready" || req.path === "/metrics";
@@ -112,21 +115,37 @@ app.use(metricsMiddleware(isInfraPath));
 app.use(helmet({ crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" } }));
 if (ENABLE_APP_COMPRESSION) app.use(compression());
 
-// 4. CORS (strict allowlist; this middleware also answers preflight OPTIONS)
-app.use(cors({
-  origin: true,
-  credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-lifelines-token', 'X-Requested-With', 'Accept', 'Origin', 'X-Trace-Id']
-}));
+// 4. CORS
+// NOTE: `origin: true` reflects any request Origin. In production, review whether strict
+// allowlist (`allowedOrigins`) should be enforced instead so arbitrary origins aren't reflected.
+app.use(
+    cors({
+        origin: true,
+        credentials: true,
+        allowedHeaders: [
+            "Content-Type",
+            "Authorization",
+            "x-lifelines-token",
+            "X-Requested-With",
+            "Accept",
+            "Origin",
+            "X-Trace-Id",
+        ],
+    })
+);
 
 // 5. Infra endpoints BEFORE the rate limiter so probes are never throttled
 const checkDb = async () => {
+    if (isCheckingDb || isShuttingDown) return;
+    isCheckingDb = true;
     try {
         await sequelize.authenticate();
         dbHealthy = true;
     } catch (err) {
         dbHealthy = false;
         logger.error({ err: err.message }, "HealthCheck: database down");
+    } finally {
+        isCheckingDb = false;
     }
 };
 
@@ -145,7 +164,7 @@ app.get("/ready", (req, res) => {
     res.status(ok ? 200 : 503).json({
         status: ok ? "ready" : isShuttingDown ? "shutting_down" : "degraded",
         db: dbHealthy,
-        redis: redisClient.status,
+        redis: redisClient?.status || "unknown",
         timestamp: new Date().toISOString(),
     });
 });
@@ -178,6 +197,7 @@ const socketRedisClients = [];
 
 const waitForRedis = (timeoutMs) =>
     new Promise((resolve) => {
+        if (!redisClient) return resolve(false);
         if (redisClient.status === "ready") return resolve(true);
 
         const onReady = () => {
@@ -185,15 +205,29 @@ const waitForRedis = (timeoutMs) =>
             resolve(true);
         };
         const timer = setTimeout(() => {
-            redisClient.off("ready", onReady);
+            if (typeof redisClient.off === "function") {
+                redisClient.off("ready", onReady);
+            }
             resolve(false);
         }, timeoutMs);
 
-        redisClient.once("ready", onReady);
+        if (typeof redisClient.once === "function") {
+            redisClient.once("ready", onReady);
+        } else {
+            clearTimeout(timer);
+            resolve(false);
+        }
     });
 
 const attachSocketRedisAdapter = async () => {
     try {
+        if (!redisClient || typeof redisClient.duplicate !== "function") {
+            logger.warn(
+                "Redis client does not support duplicate(); Socket.io running with in-memory adapter (single instance only)."
+            );
+            return;
+        }
+
         const ready = await waitForRedis(REDIS_WAIT_MS);
         if (!ready) {
             logger.warn(
@@ -242,10 +276,11 @@ apiV1.use("/videos", require("./routes/videoRoutes"));
 apiV1.use("/channels", require("./routes/channelRoutes"));
 apiV1.use("/calculator", require("./routes/calculatorRoutes"));
 apiV1.use("/shorts", require("./routes/shortsRoutes"));
-// inside the apiV1 block, with the other apiV1.use(...) lines:
-const lifelinesRoutes = require('./routes/lifelinesRoutes');
-app.use('/api/lifelines', lifelinesRoutes);
-app.use('/lifelines', lifelinesRoutes);
+
+// Lifelines routes
+const lifelinesRoutes = require("./routes/lifelinesRoutes");
+app.use("/api/lifelines", lifelinesRoutes);
+app.use("/lifelines", lifelinesRoutes);
 
 // /api/v1 is canonical; /api kept for backward compatibility
 app.use("/api/v1", apiV1);
@@ -265,7 +300,10 @@ const normalizeError = (err) => {
             case "LIMIT_FILE_SIZE":
                 return { status: 413, message: "Image is too large. Maximum allowed size is 10MB." };
             case "LIMIT_UNEXPECTED_FILE":
-                return { status: 400, message: "Unexpected file field. Upload the image using the field name 'image'." };
+                return {
+                    status: 400,
+                    message: "Unexpected file field. Upload the image using the field name 'image'.",
+                };
             default:
                 return { status: 400, message: `Upload error: ${err.message}` };
         }
@@ -280,7 +318,12 @@ app.use((err, req, res, next) => {
 
     (status >= 500 ? logger.error : logger.warn).call(
         logger,
-        { traceId: req.id, status, err: err.message, stack: status >= 500 && !IS_PROD ? err.stack : undefined },
+        {
+            traceId: req.id,
+            status,
+            err: err.message,
+            stack: status >= 500 && !IS_PROD ? err.stack : undefined,
+        },
         "Request failed"
     );
 
@@ -296,20 +339,20 @@ app.use((err, req, res, next) => {
 // ============================================================
 // 🏁 STARTUP
 // ============================================================
-let healthTimer;
-
 const startServer = async () => {
     try {
         await connectDB();
 
         // Run patchColumns strictly once at startup
         const patchColumns = require("./scripts/patchColumns");
-        await patchColumns().catch(err => logger.warn({ err: err.message }, "Startup patchColumns warning"));
+        await patchColumns().catch((err) =>
+            logger.warn({ err: err.message }, "Startup patchColumns warning")
+        );
 
         // Cross-platform safe auto-migrations (Windows + Linux)
         await new Promise((resolve) => {
             const { spawn } = require("child_process");
-            const envFlag = IS_PROD ? "production" : (process.env.NODE_ENV || "development");
+            const envFlag = IS_PROD ? "production" : process.env.NODE_ENV || "development";
 
             const migrate = spawn("npx", ["sequelize-cli", "db:migrate", "--env", envFlag], {
                 shell: true,
@@ -317,7 +360,10 @@ const startServer = async () => {
             });
 
             migrate.on("error", (err) => {
-                logger.warn({ err: err.message }, "⚠️ [MIGRATION SKIPPED] Could not trigger migration CLI process.");
+                logger.warn(
+                    { err: err.message },
+                    "⚠️ [MIGRATION SKIPPED] Could not trigger migration CLI process."
+                );
                 resolve();
             });
 
@@ -325,7 +371,9 @@ const startServer = async () => {
                 if (code === 0) {
                     logger.info("✅ [MIGRATION SUCCESS] Database schema is up to date.");
                 } else {
-                    logger.warn(`⚠️ [MIGRATION WARNING] Database migration process exited with code ${code}.`);
+                    logger.warn(
+                        `⚠️ [MIGRATION WARNING] Database migration process exited with code ${code}.`
+                    );
                 }
                 resolve();
             });
@@ -334,12 +382,19 @@ const startServer = async () => {
         await checkDb(); // so /ready is correct immediately, not after 30s
         await attachSocketRedisAdapter();
 
-        healthTimer = setInterval(checkDb, 30 * 1000);
-        healthTimer.unref();
+        if (!healthTimer) {
+            healthTimer = setInterval(checkDb, DB_HEALTH_INTERVAL_MS);
+            healthTimer.unref();
+        }
 
         server.listen(PORT, "0.0.0.0", () => {
             logger.info(
-                { port: PORT, env: process.env.NODE_ENV, trustProxy: TRUST_PROXY_HOPS, transports: SOCKET_TRANSPORTS },
+                {
+                    port: PORT,
+                    env: process.env.NODE_ENV,
+                    trustProxy: TRUST_PROXY_HOPS,
+                    transports: SOCKET_TRANSPORTS,
+                },
                 "Server online"
             );
         });
@@ -366,7 +421,10 @@ const shutdown = async (signal, exitCode = 0, { drain = true } = {}) => {
     forceTimer.unref();
 
     try {
-        clearInterval(healthTimer);
+        if (healthTimer) {
+            clearInterval(healthTimer);
+            healthTimer = null;
+        }
 
         // Give the load balancer time to stop routing new traffic here.
         if (drain && DRAIN_DELAY_MS > 0) await sleep(DRAIN_DELAY_MS);
@@ -377,13 +435,17 @@ const shutdown = async (signal, exitCode = 0, { drain = true } = {}) => {
         logger.info("HTTP + Socket.io drained.");
 
         const results = await Promise.allSettled([
-            sequelize.close(),
-            ...socketRedisClients.map((c) => c.quit()),
-            redisClient.quit(),
+            sequelize?.close ? sequelize.close() : Promise.resolve(),
+            ...socketRedisClients.map((c) =>
+                typeof c?.quit === "function" ? c.quit() : Promise.resolve()
+            ),
+            typeof redisClient?.quit === "function" ? redisClient.quit() : Promise.resolve(),
         ]);
         results
             .filter((r) => r.status === "rejected")
-            .forEach((r) => logger.warn({ err: r.reason?.message }, "Error during resource close"));
+            .forEach((r) =>
+                logger.warn({ err: r.reason?.message }, "Error during resource close")
+            );
 
         logger.info("All connections closed. Bye.");
         process.exit(exitCode);
@@ -396,7 +458,10 @@ const shutdown = async (signal, exitCode = 0, { drain = true } = {}) => {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT", 0, { drain: false }));
 process.on("unhandledRejection", (reason) => {
-    logger.error({ err: reason instanceof Error ? reason.message : String(reason) }, "Unhandled promise rejection");
+    logger.error(
+        { err: reason instanceof Error ? reason.message : String(reason) },
+        "Unhandled promise rejection"
+    );
 });
 process.on("uncaughtException", (err) => {
     // Process state may be corrupt: do not wait for drain, exit fast.
