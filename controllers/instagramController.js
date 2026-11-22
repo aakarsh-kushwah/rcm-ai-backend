@@ -8,7 +8,7 @@ const { Op } = require('sequelize');
 const { logger } = require('../utils/logger');
 const instagramService = require('../services/instagramService');
 const { cleanInstagramUsername } = require('../utils/instagramSanitizer');
-const { fetchFullProfileReels } = require('./fullProfileReelsScraper');
+const { fetchFullProfileReels } = require('../services/fullProfileReelsScraper');
 
 const BULK_MAX = 25;
 const BULK_ITEM_DELAY_MS = 2500;
