@@ -37,35 +37,75 @@ function resolveBrowserExecutable() {
   return undefined;
 }
 
-function buildHttpHeaders(username) {
-  const cleanUser = encodeURIComponent(String(username || '').trim());
-  const headers = {
-    'User-Agent': DEFAULT_UA,
-    Accept:
-      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
-    'X-IG-App-ID': '936619743392459',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Dest': 'empty',
-    Referer: `https://www.instagram.com/${cleanUser}/reels/`,
-  };
-
+function buildCookieHeader() {
   const cookies = [];
-  if (process.env.INSTAGRAM_SESSION_ID && process.env.INSTAGRAM_SESSION_ID.trim()) {
-    cookies.push(`sessionid=${process.env.INSTAGRAM_SESSION_ID.trim()}`);
+  const rawSession = process.env.INSTAGRAM_SESSION_ID ? process.env.INSTAGRAM_SESSION_ID.trim() : '';
+
+  if (rawSession) {
+    cookies.push(`sessionid=${rawSession}`);
+    const maybeUserId = rawSession.split('%')[0];
+    if (/^\d{4,20}$/.test(maybeUserId)) {
+      cookies.push(`ds_user_id=${maybeUserId}`);
+    }
   }
+
   if (process.env.INSTAGRAM_CSRF_TOKEN && process.env.INSTAGRAM_CSRF_TOKEN.trim()) {
-    const csrf = process.env.INSTAGRAM_CSRF_TOKEN.trim();
-    cookies.push(`csrftoken=${csrf}`);
+    cookies.push(`csrftoken=${process.env.INSTAGRAM_CSRF_TOKEN.trim()}`);
+  }
+
+  return cookies.join('; ');
+}
+
+function buildHttpHeaders(username, { isJson = false } = {}) {
+  const cleanUser = encodeURIComponent(String(username || '').trim());
+  const csrf = process.env.INSTAGRAM_CSRF_TOKEN ? process.env.INSTAGRAM_CSRF_TOKEN.trim() : '';
+  const cookieHeader = buildCookieHeader();
+
+  const headers = isJson
+    ? {
+        'User-Agent': DEFAULT_UA,
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+        'X-IG-App-ID': '936619743392459',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Dest': 'empty',
+        Referer: `https://www.instagram.com/${cleanUser}/reels/`,
+      }
+    : {
+        'User-Agent': DEFAULT_UA,
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-User': '?1',
+        Referer: 'https://www.instagram.com/',
+      };
+
+  if (csrf) {
     headers['X-CSRFToken'] = csrf;
   }
-  if (cookies.length > 0) {
-    headers.Cookie = cookies.join('; ');
+  if (cookieHeader) {
+    headers.Cookie = cookieHeader;
   }
 
   return headers;
+}
+
+function hasLoginOrChallengeWall(html, finalUrl) {
+  if (typeof finalUrl === 'string' && /\/accounts\/login|\/challenge/i.test(finalUrl)) {
+    return true;
+  }
+  if (typeof html !== 'string' || !html) return false;
+  return (
+    html.includes('"/accounts/login/"') ||
+    html.includes('auth_platform/recaptcha') ||
+    html.includes('login_and_signup_page')
+  );
 }
 
 /**
@@ -115,7 +155,6 @@ async function fetchFullProfileReels(username, options = {}) {
     );
   }
 
-  // If HTTP got nothing and browser mode is explicitly enabled, try Puppeteer
   if (reelsMap.size === 0 && USE_BROWSER) {
     try {
       const browserReels = await fetchProfileReelsPuppeteer(cleanUsername, {
@@ -132,7 +171,6 @@ async function fetchFullProfileReels(username, options = {}) {
     }
   }
 
-  // In incremental mode, if we already have plenty of these shortcodes in DB, note it cleanly
   if (isIncremental && reelsMap.size > 0 && InstagramReel) {
     try {
       const codes = Array.from(reelsMap.keys()).slice(0, 30);
@@ -168,7 +206,6 @@ async function fetchFullProfileReels(username, options = {}) {
 }
 
 async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
-  const headers = buildHttpHeaders(username);
   const reelsMap = new Map();
 
   const targets = [
@@ -195,10 +232,13 @@ async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
       : []),
   ].slice(0, maxSteps);
 
+  let hitRateLimit = false;
+
   for (let i = 0; i < targets.length; i++) {
     const step = i + 1;
     const target = targets[i];
     const beforeCount = reelsMap.size;
+    const headers = buildHttpHeaders(username, { isJson: target.isJson });
 
     try {
       const res = await axios.get(target.url, {
@@ -209,15 +249,13 @@ async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
       });
 
       const finalUrl = res.request?.res?.responseUrl || target.url;
-      const redirectedToLogin =
-        typeof finalUrl === 'string' && finalUrl.includes('/accounts/login');
 
       if (target.isJson && res.data && typeof res.data === 'object') {
         extractReelsFromJson(res.data, username, reelsMap);
       } else if (typeof res.data === 'string' && res.data.length > 0) {
-        if (redirectedToLogin) {
+        if (hasLoginOrChallengeWall(res.data, finalUrl)) {
           logger.warn(
-            `[FullProfileReelsScraper] Step ${step} (${target.label}) redirected to login for @${username}.`
+            `[FullProfileReelsScraper] Step ${step} (${target.label}) hit login/challenge wall for @${username}.`
           );
         }
         extractReelsFromHtml(res.data, username, reelsMap);
@@ -231,6 +269,7 @@ async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
       );
     } catch (err) {
       const status = err.response?.status || 'ERR';
+      if (status === 429) hitRateLimit = true;
       logger.warn(
         `[FullProfileReelsScraper] Step ${step} (${target.label}) failed [status=${status}] for @${username}: ${err.message}`
       );
@@ -248,9 +287,10 @@ async function fetchProfileReelsHttp(username, { mode, maxSteps, onProgress }) {
       } catch (_) {}
     }
 
-    // Small polite pause between HTTP requests
     if (i < targets.length - 1) {
-      await new Promise((r) => setTimeout(r, 900));
+      const delayMs = hitRateLimit ? 2500 : 1100;
+      hitRateLimit = false;
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 
@@ -385,7 +425,6 @@ function extractEmbeddedJsonReels(html, username, reelsMap) {
       } catch (_) {}
     }
 
-    // Fallback for escaped JSON inside inline scripts
     const escapedCodeRegex = /\\"(?:shortcode|code)\\"\s*:\s*\\"([A-Za-z0-9_-]{6,20})\\"/g;
     let escMatch;
     while ((escMatch = escapedCodeRegex.exec(raw)) !== null) {
@@ -414,7 +453,6 @@ function extractReelsFromJson(obj, username, reelsMap, depth = 0) {
     return;
   }
 
-  // Unwrap Instagram media container if present
   const candidate = obj.media && typeof obj.media === 'object' ? obj.media : obj;
   const rawCode = candidate.shortcode || candidate.code;
 

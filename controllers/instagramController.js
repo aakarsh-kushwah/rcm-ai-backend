@@ -1,7 +1,6 @@
 /**
  * @file instagramController.js
- * @description TiDB-backed admin controller for Instagram accounts & reels.
- * No scraping: reels are added by URL (single or bulk); title/thumbnail are edited manually.
+ * @description TiDB-backed admin controller for Instagram accounts & reels with live sync visibility.
  */
 
 const { InstagramAccount, InstagramReel } = require('../models');
@@ -9,8 +8,17 @@ const { Op } = require('sequelize');
 const { logger } = require('../utils/logger');
 const instagramService = require('../services/instagramService');
 const { cleanInstagramUsername } = require('../utils/instagramSanitizer');
-const { fetchFullProfileReels } = require('../services/fullProfileReelsScraper');
+const { fetchFullProfileReels } = require('./fullProfileReelsScraper');
 
+const BULK_MAX = 25;
+const BULK_ITEM_DELAY_MS = 2500;
+
+// In-memory live sync tracker so Admin UI can show real-time status & clear reasons
+const liveSyncTracker = new Map(); // accountId -> { accountId, username, status, scrapedCount, newReelsCount, totalReels, reason, startedAt, finishedAt }
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function invalidateFeedCache() {
   if (global.invalidateFeedCandidateCache) global.invalidateFeedCandidateCache();
@@ -19,13 +27,29 @@ function invalidateFeedCache() {
 const cleanCategory = (c) => (typeof c === 'string' && c.trim() ? c.trim().slice(0, 50) : 'Motivation');
 const isHttpUrl = (v) => typeof v === 'string' && /^https?:\/\/\S+$/i.test(v.trim());
 
+function setTrackerState(accountId, patch) {
+  const key = String(accountId);
+  const prev = liveSyncTracker.get(key) || {
+    accountId: Number(accountId) || accountId,
+    status: 'idle',
+    scrapedCount: 0,
+    newReelsCount: 0,
+    totalReels: 0,
+    reason: null,
+    startedAt: null,
+    finishedAt: null,
+  };
+  const next = { ...prev, ...patch };
+  liveSyncTracker.set(key, next);
+  return next;
+}
+
 const instagramController = {
   // POST /import  { input|url|link|value, category }
   importReelOrAccount: async (req, res, next) => {
     try {
       const rawInput = req.body.input || req.body.url || req.body.link || req.body.value;
       const category = cleanCategory(req.body.category);
-
       const username = cleanInstagramUsername(rawInput);
 
       if (!username) {
@@ -36,63 +60,72 @@ const instagramController = {
         });
       }
 
-      // 1. Return immediate success response to prevent admin UI timeout
-      res.status(200).json({
-        success: true,
-        message: `Import for @${username} initiated. Reels will be scraped in the background.`,
-        data: { username },
+      const [account, created] = await InstagramAccount.findOrCreate({
+        where: { username },
+        defaults: {
+          username,
+          displayName: username,
+          category,
+          reelsCount: 0,
+          isActive: true,
+          lastSyncedAt: new Date(),
+        },
       });
 
-      // 2. Process account creation/update and scraping in the background
+      if (!created && account.category !== category) {
+        account.category = category;
+        await account.save();
+      }
+
+      setTrackerState(account.id, {
+        accountId: account.id,
+        username,
+        status: 'syncing',
+        scrapedCount: 0,
+        newReelsCount: 0,
+        totalReels: account.reelsCount || 0,
+        reason: 'Scraping reels in background...',
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: `Import for @${username} started. Scraper is running in background.`,
+        data: { id: account.id, username, status: 'syncing' },
+      });
+
       setImmediate(async () => {
         try {
-          let [account, created] = await InstagramAccount.findOrCreate({
-            where: { username },
-            defaults: {
-              username,
-              displayName: username,
-              category,
-              reelsCount: 0, // Initialize reelsCount to 0 for new accounts
-              isActive: true,
-              lastSyncedAt: new Date(),
-            },
-          });
+          const beforeCount = await InstagramReel.count({ where: { accountId: account.id } });
+          const syncResult = await instagramService.syncAccountReels(account.id, username);
+          const afterCount = syncResult.reelsCount ?? (await InstagramReel.count({ where: { accountId: account.id } }));
+          const newAdded = Math.max(0, afterCount - beforeCount);
 
-          if (!created) {
-            // If account exists, update its category if provided
-            if (account.category !== category) {
-              account.category = category;
-              await account.save();
-            }
-          }
-
-          logger.info(`[InstagramController] Background: Initiating full profile reel scrape for @${username} (Account ID: ${account.id})`);
-
-          const scrapedReels = await fetchFullProfileReels(username, {
+          setTrackerState(account.id, {
             accountId: account.id,
-            category: account.category,
-            sessionId: process.env.INSTAGRAM_SESSION_ID,
+            username,
+            status: syncResult.status || (syncResult.scrapedCount > 0 ? 'ok' : 'rate_limited_or_empty'),
+            scrapedCount: syncResult.scrapedCount || 0,
+            newReelsCount: newAdded,
+            totalReels: afterCount,
+            reason: syncResult.reason || null,
+            finishedAt: new Date().toISOString(),
           });
-
-          if (scrapedReels.length > 0) {
-            await InstagramReel.bulkCreate(scrapedReels, {
-              updateOnDuplicate: ['thumbnailUrl', 'updatedAt', 'title', 'url', 'videoUrl', 'creatorHandle', 'category', 'likesCount', 'commentsCount', 'viewCount'],
-            });
-            logger.info(`[InstagramController] Background: Successfully ingested ${scrapedReels.length} reels for @${username}.`);
-          } else {
-            logger.info(`[InstagramController] Background: No new reels found for @${username} during scrape.`);
-          }
-
-          // Update reelsCount and lastSyncedAt after scraping
-          const reelsCount = await InstagramReel.count({ where: { accountId: account.id } });
-          account.reelsCount = reelsCount;
-          account.lastSyncedAt = new Date();
-          await account.save();
 
           invalidateFeedCache();
-          logger.info(`[InstagramController] Background: Completed sync for @${username}. Total reels: ${reelsCount}`);
         } catch (backgroundErr) {
-          logger.error({ err: backgroundErr.message, stack: backgroundErr.stack, username }, '[InstagramController] Background scraping or DB update failed');
+          logger.error(
+            { err: backgroundErr.message, username },
+            '[InstagramController] Background scraping or DB update failed'
+          );
+          setTrackerState(account.id, {
+            accountId: account.id,
+            username,
+            status: 'error',
+            reason: backgroundErr.message,
+            finishedAt: new Date().toISOString(),
+          });
         }
       });
     } catch (err) {
@@ -115,12 +148,15 @@ const instagramController = {
         return res.status(400).json({ success: false, message: `Max ${BULK_MAX} items per request.` });
       }
 
-      // Immediate response for bulk import as well
-      res.status(200).json({ success: true, message: 'Bulk import initiated. Processing in background.' });
+      res.status(200).json({
+        success: true,
+        message: `Bulk import for ${items.length} item(s) started. Running slowly in background to avoid rate limits.`,
+      });
 
       setImmediate(async () => {
         const result = { imported: 0, skipped: 0, accounts: 0, invalid: [] };
-        for (const item of items) {
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
           const username = cleanInstagramUsername(item);
           if (!username) {
             result.invalid.push(item);
@@ -128,7 +164,7 @@ const instagramController = {
           }
 
           try {
-            let [account, created] = await InstagramAccount.findOrCreate({
+            const [account, created] = await InstagramAccount.findOrCreate({
               where: { username },
               defaults: {
                 username,
@@ -140,9 +176,8 @@ const instagramController = {
               },
             });
 
-            if (created) {
-              result.accounts += 1;
-            } else {
+            if (created) result.accounts += 1;
+            else {
               result.skipped += 1;
               if (account.category !== category) {
                 account.category = category;
@@ -150,39 +185,68 @@ const instagramController = {
               }
             }
 
-            logger.info(`[InstagramController] Background Bulk: Initiating full profile reel scrape for @${username} (Account ID: ${account.id})`);
-            const scrapedReels = await fetchFullProfileReels(username, {
+            setTrackerState(account.id, {
               accountId: account.id,
-              category: account.category,
-              sessionId: process.env.INSTAGRAM_SESSION_ID,
+              username,
+              status: 'syncing',
+              scrapedCount: 0,
+              newReelsCount: 0,
+              totalReels: account.reelsCount || 0,
+              reason: `Bulk queue (${i + 1}/${items.length}) running...`,
+              startedAt: new Date().toISOString(),
+              finishedAt: null,
             });
 
-            if (scrapedReels.length > 0) {
-              await InstagramReel.bulkCreate(scrapedReels, {
-                updateOnDuplicate: ['thumbnailUrl', 'updatedAt', 'title', 'url', 'videoUrl', 'creatorHandle', 'category', 'likesCount', 'commentsCount', 'viewCount'],
-              });
-              result.imported += scrapedReels.length; // Count imported reels
-              logger.info(`[InstagramController] Background Bulk: Successfully ingested ${scrapedReels.length} reels for @${username}.`);
-            } else {
-              logger.info(`[InstagramController] Background Bulk: No new reels found for @${username} during scrape.`);
-            }
+            const beforeCount = await InstagramReel.count({ where: { accountId: account.id } });
+            const syncResult = await instagramService.syncAccountReels(account.id, username);
+            const afterCount = syncResult.reelsCount ?? beforeCount;
+            const newAdded = Math.max(0, afterCount - beforeCount);
+            result.imported += newAdded;
 
-            const reelsCount = await InstagramReel.count({ where: { accountId: account.id } });
-            account.reelsCount = reelsCount;
-            account.lastSyncedAt = new Date();
-            await account.save();
-
+            setTrackerState(account.id, {
+              accountId: account.id,
+              username,
+              status: syncResult.status || 'ok',
+              scrapedCount: syncResult.scrapedCount || 0,
+              newReelsCount: newAdded,
+              totalReels: afterCount,
+              reason: syncResult.reason || null,
+              finishedAt: new Date().toISOString(),
+            });
           } catch (itemErr) {
-            logger.error({ err: itemErr.message, stack: itemErr.stack, item }, '[InstagramController] Background Bulk: Error processing item');
-            result.invalid.push(item); // Treat as invalid if background processing fails
+            logger.error({ err: itemErr.message, item }, '[InstagramController] Background Bulk: Error processing item');
+            result.invalid.push(item);
+          }
+
+          if (i < items.length - 1) {
+            await sleep(BULK_ITEM_DELAY_MS);
           }
         }
         invalidateFeedCache();
-        logger.info(`[InstagramController] Background Bulk: Finished processing all items. Result: ${JSON.stringify(result)}`);
+        logger.info(`[InstagramController] Background Bulk finished: ${JSON.stringify(result)}`);
       });
-
     } catch (err) {
       logger.error({ err: err.message }, '[InstagramController] bulkImport error');
+      next(err);
+    }
+  },
+
+  // GET /sync/activity
+  getSyncActivity: async (req, res, next) => {
+    try {
+      const items = Array.from(liveSyncTracker.values()).sort((a, b) => {
+        const ta = new Date(b.startedAt || b.finishedAt || 0).getTime();
+        const tb = new Date(a.startedAt || a.finishedAt || 0).getTime();
+        return ta - tb;
+      });
+      const activeCount = items.filter((x) => x.status === 'syncing').length;
+      return res.status(200).json({
+        success: true,
+        activeCount,
+        isRunning: activeCount > 0,
+        items,
+      });
+    } catch (err) {
       next(err);
     }
   },
@@ -190,10 +254,22 @@ const instagramController = {
   getAccounts: async (req, res, next) => {
     try {
       const accounts = await InstagramAccount.findAll({
-        attributes: ['id', 'username', 'displayName', 'avatarUrl', 'category', 'reelsCount', 'lastSyncedAt', 'isActive', 'createdAt'],
         order: [['createdAt', 'DESC']],
       });
-      return res.status(200).json({ success: true, data: accounts });
+
+      const enriched = accounts.map((acc) => {
+        const plain = acc.toJSON();
+        const live = liveSyncTracker.get(String(plain.id));
+        return {
+          ...plain,
+          syncStatus: live?.status || plain.lastSyncStatus || 'idle',
+          syncReason: live?.reason || plain.lastSyncError || null,
+          lastScrapedCount: live?.scrapedCount ?? null,
+          lastNewReelsCount: live?.newReelsCount ?? null,
+        };
+      });
+
+      return res.status(200).json({ success: true, data: enriched });
     } catch (err) {
       next(err);
     }
@@ -208,8 +284,24 @@ const instagramController = {
 
       const where = {};
       if (req.query.category) where.category = req.query.category;
+      if (req.query.accountId) where.accountId = req.query.accountId;
 
-      const attributes = ['id', 'accountId', 'shortcode', 'url', 'title', 'thumbnailUrl', 'videoUrl', 'creatorHandle', 'category', 'likesCount', 'commentsCount', 'viewCount', 'isActive', 'createdAt'];
+      const attributes = [
+        'id',
+        'accountId',
+        'shortcode',
+        'url',
+        'title',
+        'thumbnailUrl',
+        'videoUrl',
+        'creatorHandle',
+        'category',
+        'likesCount',
+        'commentsCount',
+        'viewCount',
+        'isActive',
+        'createdAt',
+      ];
 
       if (page > 0) {
         const { count, rows } = await InstagramReel.findAndCountAll({
@@ -222,7 +314,13 @@ const instagramController = {
         return res.status(200).json({
           success: true,
           data: rows,
-          pagination: { page, limit, total: count, totalPages: Math.ceil(count / limit) || 1, hasMore: page * limit < count },
+          pagination: {
+            page,
+            limit,
+            total: count,
+            totalPages: Math.ceil(count / limit) || 1,
+            hasMore: page * limit < count,
+          },
         });
       }
 
@@ -276,36 +374,77 @@ const instagramController = {
   syncAccount: async (req, res, next) => {
     try {
       const accountId = req.params.id;
-      const account = await InstagramAccount.findByPk(accountId, { attributes: ['id', 'username'] });
+      const account = await InstagramAccount.findByPk(accountId);
       if (!account) {
         logger.warn(`[InstagramController] 404: Sync request for non-existent account ID: ${accountId}`);
         return res.status(404).json({ success: false, message: 'Instagram account not found.' });
       }
 
-      // 1. Return immediate success response to prevent admin UI timeout
-      res.status(200).json({
-        success: true,
-        message: `Sync for @${account.username} initiated. Reels will be scraped in the background.`,
-        count: 0, // Initial count, will be updated by background process
+      const currentState = liveSyncTracker.get(String(account.id));
+      if (currentState && currentState.status === 'syncing') {
+        return res.status(200).json({
+          success: true,
+          alreadyRunning: true,
+          message: `Sync is already running for @${account.username}.`,
+          data: currentState,
+        });
+      }
+
+      const state = setTrackerState(account.id, {
+        accountId: account.id,
+        username: account.username,
+        status: 'syncing',
+        scrapedCount: 0,
+        newReelsCount: 0,
+        totalReels: account.reelsCount || 0,
+        reason: 'Scraping reels in background...',
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
       });
 
-      // 2. Process account scraping in the background
+      res.status(200).json({
+        success: true,
+        message: `Sync started for @${account.username}.`,
+        data: state,
+      });
+
       setImmediate(async () => {
         try {
-          logger.info(`[InstagramController] Background: Initiating single account sync for @${account.username} (Account ID: ${account.id})`);
+          logger.info(
+            `[InstagramController] Background: Initiating single account sync for @${account.username} (Account ID: ${account.id})`
+          );
+          const beforeCount = await InstagramReel.count({ where: { accountId: account.id } });
           const syncResult = await instagramService.syncAccountReels(account.id, account.username);
-          
-          // After background process completes, update account details and invalidate cache
-          const reelsCount = await InstagramReel.count({ where: { accountId: account.id } });
-          account.reelsCount = reelsCount;
-          account.lastSyncedAt = new Date();
-          await account.save();
+          const afterCount = syncResult.reelsCount ?? (await InstagramReel.count({ where: { accountId: account.id } }));
+          const newAdded = Math.max(0, afterCount - beforeCount);
+
+          setTrackerState(account.id, {
+            accountId: account.id,
+            username: account.username,
+            status: syncResult.status || (syncResult.scrapedCount > 0 ? 'ok' : 'rate_limited_or_empty'),
+            scrapedCount: syncResult.scrapedCount || 0,
+            newReelsCount: newAdded,
+            totalReels: afterCount,
+            reason: syncResult.reason || null,
+            finishedAt: new Date().toISOString(),
+          });
 
           invalidateFeedCache();
-          logger.info(`[InstagramController] Background: Completed single account sync for @${account.username}. Total reels: ${reelsCount}, new reels: ${syncResult.newReelsCount || 0}`);
-          // TODO: Potentially notify admin UI of completion and final count via websocket if needed.
+          logger.info(
+            `[InstagramController] Background: Completed single account sync for @${account.username}. Total reels: ${afterCount}, new reels: ${newAdded}, status=${syncResult.status}`
+          );
         } catch (backgroundErr) {
-          logger.error({ err: backgroundErr.message, stack: backgroundErr.stack, accountId: account.id, username: account.username }, '[InstagramController] Background single account sync failed');
+          logger.error(
+            { err: backgroundErr.message, accountId: account.id, username: account.username },
+            '[InstagramController] Background single account sync failed'
+          );
+          setTrackerState(account.id, {
+            accountId: account.id,
+            username: account.username,
+            status: 'error',
+            reason: backgroundErr.message,
+            finishedAt: new Date().toISOString(),
+          });
         }
       });
     } catch (err) {
@@ -321,7 +460,11 @@ const instagramController = {
       account.isActive = !account.isActive;
       await account.save();
       invalidateFeedCache();
-      return res.status(200).json({ success: true, message: 'Account status toggled successfully', data: { id: account.id, isActive: account.isActive } });
+      return res.status(200).json({
+        success: true,
+        message: 'Account status toggled successfully',
+        data: { id: account.id, isActive: account.isActive },
+      });
     } catch (err) {
       next(err);
     }
@@ -329,6 +472,7 @@ const instagramController = {
 
   deleteAccount: async (req, res, next) => {
     try {
+      liveSyncTracker.delete(String(req.params.id));
       const deleted = await InstagramAccount.destroy({ where: { id: req.params.id } });
       if (!deleted) return res.status(404).json({ success: false, message: 'Instagram account not found.' });
       invalidateFeedCache();
@@ -345,7 +489,11 @@ const instagramController = {
       reel.isActive = !reel.isActive;
       await reel.save();
       invalidateFeedCache();
-      return res.status(200).json({ success: true, message: 'Reel status toggled successfully', data: { id: reel.id, isActive: reel.isActive } });
+      return res.status(200).json({
+        success: true,
+        message: 'Reel status toggled successfully',
+        data: { id: reel.id, isActive: reel.isActive },
+      });
     } catch (err) {
       next(err);
     }
@@ -362,6 +510,5 @@ const instagramController = {
     }
   },
 };
-
 
 module.exports = instagramController;

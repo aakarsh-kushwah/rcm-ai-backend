@@ -1,9 +1,22 @@
 const axios = require('axios');
 const asyncHandler = require('express-async-handler');
 const { Channel, ChannelVideo } = require('../models');
-const { syncChannel, refreshChannelMetadata } = require('../services/channelSyncService');
+const { syncChannel } = require('../services/channelSyncService');
 const logger = require('../utils/logger');
-const { Op } = require('sequelize'); // Import Op for OR conditions
+const { Op } = require('sequelize');
+
+const regularChannelWhere = (extra = {}) => ({
+  ...extra,
+  [Op.and]: [
+    ...(extra[Op.and] || []),
+    {
+      [Op.or]: [{ source: null }, { source: { [Op.ne]: 'shorts-only' } }],
+    },
+    {
+      [Op.or]: [{ isShortsOnly: null }, { isShortsOnly: false }],
+    },
+  ],
+});
 
 /**
  * Helper to parse YouTube input into handle or channel ID
@@ -13,24 +26,21 @@ function parseYouTubeInput(input) {
   const trimmed = input.trim();
   let isShortsOnly = false;
 
-  // If starts with UC... (channel ID)
   if (trimmed.startsWith('UC') && trimmed.length === 24) {
     return { type: 'id', value: trimmed, isShortsOnly: false };
   }
 
-  // If handle like @RCMIndia
   if (trimmed.startsWith('@')) {
     return { type: 'handle', value: trimmed.substring(1), isShortsOnly: false };
   }
 
-  // URL parsing
   try {
     const url = new URL(trimmed);
     let pathname = url.pathname;
 
     if (pathname.includes('/shorts')) {
       isShortsOnly = true;
-      pathname = pathname.replace('/shorts', '').replace(/\/$/, ''); // Remove /shorts and trailing slash
+      pathname = pathname.replace('/shorts', '').replace(/\/$/, '');
     }
 
     if (pathname.startsWith('/@')) {
@@ -44,19 +54,21 @@ function parseYouTubeInput(input) {
     }
 
     if (pathname.startsWith('/c/') || pathname.startsWith('/user/')) {
-      // Custom name / user
       const name = pathname.split('/')[2];
       return { type: 'handle', value: name, isShortsOnly };
     }
   } catch (e) {
-    // Not a valid URL, treat as handle or search term if needed
     if (!trimmed.includes(' ')) {
       const handle = trimmed.startsWith('@') ? trimmed.substring(1) : trimmed;
       return { type: 'handle', value: handle, isShortsOnly: false };
     }
   }
 
-  return { type: 'handle', value: trimmed.startsWith('@') ? trimmed.substring(1) : trimmed, isShortsOnly: false };
+  return {
+    type: 'handle',
+    value: trimmed.startsWith('@') ? trimmed.substring(1) : trimmed,
+    isShortsOnly: false,
+  };
 }
 
 /**
@@ -65,7 +77,7 @@ function parseYouTubeInput(input) {
 function getNextGurukulSchedule() {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
-  const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
+  const utcTime = now.getTime() + now.getTimezoneOffset() * 60 * 1000;
   const istTime = new Date(utcTime + istOffset);
 
   const year = istTime.getFullYear();
@@ -75,9 +87,6 @@ function getNextGurukulSchedule() {
   const minute = istTime.getMinutes();
   const totalMins = hour * 60 + minute;
 
-  // Gurukul is daily at 6:30 AM IST (390 mins). Concludes at 7:30 AM IST (450 mins).
-  // If current IST time is past 7:30 AM IST (> 450 mins), next session is tomorrow 6:30 AM IST.
-  // Otherwise, today 6:30 AM IST.
   const istTargetDate = new Date(Date.UTC(year, month, day, 1, 0, 0, 0)); // 01:00 UTC = 6:30 AM IST
   if (totalMins > 450) {
     istTargetDate.setDate(istTargetDate.getDate() + 1);
@@ -110,7 +119,6 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
   if (parsed.type === 'id') {
     ytUrl += `&id=${parsed.value}`;
   } else {
-    // YouTube Data API channels.list supports forHandle parameter (with or without @)
     ytUrl += `&forHandle=${parsed.value}`;
   }
 
@@ -118,9 +126,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
     const response = await axios.get(ytUrl, { timeout: 10000 });
     const items = response.data.items || [];
 
-    // Fallback: if forHandle failed or yielded 0 items, try searching or querying with username/q if needed, or error
     if (items.length === 0 && parsed.type === 'handle') {
-      // Try search endpoint as fallback for custom names if forHandle doesn't match directly
       const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(
         parsed.value
       )}&key=${apiKey}&maxResults=1`;
@@ -137,7 +143,9 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
     }
 
     if (items.length === 0) {
-      return res.status(404).json({ success: false, message: 'YouTube channel not found. Please check the handle or URL.' });
+      return res
+        .status(404)
+        .json({ success: false, message: 'YouTube channel not found. Please check the handle or URL.' });
     }
 
     const channelData = items[0];
@@ -162,10 +170,12 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
     const viewCount = statistics.viewCount ? parseInt(statistics.viewCount, 10) : 0;
     const joinedDate = snippet.publishedAt ? new Date(snippet.publishedAt) : null;
     const country = snippet.country || null;
-    const itemCount = videoCount; // For consistency, though we're now storing videoCount directly
+    const itemCount = videoCount;
 
     if (!uploadsPlaylistId) {
-      return res.status(400).json({ success: false, message: 'Could not retrieve uploads playlist for this YouTube channel.' });
+      return res
+        .status(400)
+        .json({ success: false, message: 'Could not retrieve uploads playlist for this YouTube channel.' });
     }
 
     res.status(200).json({
@@ -183,7 +193,7 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
         joinedDate,
         country,
         uploadsPlaylistId,
-        itemCount, // Still include for existing frontend logic that might use it
+        itemCount,
         isShortsOnly: parsed.isShortsOnly,
       },
     });
@@ -203,17 +213,32 @@ exports.resolveChannel = asyncHandler(async (req, res) => {
  * @access  Admin
  */
 exports.createChannel = asyncHandler(async (req, res) => {
-  const { youtubeChannelId, handle, name, logoUrl, bannerUrl, description, subscriberCount, videoCount, viewCount, joinedDate, country, uploadsPlaylistId, isShortsOnly = false } = req.body;
+  const {
+    youtubeChannelId,
+    handle,
+    name,
+    logoUrl,
+    bannerUrl,
+    description,
+    subscriberCount,
+    videoCount,
+    viewCount,
+    joinedDate,
+    country,
+    uploadsPlaylistId,
+    isShortsOnly = false,
+  } = req.body;
 
   if (!youtubeChannelId || !name || !uploadsPlaylistId) {
     return res.status(400).json({ success: false, message: 'Missing required channel parameters.' });
   }
 
-  // Check if channel already exists
   let channel = await Channel.findOne({ where: { youtubeChannelId } });
   if (channel) {
     return res.status(400).json({ success: false, message: 'Channel already added to database.' });
   }
+
+  const shortsOnlyFlag = Boolean(isShortsOnly);
 
   channel = await Channel.create({
     youtubeChannelId,
@@ -229,15 +254,14 @@ exports.createChannel = asyncHandler(async (req, res) => {
     country: country || null,
     uploadsPlaylistId,
     isActive: true,
-    source: isShortsOnly ? 'shorts-only' : 'channel',
-    isShortsOnly,
+    source: shortsOnlyFlag ? 'shorts-only' : 'channel',
+    isShortsOnly: shortsOnlyFlag,
   });
 
-  // Immediately trigger initial sync asynchronously without blocking the response
   Promise.resolve().then(async () => {
     try {
-      await syncChannel(channel);
-      logger.info(`Initial sync completed for newly added channel ${channel.name}.`);
+      await syncChannel(channel, { shortsOnly: shortsOnlyFlag });
+      logger.info(`Initial sync completed for newly added channel ${channel.name} (shortsOnly=${shortsOnlyFlag}).`);
     } catch (err) {
       logger.error(`Initial sync failed for newly added channel ${channel.name}: ${err.message}`);
     }
@@ -250,24 +274,21 @@ exports.createChannel = asyncHandler(async (req, res) => {
   });
 });
 
-
-
 /**
- * @desc    Get active channels for public sidebar
+ * @desc    Get active channels for public sidebar (excludes shorts-only channels)
  * @route   GET /api/channels
  * @access  Public
  */
 exports.getChannels = asyncHandler(async (req, res) => {
   const channels = await Channel.findAll({
-    where: { 
-      isActive: true, 
-      source: 'channel', 
-      [Op.or]: [{ isShortsOnly: false }, { isShortsOnly: null }] 
-    }, // Filter by source: 'channel' and exclude shorts-only channels
-    order: [['isPinned', 'DESC'], ['name', 'ASC']],
+    where: regularChannelWhere({ isActive: true }),
+    order: [
+      ['isPinned', 'DESC'],
+      ['name', 'ASC'],
+    ],
   });
 
-  const formattedChannels = channels.map(ch => {
+  const formattedChannels = channels.map((ch) => {
     const json = ch.toJSON();
     return {
       ...json,
@@ -290,10 +311,6 @@ exports.getChannels = asyncHandler(async (req, res) => {
     };
   });
 
-  if (formattedChannels.length > 0) {
-    console.log("Sample Channel API Response:", formattedChannels[0]);
-  }
-
   res.status(200).json({
     success: true,
     count: formattedChannels.length,
@@ -302,12 +319,16 @@ exports.getChannels = asyncHandler(async (req, res) => {
 });
 
 /**
- * @desc    Get all channels for admin management
+ * @desc    Get regular channels for admin channel management (excludes shorts-only channels by default)
  * @route   GET /api/channels/admin/all
  * @access  Admin
  */
 exports.getAdminChannels = asyncHandler(async (req, res) => {
+  const includeShortsOnly =
+    req.query.includeShortsOnly === 'true' || req.query.includeShortsOnly === '1';
+
   const channels = await Channel.findAll({
+    where: includeShortsOnly ? {} : regularChannelWhere(),
     attributes: [
       'id',
       'youtubeChannelId',
@@ -337,7 +358,7 @@ exports.getAdminChannels = asyncHandler(async (req, res) => {
       'lastLiveCheckAt',
       'lastNotifiedVideoId',
       'createdAt',
-      'source', // Include source in admin view
+      'source',
       'isShortsOnly',
       'shortsCount',
     ],
@@ -365,33 +386,36 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
 
   const channel = await Channel.findOne({
     where: {
-      [Op.or]: [
-        ...(isNaN(parsedId) ? [] : [{ id: parsedId }]),
-        { youtubeChannelId: channelParam }
-      ]
-    }
+      [Op.or]: [...(isNaN(parsedId) ? [] : [{ id: parsedId }]), { youtubeChannelId: channelParam }],
+    },
   });
   if (!channel) {
     return res.status(404).json({ success: false, message: 'Channel not found.' });
   }
   const channelId = channel.id;
 
-  // For getChannelVideos(), filter strictly isShort: false (so shorts never show up on channel profile)
   const { count, rows: videos } = await ChannelVideo.findAndCountAll({
     where: {
       channelId,
       isAvailable: true,
       isShort: false,
     },
-    attributes: ['id', 'youtubeVideoId', 'title', 'thumbnailUrl', 'publishedAt', 'isAvailable', 'liveBroadcastContent', 'scheduledStartTime'],
+    attributes: [
+      'id',
+      'youtubeVideoId',
+      'title',
+      'thumbnailUrl',
+      'publishedAt',
+      'isAvailable',
+      'liveBroadcastContent',
+      'scheduledStartTime',
+    ],
     order: [['publishedAt', 'DESC']],
     limit,
     offset,
   });
 
-  // ... (rest of the getChannelVideos method)
-
-  if (channelId == 2) { // RCM World Channel
+  if (channelId == 2) {
     const nextGurukulTime = getNextGurukulSchedule();
     const now = new Date();
 
@@ -405,7 +429,10 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
       }
       if (video.liveBroadcastContent === 'upcoming' && video.scheduledStartTime) {
         const scheduled = new Date(video.scheduledStartTime);
-        if (scheduled.getTime() >= nextGurukulTime.getTime() - 24 * 60 * 60 * 1000 && scheduled.getTime() <= nextGurukulTime.getTime() + 60 * 60 * 1000) {
+        if (
+          scheduled.getTime() >= nextGurukulTime.getTime() - 24 * 60 * 60 * 1000 &&
+          scheduled.getTime() <= nextGurukulTime.getTime() + 60 * 60 * 1000
+        ) {
           actualUpcomingVideo = video;
           break;
         }
@@ -416,10 +443,19 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
 
     if (!actualLiveVideo) {
       const istOffset = 5.5 * 60 * 60 * 1000;
-      const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
+      const utcTime = now.getTime() + now.getTimezoneOffset() * 60 * 1000;
       const currentIstTime = new Date(utcTime + istOffset);
-      
-      const gurukulEndTimeIST = new Date(Date.UTC(nextGurukulTime.getFullYear(), nextGurukulTime.getMonth(), nextGurukulTime.getDate(), 2, 0, 0));
+
+      const gurukulEndTimeIST = new Date(
+        Date.UTC(
+          nextGurukulTime.getFullYear(),
+          nextGurukulTime.getMonth(),
+          nextGurukulTime.getDate(),
+          2,
+          0,
+          0
+        )
+      );
 
       if (currentIstTime < gurukulEndTimeIST) {
         gurukulCard = {
@@ -438,10 +474,10 @@ exports.getChannelVideos = asyncHandler(async (req, res) => {
 
     let finalVideos = [...videos];
     if (actualLiveVideo) {
-      finalVideos = finalVideos.filter(v => v.id !== actualLiveVideo.id);
+      finalVideos = finalVideos.filter((v) => v.id !== actualLiveVideo.id);
       finalVideos.unshift(actualLiveVideo);
     } else if (actualUpcomingVideo) {
-      finalVideos = finalVideos.filter(v => v.id !== actualUpcomingVideo.id);
+      finalVideos = finalVideos.filter((v) => v.id !== actualUpcomingVideo.id);
       finalVideos.unshift(actualUpcomingVideo);
     } else if (gurukulCard) {
       finalVideos.unshift(gurukulCard);
@@ -557,12 +593,15 @@ exports.syncChannelOnDemand = asyncHandler(async (req, res) => {
     return res.status(404).json({ success: false, message: 'Channel not found.' });
   }
 
+  const isShortsOnly = Boolean(channel.isShortsOnly || channel.source === 'shorts-only');
+
   try {
-    const newCount = await syncChannel(channel);
+    const newCount = await syncChannel(channel, { shortsOnly: isShortsOnly });
     res.status(200).json({
       success: true,
       message: `Channel synced successfully. ${newCount} new videos added.`,
       newVideosCount: newCount,
+      shortsOnly: isShortsOnly,
     });
   } catch (err) {
     res.status(500).json({
@@ -584,7 +623,6 @@ exports.deleteChannel = asyncHandler(async (req, res) => {
     return res.status(404).json({ success: false, message: 'Channel not found.' });
   }
 
-  // Delete associated videos first (or cascade delete handles it)
   await ChannelVideo.destroy({ where: { channelId } });
   await channel.destroy();
 
@@ -622,7 +660,20 @@ exports.toggleLiveStatus = asyncHandler(async (req, res) => {
  * @access  Admin
  */
 exports.createShortsOnlyChannel = asyncHandler(async (req, res) => {
-  const { youtubeChannelId, handle, name, logoUrl, bannerUrl, description, subscriberCount, videoCount, viewCount, joinedDate, country, uploadsPlaylistId } = req.body;
+  const {
+    youtubeChannelId,
+    handle,
+    name,
+    logoUrl,
+    bannerUrl,
+    description,
+    subscriberCount,
+    videoCount,
+    viewCount,
+    joinedDate,
+    country,
+    uploadsPlaylistId,
+  } = req.body;
 
   if (!youtubeChannelId || !name || !uploadsPlaylistId) {
     return res.status(400).json({ success: false, message: 'Missing required channel parameters.' });
@@ -651,10 +702,9 @@ exports.createShortsOnlyChannel = asyncHandler(async (req, res) => {
     isShortsOnly: true,
   });
 
-  // Immediately trigger initial sync asynchronously without blocking the response
   Promise.resolve().then(async () => {
     try {
-      await syncChannel(channel);
+      await syncChannel(channel, { shortsOnly: true });
       logger.info(`Initial sync completed for newly added shorts-only channel ${channel.name}.`);
     } catch (err) {
       logger.error(`Initial sync failed for newly added shorts-only channel ${channel.name}: ${err.message}`);
@@ -675,15 +725,13 @@ exports.createShortsOnlyChannel = asyncHandler(async (req, res) => {
  */
 exports.getChannelById = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  console.log("[getChannelById] Request received for param:", id);
-  const whereClause = !isNaN(id) 
+  const whereClause = !isNaN(id)
     ? { [Op.or]: [{ id: parseInt(id, 10) }, { youtubeChannelId: id }] }
     : { youtubeChannelId: id };
 
   const channel = await Channel.findOne({ where: whereClause });
   if (!channel) {
-    console.warn("[getChannelById] Channel not found in DB for:", id);
-    return res.status(404).json({ success: false, message: "Channel not found" });
+    return res.status(404).json({ success: false, message: 'Channel not found' });
   }
   return res.status(200).json({ success: true, channel, data: channel });
 });
@@ -699,11 +747,8 @@ exports.syncChannelShortsNow = asyncHandler(async (req, res) => {
 
   const channel = await Channel.findOne({
     where: {
-      [Op.or]: [
-        ...(isNaN(parsedId) ? [] : [{ id: parsedId }]),
-        { youtubeChannelId: channelParam }
-      ]
-    }
+      [Op.or]: [...(isNaN(parsedId) ? [] : [{ id: parsedId }]), { youtubeChannelId: channelParam }],
+    },
   });
 
   if (!channel) {
@@ -711,7 +756,7 @@ exports.syncChannelShortsNow = asyncHandler(async (req, res) => {
   }
 
   try {
-    const newVideosCount = await syncChannel(channel);
+    const newVideosCount = await syncChannel(channel, { shortsOnly: true });
     const shortsCount = await ChannelVideo.count({ where: { channelId: channel.id, isShort: true } });
     await Channel.update({ shortsCount }, { where: { id: channel.id } });
 
@@ -719,7 +764,7 @@ exports.syncChannelShortsNow = asyncHandler(async (req, res) => {
       success: true,
       count: newVideosCount,
       shortsCount,
-      message: "Channel shorts synced successfully",
+      message: 'Channel shorts synced successfully',
     });
   } catch (err) {
     logger.error(`Failed to sync shorts for channel ${channel.name}: ${err.message}`);
@@ -729,4 +774,3 @@ exports.syncChannelShortsNow = asyncHandler(async (req, res) => {
     });
   }
 });
-

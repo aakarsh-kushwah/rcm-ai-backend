@@ -6,10 +6,21 @@
 const { InstagramAccount, InstagramReel } = require('../models');
 const { logger } = require('../utils/logger');
 const { Op } = require('sequelize');
-const axios = require('axios');
 const { fetchFullProfileReels } = require('./fullProfileReelsScraper');
 
 const userInstagramLikes = new Map(); // userId -> Set of reel ids
+const IG_ACCOUNT_DELAY_MS = parseInt(process.env.IG_ACCOUNT_DELAY_MS || '2500', 10);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function setIfAttributeExists(instance, attr, value) {
+  if (!instance || !instance.rawAttributes) return;
+  if (Object.prototype.hasOwnProperty.call(instance.rawAttributes, attr)) {
+    instance[attr] = value;
+  }
+}
 
 const instagramService = {
   startSyncWorker: (options = {}) => {
@@ -43,7 +54,7 @@ const instagramService = {
       const reels = await InstagramReel.findAll({
         where: {
           isActive: true,
-          videoUrl: { [Op.ne]: null, [Op.ne]: '' }
+          videoUrl: { [Op.ne]: null, [Op.ne]: '' },
         },
         attributes: ['id', 'likesCount'],
         limit,
@@ -72,7 +83,9 @@ const instagramService = {
 
     try {
       const numericIds = igIds
-        .map((id) => (String(id).startsWith('ig_') ? parseInt(String(id).replace('ig_', ''), 10) : parseInt(id, 10)))
+        .map((id) =>
+          String(id).startsWith('ig_') ? parseInt(String(id).replace('ig_', ''), 10) : parseInt(id, 10)
+        )
         .filter((n) => !isNaN(n));
 
       if (numericIds.length === 0) return hydrated;
@@ -81,7 +94,7 @@ const instagramService = {
         where: {
           id: { [Op.in]: numericIds },
           isActive: true,
-          videoUrl: { [Op.ne]: null, [Op.ne]: '' }
+          videoUrl: { [Op.ne]: null, [Op.ne]: '' },
         },
         include: [{ model: InstagramAccount, as: 'account', required: false }],
       });
@@ -110,7 +123,9 @@ const instagramService = {
             id: account.id ? String(account.id) : 'ig_manual',
             name: account.displayName || account.username || 'Instagram Creator',
             handle: account.username || 'instagram',
-            logoUrl: account.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&q=80',
+            logoUrl:
+              account.avatarUrl ||
+              'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&q=80',
             verified: true,
           },
         });
@@ -147,7 +162,7 @@ const instagramService = {
       userInstagramLikes.set(uKey, new Set());
     }
     const userLikes = userInstagramLikes.get(uKey);
-    
+
     const numericId = parseInt(String(id).replace('ig_', ''), 10);
     const reel = await InstagramReel.findByPk(numericId);
     if (!reel) throw new Error('Instagram reel not found.');
@@ -174,23 +189,38 @@ const instagramService = {
   },
 
   syncAccountReels: async (accountId, username) => {
+    let account = null;
     try {
       logger.info(`[InstagramService] Starting sync for account ID ${accountId} (@${username})...`);
-      const account = await InstagramAccount.findByPk(accountId);
+      account = await InstagramAccount.findByPk(accountId);
       if (!account) {
         throw new Error(`Instagram account ${accountId} not found.`);
       }
 
-      const cleanUsername = String(username || account.username || '').replace(/^@/, '').trim();
-      let scrapedReels = [];
-
-      try {
-        scrapedReels = await fetchFullProfileReels(cleanUsername, { accountId: account.id, category: account.category || 'Motivation' });
-      } catch (scrapeErr) {
-        logger.warn(`[InstagramService] Fetch full profile reels warning for @${cleanUsername}: ${scrapeErr.message}`);
+      setIfAttributeExists(account, 'lastSyncStatus', 'syncing');
+      setIfAttributeExists(account, 'lastSyncError', null);
+      if (account.changed()) {
+        await account.save();
       }
 
-      const reelsToIngest = scrapedReels.map(reel => ({
+      const cleanUsername = String(username || account.username || '').replace(/^@/, '').trim();
+      let scrapedReels = [];
+      let scrapeErrorMessage = null;
+
+      try {
+        scrapedReels = await fetchFullProfileReels(cleanUsername, {
+          accountId: account.id,
+          category: account.category || 'Motivation',
+          mode: 'full',
+        });
+      } catch (scrapeErr) {
+        scrapeErrorMessage = scrapeErr.message;
+        logger.warn(
+          `[InstagramService] Fetch full profile reels warning for @${cleanUsername}: ${scrapeErr.message}`
+        );
+      }
+
+      const reelsToIngest = scrapedReels.map((reel) => ({
         accountId: account.id,
         shortcode: reel.shortcode,
         url: reel.url,
@@ -209,25 +239,78 @@ const instagramService = {
       }
 
       const reelsCount = await InstagramReel.count({ where: { accountId: account.id } });
+      const status =
+        reelsToIngest.length > 0
+          ? 'ok'
+          : scrapeErrorMessage
+          ? 'warning'
+          : 'rate_limited_or_empty';
+
+      const reason =
+        reelsToIngest.length > 0
+          ? null
+          : scrapeErrorMessage ||
+            '0 reels returned by Instagram HTTP scraper (likely 429 rate-limit or login gate; existing reels kept).';
+
       account.reelsCount = reelsCount;
       account.lastSyncedAt = new Date();
+      setIfAttributeExists(account, 'lastSyncStatus', status);
+      setIfAttributeExists(account, 'lastSyncError', reason);
       await account.save();
 
       if (typeof global.invalidateFeedCandidateCache === 'function') {
         global.invalidateFeedCandidateCache();
       }
 
-      logger.info(`[InstagramService] Synced @${cleanUsername}: ${reelsToIngest.length} scraped, total account reels: ${reelsCount}`);
+      logger.info(
+        `[InstagramService] Synced @${cleanUsername}: ${reelsToIngest.length} scraped, total account reels: ${reelsCount}, status=${status}`
+      );
+
       return {
         success: true,
+        status,
+        reason,
         scrapedCount: reelsToIngest.length,
         reelsCount,
         lastSyncedAt: account.lastSyncedAt,
       };
     } catch (err) {
-      logger.error({ err: err.message }, `[InstagramService] syncAccountReels failed for accountId ${accountId}`);
+      logger.error(
+        { err: err.message },
+        `[InstagramService] syncAccountReels failed for accountId ${accountId}`
+      );
+      if (account) {
+        try {
+          setIfAttributeExists(account, 'lastSyncStatus', 'error');
+          setIfAttributeExists(account, 'lastSyncError', String(err.message).slice(0, 500));
+          await account.save();
+        } catch (_) {}
+      }
       throw err;
     }
+  },
+
+  syncAccountsSequentially: async (accounts = []) => {
+    const results = [];
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i];
+      try {
+        const res = await instagramService.syncAccountReels(acc.id, acc.username);
+        results.push({ accountId: acc.id, username: acc.username, ...res });
+      } catch (err) {
+        results.push({
+          accountId: acc.id,
+          username: acc.username,
+          success: false,
+          status: 'error',
+          reason: err.message,
+        });
+      }
+      if (i < accounts.length - 1 && IG_ACCOUNT_DELAY_MS > 0) {
+        await sleep(IG_ACCOUNT_DELAY_MS);
+      }
+    }
+    return results;
   },
 };
 

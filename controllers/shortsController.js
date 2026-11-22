@@ -1,22 +1,5 @@
 /**
  * shortsController.js  (Production-Hardened, Strict Short/Long Separation)
- *
- * Guarantees:
- *  - A video is a "Short" ONLY IF isShort = true AND 0 < totalSeconds <= 180.
- *  - Feed requests are served from a creator-interleaved candidate pool
- *    (YouTube Shorts + verified Instagram Reels, 2 YT : 1 IG) held in process memory (L1)
- *    and in Redis `shorts:feed:pool` (L2). Rebuilt in the background, one process at a time.
- *  - Instagram candidates come straight from InstagramReel joined with InstagramAccount
- *    (authentic profile picture, full name, verified flag). Seeded / mock reels and reels
- *    without a valid direct video URL are NEVER served, so there are no black screens.
- *  - /api/shorts/ig-stream/:shortcode is a 302 redirect engine:
- *    memory -> Redis (`ig:stream:<shortcode>`) -> DB -> live scrape capped at 600 ms ->
- *    404 { error: 'Stream unavailable' }. It never hangs, never proxies video bytes and
- *    never redirects to an Instagram web page.
- *  - /api/shorts/seen answers { ok: true } immediately; DB work runs from a bounded queue.
- *  - Atomic like/comment counters inside transactions.
- *  - SQL is written for MySQL / TiDB (backticks, ON DUPLICATE KEY UPDATE); a PostgreSQL
- *    branch is kept for the seen-history upsert so either dialect works.
  */
 
 const asyncHandler = require('express-async-handler');
@@ -52,7 +35,6 @@ const USER_ATTRS = ['id', 'fullName', 'avatar'];
 const IMPORT_PAYLOAD_KEYS = ['videoUrl', 'url', 'shortUrl', 'link', 'videoId'];
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-/** Candidate pool: the interleaved YouTube + Instagram list every feed request is served from. */
 const POOL = {
   redisKey: 'shorts:feed:pool',
   redisStaleKey: 'shorts:feed:pool:stale',
@@ -74,10 +56,9 @@ const POOL = {
   maxScanChunks: 4,
   seenTimeoutMs: 250,
   historyWaitMs: 300,
-  ytPerIg: 2, // 2 YouTube Shorts : 1 Instagram Reel
+  ytPerIg: 2,
 };
 
-/** Instagram stream redirect engine. */
 const IG_STREAM = {
   l1Max: 20000,
   ttlMs: 4 * 60 * 60 * 1000,
@@ -87,8 +68,8 @@ const IG_STREAM = {
   missTtlMs: 60 * 1000,
   missTtlSec: 60,
   redisTimeoutMs: 150,
-  lookupBudgetMs: 400, // Redis + DB together
-  scrapeTimeoutMs: 600, // HARD cap on any live scrape
+  lookupBudgetMs: 400,
+  scrapeTimeoutMs: 600,
   scrapeMaxConcurrent: 6,
   breakerFailures: 8,
   breakerOpenMs: 60 * 1000,
@@ -97,13 +78,11 @@ const IG_STREAM = {
 const IG_MEDIA_HOST_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
 const SHORTCODE_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
-/** Seeded dummy shortcodes look like C2m3n4b5v6c / C5h6j7k8l9z (letter,digit alternating). */
 const MOCK_SHORTCODE_RE = /^(?:[A-Za-z]\d){5}[A-Za-z]$/;
 const MOCK_SHORTCODE_PREFIXES = ['C2m3n', 'C5f6', 'C5h6j'];
 const isMockShortcode = (code) =>
   !code || MOCK_SHORTCODE_RE.test(code) || MOCK_SHORTCODE_PREFIXES.some((p) => String(code).startsWith(p));
 
-/** Background queue for /seen analytics. */
 const SEEN_QUEUE = {
   maxEventsPerBatch: 50,
   queueMax: 5000,
@@ -208,7 +187,6 @@ async function cached(key, ttl, loader) {
   return refresh(key, ttl, loader);
 }
 
-/** Admin changes call this: clears the read caches and schedules a candidate pool rebuild. */
 const invalidateFeedCache = () => {
   cache.clear();
   invalidateCandidatePool();
@@ -236,7 +214,11 @@ function durationToSeconds(iso) {
   try {
     const d = parse(iso);
     return Math.floor(
-      (d.weeks || 0) * 604800 + (d.days || 0) * 86400 + (d.hours || 0) * 3600 + (d.minutes || 0) * 60 + (d.seconds || 0)
+      (d.weeks || 0) * 604800 +
+        (d.days || 0) * 86400 +
+        (d.hours || 0) * 3600 +
+        (d.minutes || 0) * 60 +
+        (d.seconds || 0)
     );
   } catch (e) {
     log.warn(`could not parse duration "${iso}": ${e.message}`);
@@ -254,7 +236,6 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-/** FNV-1a 32-bit: a cheap, stable hash used to give every viewer a different starting point. */
 function hashString(str) {
   let h = 0x811c9dc5;
   for (let i = 0; i < str.length; i += 1) {
@@ -272,11 +253,18 @@ function firstPresent(...values) {
   return undefined;
 }
 
-/** Stable creator identity for YouTube channels and Instagram accounts (null when unknown). */
 function creatorKeyOf(row) {
   if (!row) return null;
   const ch = row.channel && typeof row.channel === 'object' ? row.channel : {};
-  const raw = firstPresent(row.channelId, row.accountId, row.creatorHandle, row.username, row.ownerUsername, ch.id, ch.handle);
+  const raw = firstPresent(
+    row.channelId,
+    row.accountId,
+    row.creatorHandle,
+    row.username,
+    row.ownerUsername,
+    ch.id,
+    ch.handle
+  );
   return raw === undefined ? null : String(raw);
 }
 
@@ -297,7 +285,6 @@ function safeRequire(path) {
   }
 }
 
-/** Only the attributes a model really has (the admin schema differs between deployments). */
 const existingAttrs = (Model, names) =>
   Model && Model.rawAttributes ? names.filter((n) => Boolean(Model.rawAttributes[n])) : [];
 
@@ -305,7 +292,6 @@ const existingAttrs = (Model, names) =>
 /* Cursor helpers                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** Keyset cursor used by the per-channel feed. */
 function encodeCursor(row, lastChannelId) {
   const payload = {
     d: new Date(row.publishedAt).toISOString(),
@@ -342,7 +328,6 @@ function decodeCursor(raw) {
   }
 }
 
-/** Stateless position cursor used by the global feed: v = pool version, o = next offset, a = last served id. */
 function encodePoolCursor({ v, o, a }) {
   return Buffer.from(JSON.stringify({ k: 'p', v, o, a })).toString('base64url');
 }
@@ -393,7 +378,6 @@ const feedWhere = (channelId) => {
   return where;
 };
 
-/** Marks which rows the viewer liked. A failing likes lookup degrades to "not liked", never to a failed feed. */
 async function attachLikes(rows, userId) {
   const liked = new Set();
   if (userId && rows.length > 0) {
@@ -567,23 +551,17 @@ exports.getShortsByChannel = asyncHandler(async (req, res) => {
 
 /* -------------------------------------------------------------------------- */
 /* Instagram stream engine: GET /api/shorts/ig-stream/:shortcode              */
-/*                                                                            */
-/* 302 redirect to the Instagram CDN MP4. Resolution order:                   */
-/*   memory (0 ms) -> Redis `ig:stream:<shortcode>` -> DB -> live scrape      */
-/*   (hard 600 ms) -> 404 { error: 'Stream unavailable' }                     */
-/* Video bytes never pass through Node.                                       */
 /* -------------------------------------------------------------------------- */
 
 const igStream = {
-  hits: new Map(), // shortcode -> { url, exp }
-  misses: new Map(), // shortcode -> expiry (negative cache)
-  inflight: new Map(), // shortcode -> Promise (request coalescing)
+  hits: new Map(),
+  misses: new Map(),
+  inflight: new Map(),
   activeScrapes: 0,
   breaker: { fails: 0, openUntil: 0 },
 };
 
 function setStreamCorsHeaders(res) {
-  // Stops Chrome's NotSameOrigin blocking of the 302 hop to the CDN.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
@@ -591,10 +569,6 @@ function setStreamCorsHeaders(res) {
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
 }
 
-/**
- * Accepts only https media URLs on the Instagram/Facebook CDN (or a plain .mp4) and never an
- * Instagram web page. Reads the CDN's own expiry (`oe`) so an expiring link is never cached longer than it lives.
- */
 function evaluateMediaUrl(raw) {
   if (typeof raw !== 'string' || raw.length === 0 || raw.length > 4096) return null;
   let u;
@@ -656,16 +630,13 @@ function getInstagramAccountModel() {
   return models.InstagramAccount || safeRequire('../models/InstagramAccount');
 }
 
-/** Redis + database persistence of a freshly resolved URL. Always runs off the request path. */
 function persistStreamUrl(shortcode, url, ttlMs) {
   setImmediate(async () => {
     const redis = safeRedis();
     if (redis) {
       try {
         await redis.set(`ig:stream:${shortcode}`, url, 'EX', Math.max(60, Math.floor(ttlMs / 1000)));
-      } catch (_) {
-        /* cache only */
-      }
+      } catch (_) {}
     }
     try {
       const Reel = getInstagramReelModel();
@@ -682,9 +653,7 @@ function persistStreamMiss(shortcode) {
     if (!redis) return;
     try {
       await redis.set(`ig:stream:miss:${shortcode}`, '1', 'EX', IG_STREAM.missTtlSec);
-    } catch (_) {
-      /* cache only */
-    }
+    } catch (_) {}
   });
 }
 
@@ -719,7 +688,6 @@ function scraperFailed() {
   }
 }
 
-/** One live lookup, hard-capped at IG_STREAM.scrapeTimeoutMs (600 ms). Returns { url, transient }. */
 async function scrapeInstagramVideoUrl(shortcode) {
   const sessionId = process.env.INSTAGRAM_SESSION_ID;
   const headers = {
@@ -747,7 +715,12 @@ async function scrapeInstagramVideoUrl(shortcode) {
 
     const data = response.data;
     let rawUrl =
-      (data && data.items && data.items[0] && data.items[0].video_versions && data.items[0].video_versions[0] && data.items[0].video_versions[0].url) ||
+      (data &&
+        data.items &&
+        data.items[0] &&
+        data.items[0].video_versions &&
+        data.items[0].video_versions[0] &&
+        data.items[0].video_versions[0].url) ||
       (data && data.graphql && data.graphql.shortcode_media && data.graphql.shortcode_media.video_url) ||
       null;
 
@@ -768,7 +741,6 @@ async function scrapeInstagramVideoUrl(shortcode) {
   }
 }
 
-/** Redis -> database lookup (budgeted). Returns { url, ttlMs } | { url: null, missed? }. */
 async function lookupStreamUrl(shortcode) {
   const redis = safeRedis();
   if (redis) {
@@ -783,9 +755,7 @@ async function lookupStreamUrl(shortcode) {
         }
       }
       if (hit.missed) return { url: null, missed: true };
-    } catch (_) {
-      /* Redis slow or down: continue with the database */
-    }
+    } catch (_) {}
   }
 
   try {
@@ -805,7 +775,6 @@ async function lookupStreamUrl(shortcode) {
   return { url: null };
 }
 
-/** Live scrape fallback: concurrency-limited, circuit-broken and capped at 600 ms. */
 async function scrapeWithBudget(shortcode) {
   if (scraperBreakerOpen() || igStream.activeScrapes >= IG_STREAM.scrapeMaxConcurrent) return { url: null };
   igStream.activeScrapes += 1;
@@ -841,7 +810,6 @@ async function doResolveStream(shortcode) {
     return { url: null };
   }
 
-  // Cache and DB had nothing usable: one hard-capped live attempt, then give up.
   const scraped = await scrapeWithBudget(shortcode);
   if (scraped.url) return scraped;
 
@@ -850,7 +818,6 @@ async function doResolveStream(shortcode) {
   return { url: null };
 }
 
-/** Many players asking for the same reel trigger exactly one resolution. */
 function resolveInstagramStream(shortcode) {
   if (igStream.inflight.has(shortcode)) return igStream.inflight.get(shortcode);
   const p = doResolveStream(shortcode).finally(() => {
@@ -873,13 +840,8 @@ function streamUnavailable(res) {
   return res.status(404).json({ error: 'Stream unavailable' });
 }
 
-/**
- * GET /api/shorts/ig-stream/:shortcode
- * Always answers with either a 302 to the CDN MP4 or a clean 404 JSON. Never an HTML page,
- * never a redirect to instagram.com, never a hanging socket.
- */
 exports.getInstagramStream = async (req, res) => {
-  setStreamCorsHeaders(res); // first thing: headers must be on every response, including errors
+  setStreamCorsHeaders(res);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   try {
@@ -890,7 +852,6 @@ exports.getInstagramStream = async (req, res) => {
       return streamUnavailable(res);
     }
 
-    // Hot path: in-process cache, no I/O at all.
     const hot = streamCacheGet(shortcode);
     if (hot) return redirectToMedia(res, hot.url, hot.ttlMs);
     if (streamIsMissed(shortcode)) return streamUnavailable(res);
@@ -905,11 +866,6 @@ exports.getInstagramStream = async (req, res) => {
   }
 };
 
-/**
- * POST /api/shorts/:id/unavailable
- * Public endpoint, so it never mutates video records. For Instagram reels it drops the cached
- * stream URL so the next request resolves a fresh one.
- */
 exports.reportUnavailable = (req, res) => {
   res.status(200).json({ success: true });
 
@@ -1103,6 +1059,9 @@ exports.adminToggleChannelShortsOnly = asyncHandler(async (req, res) => {
 
   const { promoted, demoted, shortsCount } = await ChannelVideo.sequelize.transaction(async (transaction) => {
     channel.isShortsOnly = !channel.isShortsOnly;
+    if (Channel.rawAttributes.source) {
+      channel.source = channel.isShortsOnly ? 'shorts-only' : 'channel';
+    }
     await channel.save({ transaction });
 
     const result = await reconcileChannelShorts(channelId, { promote: true, transaction });
@@ -1315,15 +1274,32 @@ function channelPayloadFromYouTube(chData, { shortsOnly = false } = {}) {
   };
 }
 
+async function applyShortsOnlyMode(channel, shortsOnly) {
+  if (!shortsOnly || !channel) return channel;
+  let dirty = false;
+  if (Channel.rawAttributes && Channel.rawAttributes.isShortsOnly && !channel.isShortsOnly) {
+    channel.isShortsOnly = true;
+    dirty = true;
+  }
+  if (Channel.rawAttributes && Channel.rawAttributes.source && channel.source !== 'shorts-only') {
+    channel.source = 'shorts-only';
+    dirty = true;
+  }
+  if (dirty) await channel.save();
+  return channel;
+}
+
 async function findOrCreateChannelFromYouTubeData(chData, opts) {
   const existing = await Channel.findOne({ where: { youtubeChannelId: chData.id } });
-  if (existing) return existing;
+  if (existing) {
+    return applyShortsOnlyMode(existing, Boolean(opts && opts.shortsOnly));
+  }
   try {
     return await Channel.create(channelPayloadFromYouTube(chData, opts));
   } catch (err) {
     if (err.name === 'SequelizeUniqueConstraintError') {
       const again = await Channel.findOne({ where: { youtubeChannelId: chData.id } });
-      if (again) return again;
+      if (again) return applyShortsOnlyMode(again, Boolean(opts && opts.shortsOnly));
     }
     throw err;
   }
@@ -1344,7 +1320,8 @@ function findChannelInDb(detected) {
 
 const importLocks = new Set();
 
-async function importChannel(detected) {
+async function importChannel(detected, forceShortsOnly = false) {
+  const effectiveShortsOnly = Boolean(detected.shortsOnly || forceShortsOnly);
   const lockKey = `${detected.kind}:${String(detected.value).toLowerCase()}`;
   if (importLocks.has(lockKey)) {
     throw new HttpError(409, 'This channel is already being imported. Please wait.');
@@ -1358,11 +1335,23 @@ async function importChannel(detected) {
       log.info(`import: channel not in DB, fetching from YouTube: ${detected.value}`);
       const chData = await fetchChannelFromYouTube(detected);
       if (!chData) throw new HttpError(404, 'Channel not found on YouTube.');
-      channel = await findOrCreateChannelFromYouTubeData(chData, { shortsOnly: detected.shortsOnly });
+      channel = await findOrCreateChannelFromYouTubeData(chData, { shortsOnly: effectiveShortsOnly });
+    } else if (effectiveShortsOnly) {
+      channel = await applyShortsOnlyMode(channel, true);
     }
 
-    log.info(`import: syncing channel "${channel.name}" (id=${channel.id})`);
-    const newShortsCount = await syncChannel(channel, { skipAlerts: true, maxPages: IMPORT_MAX_PAGES });
+    const isShortsOnlyChannel = Boolean(
+      effectiveShortsOnly || channel.isShortsOnly || channel.source === 'shorts-only'
+    );
+
+    log.info(
+      `import: syncing channel "${channel.name}" (id=${channel.id}, shortsOnly=${isShortsOnlyChannel})`
+    );
+    const newShortsCount = await syncChannel(channel, {
+      skipAlerts: true,
+      maxPages: IMPORT_MAX_PAGES,
+      shortsOnly: isShortsOnlyChannel,
+    });
 
     const { demoted } = await reconcileChannelShorts(channel.id, { promote: false });
     if (demoted > 0) log.warn(`import: demoted ${demoted} non-short videos for channel ${channel.id}`);
@@ -1371,8 +1360,16 @@ async function importChannel(detected) {
     invalidateFeedCache();
 
     return {
-      message: `Channel "${channel.name}" synced. Added ${newShortsCount} new videos.`,
-      data: { channelId: channel.id, name: channel.name, newShortsCount, shortsCount },
+      message: isShortsOnlyChannel
+        ? `Shorts-only channel "${channel.name}" synced. Added ${newShortsCount} new shorts.`
+        : `Channel "${channel.name}" synced. Added ${newShortsCount} new videos.`,
+      data: {
+        channelId: channel.id,
+        name: channel.name,
+        shortsOnly: isShortsOnlyChannel,
+        newShortsCount,
+        shortsCount,
+      },
     };
   } finally {
     importLocks.delete(lockKey);
@@ -1435,10 +1432,6 @@ async function importVideo(videoId, force) {
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* Import: endpoint POST /api/admin/shorts/import-single                      */
-/* -------------------------------------------------------------------------- */
-
 function mapImportError(err) {
   if (err instanceof HttpError) return { status: err.status, message: err.message };
 
@@ -1480,9 +1473,16 @@ exports.adminImportSingleShort = asyncHandler(async (req, res) => {
 
     const body = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body : {};
     const force = body.force === true || body.force === 'true';
+    const forceShortsOnly =
+      body.shortsOnly === true ||
+      body.shortsOnly === 'true' ||
+      req.query.shortsOnly === 'true' ||
+      req.query.shortsOnly === '1';
 
     const result =
-      detected.type === 'channel' ? await importChannel(detected) : await importVideo(detected.value, force);
+      detected.type === 'channel'
+        ? await importChannel(detected, forceShortsOnly)
+        : await importVideo(detected.value, force);
 
     return res.status(200).json({ success: true, ...result });
   } catch (err) {
@@ -1534,7 +1534,6 @@ const RK = {
   viewDead: `${RP}viewqueue:dead`,
 };
 
-/* ---------------------- durable seen history (SQL) -------------------------- */
 const sequelize = ChannelVideo.sequelize;
 const UserSeenVideo =
   sequelize.models.UserSeenVideo ||
@@ -1560,14 +1559,10 @@ const UserSeenVideo =
     }
   );
 
-/** The durable table only holds YouTube (numeric) video ids; Instagram ids stay in Redis. */
 const isPersistableVideoId = (id) => /^\d+$/.test(String(id));
 
-/** Quoted physical column name of a UserSeenVideo attribute (honours underscored models). */
 const seenCol = (attr) =>
   sequelize.getQueryInterface().queryGenerator.quoteIdentifier(UserSeenVideo.rawAttributes[attr].field || attr);
-
-/* --------------------------------- Redis ------------------------------------ */
 
 const POP_BATCH_LUA = `
 local n = tonumber(ARGV[1])
@@ -1581,7 +1576,6 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 `;
 
-// `let`: stopFeedWorkers() clears it on shutdown.
 let { connection: redisClient } = require('../config/redis');
 let redisCustomCommandsRegistered = false;
 
@@ -1600,7 +1594,6 @@ function getRedis() {
   return redisClient;
 }
 
-/** Redis is an accelerator, never a dependency: a missing or broken client yields null. */
 function safeRedis() {
   try {
     const client = getRedis();
@@ -1627,8 +1620,6 @@ function resolveViewer(req) {
 }
 
 const viewerTtl = (viewer) => (viewer.userId ? NF.history.ttlSec : NF.history.anonTtlSec);
-
-/* ------------------------ seen history (never-repeat) ----------------------- */
 
 const historyLoading = new Map();
 
@@ -1666,7 +1657,6 @@ async function loadHistoryFromDb(viewer) {
     assertPipeline(await pipe.exec());
     if (rows.length > 0) log.info(`restored ${rows.length} seen ids for ${viewer.key} from the database`);
   } catch (err) {
-    // Do not retry on every request while the history table is unavailable.
     try {
       await redis.set(RK.loaded(viewer.key), '1', 'EX', 60);
     } catch (_) {}
@@ -1674,7 +1664,6 @@ async function loadHistoryFromDb(viewer) {
   }
 }
 
-/** Which of these ids has the viewer already seen? Fails open: on any problem nothing is filtered. */
 async function getSeenSet(viewer, ids) {
   const seen = new Set();
   if (!viewer || ids.length === 0) return seen;
@@ -1720,7 +1709,6 @@ async function recordSeenIds(viewer, ids) {
   assertPipeline(await pipe.exec());
 }
 
-/** The viewer has seen (almost) everything: keep only the newest slice so the feed starts a fresh cycle. */
 async function trimSeenHistory(viewer, poolSize) {
   const redis = safeRedis();
   if (!redis || !viewer) return;
@@ -1789,8 +1777,6 @@ async function isTrackRateLimited(viewer) {
   }
 }
 
-/* --------------------- batched view persistence (Redis -> SQL) --------------- */
-
 const localViewBuffer = [];
 let flushing = false;
 let flushFailures = 0;
@@ -1847,7 +1833,6 @@ function aggregateViews(items) {
   return Array.from(map.values());
 }
 
-/** Bulk upsert of seen rows. MySQL / TiDB: ON DUPLICATE KEY UPDATE. PostgreSQL: ON CONFLICT. */
 async function upsertSeenRows(rows) {
   if (rows.length === 0) return;
   await seenTableReady;
@@ -1957,16 +1942,10 @@ async function flushViewEvents() {
   return persisted;
 }
 
-/* ----------------------- ranked catalog (engagement x freshness) ------------- */
-
 const cvHas = (a) => Boolean(ChannelVideo.rawAttributes[a]);
 const cvCol = (a) => `\`${ChannelVideo.name}\`.\`${ChannelVideo.rawAttributes[a].field || a}\``;
 const cvNum = (a) => (cvHas(a) ? `COALESCE(${cvCol(a)}, 0)` : '0');
 
-/**
- * TiDB / MySQL ranking expression (engagement x freshness):
- * ((LN(1 + likes*3 + comments*5 + views*0.02) + 1.0) * (0.15 + 0.85 * POW(0.5, GREATEST(age_hours, 0) / 72)))
- */
 const cvPublished = cvHas('createdAt')
   ? `COALESCE(\`ChannelVideo\`.\`published_at\`, \`ChannelVideo\`.\`created_at\`, NOW())`
   : `COALESCE(\`ChannelVideo\`.\`published_at\`, NOW())`;
@@ -2013,7 +1992,6 @@ async function rebuildCatalog() {
       if (rows.length < c.batchSize) break;
     }
 
-    // Instagram reels are added once per rebuild (not once per YouTube batch).
     try {
       const igReels = await instagramService.getCatalogBatch({ limit: c.batchSize });
       if (Array.isArray(igReels) && igReels.length > 0) {
@@ -2049,8 +2027,6 @@ async function removeFromCatalog(ids) {
   }
 }
 
-/* --------------------------------- diversity -------------------------------- */
-
 const categoryOf = (row) => row.category || (row.channel && row.channel.category) || null;
 
 function diversifyFeed(rows, limit, lastChannelId = null, lastCategory = null) {
@@ -2084,11 +2060,7 @@ function diversifyFeed(rows, limit, lastChannelId = null, lastCategory = null) {
   return out;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Candidate pool: interleaved YouTube + Instagram list (Redis `shorts:feed:pool`) */
-/* -------------------------------------------------------------------------- */
-
-let poolL1 = null; // { version, builtAt, partial, rows, index }
+let poolL1 = null;
 let poolInflight = null;
 let poolRetryAt = 0;
 let poolDirty = false;
@@ -2107,16 +2079,25 @@ function setPool(payload) {
   return poolL1;
 }
 
-const IG_VIDEO_KEYS = ['videoUrl', 'directVideo', 'direct_video', 'directVideoUrl', 'direct_video_url', 'video_url', 'mediaUrl', 'media_url', 'playbackUrl', 'playback_url'];
+const IG_VIDEO_KEYS = [
+  'videoUrl',
+  'directVideo',
+  'direct_video',
+  'directVideoUrl',
+  'direct_video_url',
+  'video_url',
+  'mediaUrl',
+  'media_url',
+  'playbackUrl',
+  'playback_url',
+];
 
-/** Instagram rows go to the client without raw CDN links: playback always uses the 302 endpoint. */
 function toClientInstagramRow(row) {
   const out = { ...row };
   const derivedCode = String(out.id).replace(/^ig_/, '');
   const shortcode = String(out.shortcode || (SHORTCODE_RE.test(derivedCode) ? derivedCode : '') || '');
   if (shortcode) out.shortcode = shortcode;
 
-  // Pre-warm the in-process stream cache so the first plays need no I/O.
   const ev = evaluateMediaUrl(firstPresent(...IG_VIDEO_KEYS.map((k) => out[k])));
   if (ev && shortcode && SHORTCODE_RE.test(shortcode)) streamCacheSet(shortcode, ev.url, ev.ttlMs);
 
@@ -2154,7 +2135,6 @@ async function loadYoutubeCandidates() {
   return { rows: out, scores };
 }
 
-/** Same engagement x freshness formula as the SQL, evaluated in JS for Instagram rows. */
 function instagramScore({ likes, comments, views, publishedAt }) {
   const { wLike, wComment, wView, halfLifeHours, floor } = NF.ranking;
   const engagement = Math.log(1 + likes * wLike + comments * wComment + views * wView) + 1.0;
@@ -2163,14 +2143,6 @@ function instagramScore({ likes, comments, views, publishedAt }) {
   return engagement * (floor + (1 - floor) * Math.pow(0.5, ageHours / halfLifeHours));
 }
 
-/**
- * Instagram candidates: InstagramReel JOINED with InstagramAccount (the Admin ecosystem).
- *  - join on reel.accountId = account.id OR reel.ownerUsername = account.username
- *  - authentic profilePicUrl / fullName / verified come from the account row
- *  - dummy / seeded shortcodes and reels without a valid direct video URL are dropped
- * The join is done with two plain queries so it works whatever association alias the admin
- * models use.
- */
 async function loadInstagramCandidates() {
   const Reel = getInstagramReelModel();
   const Account = getInstagramAccountModel();
@@ -2179,11 +2151,27 @@ async function loadInstagramCandidates() {
   }
 
   const reelAttrs = existingAttrs(Reel, [
-    'id', 'shortcode', 'videoUrl', 'accountId', 'ownerUsername', 'username', 'caption', 'description',
-    'thumbnailUrl', 'displayUrl', 'thumbnail', 'likesCount', 'commentsCount', 'playCount', 'viewCount',
-    'videoPlayCount', 'takenAt', 'publishedAt', 'createdAt',
+    'id',
+    'shortcode',
+    'videoUrl',
+    'accountId',
+    'ownerUsername',
+    'username',
+    'caption',
+    'description',
+    'thumbnailUrl',
+    'displayUrl',
+    'thumbnail',
+    'likesCount',
+    'commentsCount',
+    'playCount',
+    'viewCount',
+    'videoPlayCount',
+    'takenAt',
+    'publishedAt',
+    'createdAt',
   ]);
-  const where = { videoUrl: { [Op.like]: 'https://%' } }; // implies NOT NULL and a real URL
+  const where = { videoUrl: { [Op.like]: 'https://%' } };
   if (Reel.rawAttributes.isAvailable) where.isAvailable = true;
   if (Reel.rawAttributes.isActive) where.isActive = true;
   if (Reel.rawAttributes.isMock) where.isMock = false;
@@ -2197,7 +2185,6 @@ async function loadInstagramCandidates() {
     raw: true,
   });
 
-  // Account join.
   const accountIds = new Set();
   const usernames = new Set();
   reels.forEach((r) => {
@@ -2211,7 +2198,14 @@ async function loadInstagramCandidates() {
   if (Account && Account.rawAttributes && (accountIds.size > 0 || usernames.size > 0)) {
     try {
       const accAttrs = existingAttrs(Account, [
-        'id', 'username', 'fullName', 'profilePicUrl', 'verified', 'isVerified', 'followersCount', 'isActive',
+        'id',
+        'username',
+        'fullName',
+        'profilePicUrl',
+        'verified',
+        'isVerified',
+        'followersCount',
+        'isActive',
       ]);
       const ors = [];
       if (accountIds.size > 0 && Account.rawAttributes.id) ors.push({ id: { [Op.in]: Array.from(accountIds) } });
@@ -2231,8 +2225,8 @@ async function loadInstagramCandidates() {
   const scored = [];
   for (const r of reels) {
     const shortcode = String(r.shortcode || '');
-    if (!SHORTCODE_RE.test(shortcode) || isMockShortcode(shortcode)) continue; // seeded dummy
-    if (!evaluateMediaUrl(r.videoUrl)) continue; // no valid / unexpired direct stream
+    if (!SHORTCODE_RE.test(shortcode) || isMockShortcode(shortcode)) continue;
+    if (!evaluateMediaUrl(r.videoUrl)) continue;
 
     const ownerName = String(firstPresent(r.ownerUsername, r.username) || '').replace(/^@+/, '');
     const account =
@@ -2240,7 +2234,7 @@ async function loadInstagramCandidates() {
     if (account && account.isActive === false) continue;
 
     const username = String((account && account.username) || ownerName || '').replace(/^@+/, '');
-    if (!username) continue; // cannot show a creator handle: skip rather than render an anonymous reel
+    if (!username) continue;
 
     const fullName = (account && account.fullName) || username;
     const caption = String(firstPresent(r.caption, r.description) || '').trim();
@@ -2293,10 +2287,6 @@ async function loadInstagramCandidates() {
   return { rows: out, scores };
 }
 
-/**
- * Round-robin across creators: round r contains the r-th best item of every creator,
- * so the head of the feed is as varied as possible and no creator appears twice in a row.
- */
 function roundRobinByCreator(rows, scoreOf) {
   const queues = new Map();
   for (const row of rows) {
@@ -2327,7 +2317,6 @@ function roundRobinByCreator(rows, scoreOf) {
   return out;
 }
 
-/** 2 YouTube Shorts : 1 verified Instagram Reel, YouTube first. */
 function interleaveYtAndIg(ytRows, igRows, scoreOf) {
   const yts = [...ytRows].sort((a, b) => scoreOf(b) - scoreOf(a));
   const igs = [...igRows].sort((a, b) => scoreOf(b) - scoreOf(a));
@@ -2370,7 +2359,12 @@ async function buildCandidatePool() {
 
   const builtAt = Date.now();
   log.info(`pool built: ${rows.length} candidates (yt=${ytRows.length}, ig=${igRows.length}) in ${builtAt - started}ms`);
-  return { version: `${builtAt}-${rows.length}`, builtAt, partial: yt.status !== 'fulfilled' || ig.status !== 'fulfilled', rows };
+  return {
+    version: `${builtAt}-${rows.length}`,
+    builtAt,
+    partial: yt.status !== 'fulfilled' || ig.status !== 'fulfilled',
+    rows,
+  };
 }
 
 async function readPoolFromRedis(redis, key) {
@@ -2412,15 +2406,17 @@ const poolSoftTtl = (pool) => (pool.partial ? POOL.partialSoftTtlMs : POOL.softT
 async function doRefreshPool() {
   const redis = safeRedis();
 
-  // 1. Another process may already have built a fresh pool.
   if (redis && !poolDirty) {
     const shared = await readPoolFromRedis(redis, POOL.redisKey);
-    if (shared && (!poolL1 || shared.builtAt > poolL1.builtAt) && Date.now() - shared.builtAt < (shared.partial ? POOL.partialSoftTtlMs : POOL.softTtlMs)) {
+    if (
+      shared &&
+      (!poolL1 || shared.builtAt > poolL1.builtAt) &&
+      Date.now() - shared.builtAt < (shared.partial ? POOL.partialSoftTtlMs : POOL.softTtlMs)
+    ) {
       return setPool(shared);
     }
   }
 
-  // 2. Only one process rebuilds at a time.
   let token = null;
   if (redis) {
     token = `${process.pid}:${Date.now()}:${Math.random()}`;
@@ -2435,7 +2431,6 @@ async function doRefreshPool() {
       const peer = await waitForPeerPool(redis);
       if (peer) return setPool(peer);
       if (poolL1) return poolL1;
-      // No peer result and nothing in memory: build locally rather than serve nothing.
     }
   }
 
@@ -2446,7 +2441,7 @@ async function doRefreshPool() {
     return pool;
   } catch (err) {
     log.error(`pool refresh failed: ${err.message}`);
-    if (poolL1) return poolL1; // keep serving the last good pool
+    if (poolL1) return poolL1;
     if (redis) {
       const stale = await readPoolFromRedis(redis, POOL.redisStaleKey);
       if (stale) {
@@ -2456,7 +2451,9 @@ async function doRefreshPool() {
     }
     throw err;
   } finally {
-    if (redis && token && typeof redis.compareDel === 'function') await redis.compareDel(POOL.redisLockKey, token).catch(() => {});
+    if (redis && token && typeof redis.compareDel === 'function') {
+      await redis.compareDel(POOL.redisLockKey, token).catch(() => {});
+    }
   }
 }
 
@@ -2480,10 +2477,6 @@ function refreshPool() {
   return p;
 }
 
-/**
- * Hot path: returns the in-memory pool immediately. A soft-expired pool is still served while a
- * background refresh runs, so users only ever wait on a completely cold start.
- */
 async function getCandidatePool() {
   const now = Date.now();
   if (poolL1) {
@@ -2495,7 +2488,6 @@ async function getCandidatePool() {
   return refreshPool();
 }
 
-/** Admin change: purge the shared copy and rebuild in the background. */
 function invalidateCandidatePool() {
   poolDirty = true;
   poolRetryAt = 0;
@@ -2506,7 +2498,6 @@ function invalidateCandidatePool() {
   });
 }
 
-/** Immediately removes videos from this process's pool (deleted or no longer a Short). */
 function evictFromPool(ids) {
   if (!poolL1 || !ids || ids.length === 0) return;
   const drop = new Set(ids.map(String));
@@ -2519,10 +2510,6 @@ function evictFromPool(ids) {
     rows,
   });
 }
-
-/* -------------------------------------------------------------------------- */
-/* Global feed endpoint                                                       */
-/* -------------------------------------------------------------------------- */
 
 let feedEngineRef;
 function loadFeedEngine() {
@@ -2538,12 +2525,6 @@ function loadFeedEngine() {
 
 const NO_SEEN = new Set();
 
-/**
- * Serves one page from the candidate pool. No database access on the hot path. The only I/O is
- * one small Redis round trip to skip what the viewer has already seen (and one likes lookup for
- * logged-in users). Page 1 (no cursor) always starts with a working YouTube Short so the first
- * paint never lands on an Instagram reel that needs a stream resolve.
- */
 async function serveFeedFromPool(viewer, { cursorRaw, page, limit }) {
   const pool = await getCandidatePool();
   const n = pool.rows.length;
@@ -2555,12 +2536,10 @@ async function serveFeedFromPool(viewer, { cursorRaw, page, limit }) {
   let start;
   if (cursor) {
     start = cursor.o;
-    // The pool was rebuilt since this cursor was issued: continue right after the last item served.
     if (cursor.v !== pool.version && cursor.a && pool.index.has(cursor.a)) start = pool.index.get(cursor.a) + 1;
   } else {
     const base = viewer ? hashString(viewer.key) : Math.floor(Math.random() * n);
     start = base + (page - 1) * take;
-    // Align to the start of a (2 YT + 1 IG) group so the first items are YouTube.
     const group = POOL.ytPerIg + 1;
     start -= ((start % group) + group) % group;
   }
@@ -2597,7 +2576,6 @@ async function serveFeedFromPool(viewer, { cursorRaw, page, limit }) {
     cursorIdx = (lastIdx + 1) % n;
   }
 
-  // The viewer has seen everything in the scanned window: keep the feed moving and start a fresh cycle.
   let cycleReset = false;
   if (picked.length < take) {
     cycleReset = Boolean(viewer);
@@ -2616,7 +2594,6 @@ async function serveFeedFromPool(viewer, { cursorRaw, page, limit }) {
     if (cycleReset) setImmediate(() => trimSeenHistory(viewer, n));
   }
 
-  // Page 1 must open on a YouTube Short (instant load, no black screen).
   if (!cursor && picked.length > 1 && platformOf(picked[0]) === 'ig') {
     const firstYt = picked.findIndex((r) => platformOf(r) === 'yt');
     if (firstYt > 0) [picked[0], picked[firstYt]] = [picked[firstYt], picked[0]];
@@ -2628,13 +2605,11 @@ async function serveFeedFromPool(viewer, { cursorRaw, page, limit }) {
 
   return {
     data,
-    hasMore: true, // the feed cycles, it never ends
+    hasMore: true,
     nextCursor: encodePoolCursor({ v: pool.version, o: nextOffset, a: lastRow ? String(lastRow.id) : null }),
     meta: { source: 'pool', poolSize: n, poolAgeMs: Date.now() - pool.builtAt, cycleReset },
   };
 }
-
-/* -------------------- SQL fallback (last resort) ---------------------------- */
 
 const fallbackServed = new Map();
 const FALLBACK_MAX_VIEWERS = 20000;
@@ -2703,11 +2678,9 @@ async function serveFeedFromDb(viewer, limit) {
   const ordered = diversifyFeed(rows, limit);
   rememberFallbackServed(viewer, ordered);
   const data = await attachLikes(ordered, viewer.userId);
-  // No nextCursor on purpose: clients then fall back to page-based paging and keep scrolling.
   return { data, hasMore: true, meta: { source: 'db-fallback', cycleReset: cycled } };
 }
 
-/** Pool first; if it cannot serve, the legacy engine; then the database. Returns null only if everything failed. */
 async function resolveFeedPage({ viewer, cursorRaw, page, limit }) {
   try {
     return await serveFeedFromPool(viewer, { cursorRaw, page, limit });
@@ -2775,12 +2748,7 @@ function createFeedHandler({ requireViewer }) {
 
 exports.getShorts = createFeedHandler({ requireViewer: false });
 exports.getFeed = createFeedHandler({ requireViewer: true });
-/** GET /api/shorts/feed: YouTube Shorts + verified Instagram Reels, 2 : 1, YouTube first. */
 exports.getShortsFeed = exports.getShorts;
-
-/* -------------------------------------------------------------------------- */
-/* View tracking                                                              */
-/* -------------------------------------------------------------------------- */
 
 function parseTrackBody(rawBody) {
   let body = rawBody;
@@ -2853,12 +2821,9 @@ exports.trackView = asyncHandler(async (req, res) => {
   });
 });
 
-/* ---------------- POST /api/shorts/seen : non-blocking analytics ------------- */
-
 const seenQueue = [];
 let seenDraining = false;
 
-/** Maps the client's { contentId, platform } events to feed ids ('ig_' prefix for Instagram). */
 function normalizeSeenEvents(rawEvents) {
   const list = Array.isArray(rawEvents) ? rawEvents.slice(0, SEEN_QUEUE.maxEventsPerBatch) : [];
   const ids = [];
@@ -2896,7 +2861,7 @@ async function drainSeenQueue() {
     while (seenQueue.length > 0) {
       const batch = seenQueue.splice(0, SEEN_QUEUE.concurrency);
       await Promise.allSettled(batch.map(processSeenJob));
-      await new Promise((resolve) => setImmediate(resolve)); // let request handling run between batches
+      await new Promise((resolve) => setImmediate(resolve));
     }
   } finally {
     seenDraining = false;
@@ -2910,11 +2875,6 @@ function scheduleSeenDrain() {
   setImmediate(drainSeenQueue);
 }
 
-/**
- * POST /api/shorts/seen
- * Answers 200 { ok: true } BEFORE doing any work. Bookkeeping runs from a bounded queue; under
- * extreme load the oldest analytics batches are dropped instead of slowing the feed down.
- */
 exports.trackSeenBatch = (req, res) => {
   res.status(200).json({ ok: true, success: true });
 
@@ -2933,8 +2893,6 @@ exports.trackSeenBatch = (req, res) => {
   }
 };
 
-/* ---------------------------------- workers --------------------------------- */
-
 let feedWorkersStarted = false;
 let catalogTimer = null;
 let flushTimer = null;
@@ -2944,7 +2902,6 @@ function startFeedWorkers() {
   feedWorkersStarted = true;
 
   seenTableReady = UserSeenVideo.sync().catch((err) => log.error(`user_seen_videos sync failed: ${err.message}`));
-
   getCandidatePool().catch((err) => log.warn(`pool warm-up failed: ${err.message}`));
 
   const catalogTick = async () => {
@@ -3001,13 +2958,8 @@ async function stopFeedWorkers() {
 exports.startFeedWorkers = startFeedWorkers;
 exports.stopFeedWorkers = stopFeedWorkers;
 exports.refreshFeedCatalog = rebuildCatalog;
-/** Call once at server start so the very first visitor never waits for the pool build. */
 exports.warmFeedPool = () => getCandidatePool();
 exports.invalidateFeedPool = invalidateCandidatePool;
-
-/* -------------------------------------------------------------------------- */
-/* Exposed for unit tests only                                                */
-/* -------------------------------------------------------------------------- */
 
 exports.__test = {
   interleaveByChannel,
