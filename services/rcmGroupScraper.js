@@ -5,7 +5,8 @@
  * High-performance dual sync:
  *  - Stage 1 (Fast Sync): Instant root info, direct legs, and macro PV.
  *  - Stage 2a (Live Skeleton): Walks ONLY branches with group PV > 0 (sub-minute exact turnover calculation).
- *  - Stage 2b (Structure Crawl): Full hierarchy crawl with database schema integrity.
+ *  - Stage 2b (Incremental / Delta Structure Crawl): Adds new joinings, revives re-activated nodes,
+ *    and avoids hammering RCM portal with repeated full-tree scans.
  */
 
 const axios = require('axios');
@@ -16,7 +17,7 @@ try {
   console.warn('[MODEL LOAD NOTICE]:', e.message);
 }
 
-const { DownlineNode, MemberMonthlySnapshot, RcmIdentity, RcmMonthlyTurnoverHistory } = models;
+const { DownlineNode, MemberMonthlySnapshot, RcmIdentity, RcmMonthlyTurnoverHistory, sequelize } = models;
 
 let activeView = null;
 try {
@@ -26,7 +27,6 @@ try {
 }
 
 const ECOM_BASE = 'https://ecomapi.rcmworld.com/api';
-// [FIXED]: Was '/user/profile/get-distributor-downline' (404 Error) -> now correct endpoint:
 const DOWNLINE_API_URL = `${ECOM_BASE}/user/downline/get-distributor-downline`;
 const DIST_INFO_URL = `${ECOM_BASE}/user/profile/get-distributor-info`;
 const USER_DATA_URL = `${ECOM_BASE}/user/cart/user-data`;
@@ -39,11 +39,8 @@ const envNum = (key, fallback) => {
 };
 
 const CRAWL_CONCURRENCY = 2;
-const NODE_DELAY_MIN_MS = 100;
-const NODE_DELAY_MAX_MS = 250;
-const COOLDOWN_EVERY_N_FETCHES = 35;
-const COOLDOWN_MIN_MS = 1200;
-const COOLDOWN_MAX_MS = 2000;
+const NODE_DELAY_MIN_MS = 120;
+const NODE_DELAY_MAX_MS = 280;
 const FETCH_TRIES = 3;
 const BACKOFF_STEP_MS = 600;
 
@@ -53,7 +50,7 @@ const GAP_MAX_MS = envNum('RCM_GAP_MAX_MS', 3000);
 const SKELETON_WORKERS = envNum('RCM_SKELETON_WORKERS', 6);
 const PV_PAGE_SIZE = 10;
 const MONEY_EPS = 0.05;
-const STRUCT_FRESH_MS = envNum('RCM_STRUCT_FRESH_HOURS', 24) * 60 * 60 * 1000;
+const DELTA_SCAN_LIMIT = envNum('RCM_DELTA_SCAN_LIMIT', 400);
 
 const activeCrawls = new Map();
 
@@ -311,6 +308,38 @@ async function safeUpsert(model, payload, label) {
   }
 }
 
+async function upsertTurnoverHistorySafe({ buyerId, yearMonth, totalPv, selfPv, legAPv, legBPv }) {
+  if (!RcmMonthlyTurnoverHistory) return;
+  try {
+    const attrs = RcmMonthlyTurnoverHistory.rawAttributes || {};
+    const monthCol = attrs.year_month ? 'year_month' : attrs.month_key ? 'month_key' : null;
+    if (!monthCol) return;
+
+    const monthVal = monthCol === 'year_month' ? yearMonth : yearMonth.replace('-', '');
+    const existing = await RcmMonthlyTurnoverHistory.findOne({
+      where: { buyer_id: Number(buyerId), [monthCol]: monthVal }
+    });
+
+    const data = {
+      buyer_id: Number(buyerId),
+      [monthCol]: monthVal,
+      total_pv: round2(totalPv),
+      self_pv: round2(selfPv),
+      leg_a_pv: round2(legAPv),
+      leg_b_pv: round2(legBPv),
+      updated_at: new Date()
+    };
+
+    if (existing) {
+      await existing.update(data);
+    } else {
+      await RcmMonthlyTurnoverHistory.create(data);
+    }
+  } catch (err) {
+    console.warn(`[TURNOVER HISTORY WARN] ${buyerId} ${yearMonth}:`, err.message);
+  }
+}
+
 function createWriter(limit = 8) {
   const queue = [];
   let active = 0;
@@ -347,12 +376,10 @@ async function persistParsedNode(parsed, parentId, level, rootId, monthKey) {
   const mKey = monthKey || `${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}`;
   const rId = String(rootId || parentId);
 
-  await safeUpsert(DownlineNode, {
+  const payload = {
     buyer_id: String(parsed.id),
     dist_no: String(parsed.id),
-    parent_id: parentId ? String(parentId) : null,
-    parent_dist_no: parentId ? String(parentId) : null,
-    root_dist_no: rId,
+    root_buyer_id: Number(rId),
     month_key: mKey,
     name: parsed.name,
     status: parsed.status,
@@ -361,8 +388,17 @@ async function persistParsedNode(parsed, parentId, level, rootId, monthKey) {
     current_pv: parsed.selfPv || 0,
     repurchase_amt: parsed.repurchaseAmt || 0,
     level: level || 0,
-    kyc_status: parsed.kycStatus || 'A'
-  }, `DownlineNode ${parsed.id}`);
+    kyc_status: parsed.kycStatus || 'A',
+    last_synced_at: new Date()
+  };
+
+  // Never overwrite existing parent_id with null
+  if (parentId) {
+    payload.parent_id = String(parentId);
+    payload.parent_dist_no = String(parentId);
+  }
+
+  await safeUpsert(DownlineNode, payload, `DownlineNode ${parsed.id}`);
 
   await safeUpsert(RcmIdentity, buildIdentityPayload(parsed.id, {
     name: parsed.name,
@@ -506,7 +542,7 @@ async function fetchUserProfile(session, distNo, month, year) {
     if (!associateName) {
       const storeList = storeRes?.data?.data || [];
       if (Array.isArray(storeList) && storeList.length > 0) {
-        const matched = storeList.find(s => String(s.ab_id || s.distno) === String(distNo)) || storeList[0];
+        const matched = storeList.find((s) => String(s.ab_id || s.distno) === String(distNo)) || storeList[0];
         associateName = matched?.name || matched?.dist_name || null;
       }
     }
@@ -562,7 +598,8 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
   const prevMonth = prevDate.getMonth() + 1;
   const prevYear = prevDate.getFullYear();
   const currentMonthKey = `${currentYear}${String(currentMonth).padStart(2, '0')}`;
-  const prevMonthKey = `${prevYear}${String(prevMonth).padStart(2, '0')}`;
+  const currentYearMonth = `${currentYear}-${String(currentMonth).padStart(2, '0')}`;
+  const prevYearMonth = `${prevYear}-${String(prevMonth).padStart(2, '0')}`;
 
   console.log(`[FAST SYNC] Starting overview sync for associate: ${buyerId}`);
 
@@ -634,7 +671,7 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
       ...leg,
       pv: row ? extractPv(row) : 0,
       self_pv: rowSelfPv > 0 ? rowSelfPv : leg.self_pv,
-      repurchase_amt: rowRepurchase > 0 ? rowRepurchase : leg.repurchaseAmt,
+      repurchase_amt: rowRepurchase > 0 ? rowRepurchase : leg.repurchase_amt,
       pvKnown: Boolean(row)
     };
   });
@@ -652,13 +689,10 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
     sponsor_name: profile.sponsor_name
   }), 'RcmIdentity');
 
-  // Insert Root Node with BOTH column aliases for TiDB compatibility
   await safeUpsert(DownlineNode, {
     buyer_id: String(buyerId),
     dist_no: String(buyerId),
-    parent_id: null,
-    parent_dist_no: null,
-    root_dist_no: String(buyerId),
+    root_buyer_id: Number(buyerId),
     month_key: currentMonthKey,
     name: associateName,
     status: profile.terminated ? 0 : 1,
@@ -667,7 +701,8 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
     current_pv: selfPvCurrent,
     repurchase_amt: rootAmounts.repurchaseAmt,
     total_group_pv: totalPvCurrent,
-    level: 0
+    level: 0,
+    last_synced_at: new Date()
   }, 'DownlineNode root');
 
   for (const leg of directLegs) {
@@ -676,7 +711,7 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
       dist_no: String(leg.distno),
       parent_id: String(buyerId),
       parent_dist_no: String(buyerId),
-      root_dist_no: String(buyerId),
+      root_buyer_id: Number(buyerId),
       month_key: currentMonthKey,
       name: leg.name,
       status: leg.status,
@@ -685,7 +720,8 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
       current_pv: Number(leg.self_pv || 0),
       repurchase_amt: leg.repurchase_amt || 0,
       total_group_pv: leg.pv || 0,
-      level: 1
+      level: 1,
+      last_synced_at: new Date()
     };
     if (leg.leg) {
       payload.leg_type = leg.leg;
@@ -702,10 +738,53 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
     year: currentYear,
     associate_name: associateName,
     pin_level: pinLevel,
-    total_pv: totalPvCurrent,
+    pv: selfPvCurrent,
     self_pv: selfPvCurrent,
+    total_pv: totalPvCurrent,
+    total_group_pv: totalPvCurrent,
+    repurchase_amt: rootAmounts.repurchaseAmt,
+    status: profile.terminated ? 0 : 1,
     last_synced_at: new Date()
   }, 'MemberMonthlySnapshot current');
+
+  await upsertTurnoverHistorySafe({
+    buyerId,
+    yearMonth: currentYearMonth,
+    totalPv: totalPvCurrent,
+    selfPv: selfPvCurrent,
+    legAPv: legACurrent,
+    legBPv: legBCurrent
+  });
+
+  if (sequelize && totalPvCurrent > 0) {
+    await sequelize.query(
+      `UPDATE rcm_sync_state
+          SET macro_pv = :macroPv,
+              residual_pv = GREATEST(0, ROUND(:macroPv - processed_pv, 2)),
+              state = IF(ABS(:macroPv - processed_pv) > 0.05, 'BOUNDED', state),
+              updated_at = :now
+        WHERE owner_id = :owner AND month_key = :monthKey`,
+      {
+        replacements: {
+          macroPv: round2(totalPvCurrent),
+          now: new Date(),
+          owner: Number(buyerId),
+          monthKey: currentMonthKey
+        }
+      }
+    ).catch(() => {});
+  }
+
+  if (totalPvPrev > 0 || selfPvPrev > 0) {
+    await upsertTurnoverHistorySafe({
+      buyerId,
+      yearMonth: prevYearMonth,
+      totalPv: totalPvPrev,
+      selfPv: selfPvPrev,
+      legAPv: legAPrev,
+      legBPv: legBPrev
+    });
+  }
 
   if (io) {
     io.to(String(buyerId)).emit('overview:live-pv', {
@@ -734,7 +813,7 @@ async function syncOverviewFast({ session, buyerId, month, year, io }) {
   };
 }
 
-async function runSkeletonSync({ session, root, month, year, state, io }) {
+async function runSkeletonSync({ session, root, month, year, state, io, knownMacroPv = 0 }) {
   const now = new Date();
   const m = month || (now.getMonth() + 1);
   const y = year || now.getFullYear();
@@ -770,7 +849,7 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
     const prof = await fetchUserProfile(session, root, m, y);
     rootPv = { ok: true, groupPv: prof.group_pv || 0, selfPv: prof.self_pv || 0 };
   }
-  sk.macroPv = round2(rootPv.groupPv);
+  sk.macroPv = round2(Math.max(rootPv.groupPv || 0, parseNum(knownMacroPv)));
 
   const writer = createWriter(8);
   const ratios = [];
@@ -778,13 +857,10 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
   const viewRows = new Map();
   const failed = [];
   let aborted = false;
-  let rootSelfPv = 0;
-  let rootKids = [];
-  let lastEmit = 0;
 
   const refresh = () => {
     sk.coveragePct = sk.macroPv > 0 ? Math.min(100, round1((sk.processedPv / sk.macroPv) * 100)) : 100;
-    sk.residualPv = round2(sk.macroPv - sk.processedPv);
+    sk.residualPv = round2(Math.max(0, sk.macroPv - sk.processedPv));
     const unknownPv = Math.max(0, sk.pendingBuyerPv) + Math.max(0, sk.residualPv);
     if (unknownPv <= MONEY_EPS) {
       sk.estLow = sk.verifiedAmt;
@@ -801,16 +877,21 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
     }
   };
 
-  const writeNode = async (fields, isRootNode) => {
+  const writeNode = async (fields) => {
     const payload = {
       ...fields,
       buyer_id: String(fields.buyer_id),
       dist_no: String(fields.buyer_id),
-      root_dist_no: String(root),
-      month_key: monthKey
+      root_buyer_id: Number(root),
+      month_key: monthKey,
+      last_synced_at: new Date()
     };
     if (fields.parent_id) {
+      payload.parent_id = String(fields.parent_id);
       payload.parent_dist_no = String(fields.parent_id);
+    } else {
+      delete payload.parent_id;
+      delete payload.parent_dist_no;
     }
     await safeUpsert(DownlineNode, payload, `skeleton ${fields.buyer_id}`);
   };
@@ -828,22 +909,17 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
     sk.processedPv = round2(sk.processedPv + selfPv);
     state.count = Math.max(state.count, sk.liveNodes);
 
-    if (item.id === root) {
-      rootSelfPv = selfPv;
-      rootKids = kids;
-    }
-
     const payload = {
       buyer_id: item.id,
       total_group_pv: item.groupPv,
       self_pv: selfPv,
       current_pv: selfPv,
       level: item.level,
-      parent_id: item.parent ? String(item.parent) : null,
       name: item.name || `Associate #${item.id}`
     };
+    if (item.parent) payload.parent_id = String(item.parent);
     if (item.leg) payload.leg_type = item.leg;
-    writer.add(() => writeNode(payload, item.parent === null));
+    writer.add(() => writeNode(payload));
 
     if (selfPv > MONEY_EPS) {
       sk.buyers += 1;
@@ -891,15 +967,16 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
       if (info.pv > 0) vr.self_pv = info.pv;
     }
 
+    const finalPv = info.pv > 0 ? info.pv : item.selfPv;
     const nodeWrite = {
       ...((vr && vr._node) || { buyer_id: item.id }),
       repurchase_amt: info.amt,
-      self_pv: info.pv > 0 ? info.pv : item.selfPv,
-      current_pv: info.pv > 0 ? info.pv : item.selfPv,
+      self_pv: finalPv,
+      current_pv: finalPv,
       status: info.terminated ? 0 : 1,
       terminated: info.terminated ? 1 : 0
     };
-    writer.add(() => writeNode(nodeWrite, item.id === root));
+    writer.add(() => writeNode(nodeWrite));
   };
 
   const worker = async () => {
@@ -937,17 +1014,21 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
   await writer.drain();
   refresh();
 
-  sk.state = sk.residualPv <= MONEY_EPS && sk.amountsFailed === 0 ? 'VERIFIED' : 'BOUNDED';
+  sk.state = Math.abs(sk.macroPv - sk.processedPv) <= MONEY_EPS && sk.amountsFailed === 0 && !aborted
+    ? 'VERIFIED'
+    : 'BOUNDED';
   sk.finishedAt = new Date();
 
   if (activeView) {
     try {
-      await activeView.replaceOwnerView({
-        ownerId: root,
-        monthKey,
-        rows: [...viewRows.values()],
-        deleteStale: sk.state === 'VERIFIED'
-      });
+      if (viewRows.size > 0 || sk.state === 'VERIFIED') {
+        await activeView.replaceOwnerView({
+          ownerId: root,
+          monthKey,
+          rows: [...viewRows.values()],
+          deleteStale: sk.state === 'VERIFIED'
+        });
+      }
       await activeView.saveSyncState({ ownerId: root, monthKey, sk });
     } catch (err) {
       console.warn(`[ACTIVE VIEW WARN] ${root}:`, err.message);
@@ -961,24 +1042,173 @@ async function runSkeletonSync({ session, root, month, year, state, io }) {
   return { aborted, skeleton: sk };
 }
 
-async function runStructureCrawl({ session, root, state, io }) {
-  state.phase = 'STRUCTURE';
+let _cachedScraperRedis = undefined;
+function getScraperRedis() {
+  if (_cachedScraperRedis !== undefined) return _cachedScraperRedis;
+  try {
+    const mod = require('../config/redis');
+    const client = mod?.redisClient || mod?.client || mod?.redis || (typeof mod?.getRedisClient === 'function' ? mod.getRedisClient() : mod);
+    _cachedScraperRedis = client && typeof client.get === 'function' ? client : null;
+  } catch {
+    _cachedScraperRedis = null;
+  }
+  return _cachedScraperRedis;
+}
+
+const CONCURRENT_SHIELD_TTL_SEC = 120;
+const PV_SIG_TTL_SEC = 1800;
+const localShieldMap = new Map();
+const localPvSigMap = new Map();
+
+async function isShieldedRecently(distNo) {
+  const key = String(distNo);
+  const exp = localShieldMap.get(key);
+  if (exp && exp > Date.now()) return true;
+  if (exp) localShieldMap.delete(key);
+
+  const r = getScraperRedis();
+  if (!r) return false;
+  try {
+    return Boolean(await r.get(`rcm:shield:${key}`));
+  } catch {
+    return false;
+  }
+}
+
+async function markShielded(ids, ttlSec = CONCURRENT_SHIELD_TTL_SEC) {
+  if (!Array.isArray(ids) || ids.length === 0) return;
+  const nowStr = String(Date.now());
+  const expMs = Date.now() + ttlSec * 1000;
+
+  if (localShieldMap.size > 15000) localShieldMap.clear();
+  for (let i = 0; i < Math.min(ids.length, 5000); i++) {
+    localShieldMap.set(String(ids[i]), expMs);
+  }
+
+  const r = getScraperRedis();
+  if (!r) return;
+  try {
+    const CHUNK = 300;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const slice = ids.slice(i, i + CHUNK);
+      if (typeof r.pipeline === 'function') {
+        const pipe = r.pipeline();
+        for (const id of slice) pipe.set(`rcm:shield:${id}`, nowStr, 'EX', ttlSec);
+        await pipe.exec();
+      } else if (typeof r.setEx === 'function') {
+        await Promise.all(slice.map((id) => r.setEx(`rcm:shield:${id}`, ttlSec, nowStr)));
+      } else if (typeof r.set === 'function') {
+        await Promise.all(slice.map((id) =>
+          r.set(`rcm:shield:${id}`, nowStr, { EX: ttlSec })
+            .catch(() => r.set(`rcm:shield:${id}`, nowStr, 'EX', ttlSec))
+        ));
+      }
+    }
+  } catch (err) {
+    console.warn('[SHIELD STAMP WARN]:', err.message);
+  }
+}
+
+async function getLastPvSig(distNo, monthKey) {
+  const k = `${distNo}:${monthKey}`;
+  const mem = localPvSigMap.get(k);
+  if (mem && mem.exp > Date.now()) return mem.sig;
+  if (mem) localPvSigMap.delete(k);
+
+  const r = getScraperRedis();
+  if (!r) return null;
+  try {
+    return await r.get(`rcm:pv_sig:${k}`);
+  } catch {
+    return null;
+  }
+}
+
+async function setLastPvSig(distNo, monthKey, sig, ttlSec = PV_SIG_TTL_SEC) {
+  const k = `${distNo}:${monthKey}`;
+  localPvSigMap.set(k, { sig: String(sig), exp: Date.now() + ttlSec * 1000 });
+
+  const r = getScraperRedis();
+  if (!r) return;
+  try {
+    if (typeof r.setEx === 'function') await r.setEx(`rcm:pv_sig:${k}`, ttlSec, String(sig));
+    else if (typeof r.set === 'function') {
+      await r.set(`rcm:pv_sig:${k}`, String(sig), { EX: ttlSec })
+        .catch(() => r.set(`rcm:pv_sig:${k}`, String(sig), 'EX', ttlSec));
+    }
+  } catch {}
+}
+
+async function pickDeltaCandidates(rootId, limit = DELTA_SCAN_LIMIT) {
+  const candidates = [String(rootId)];
+  if (!sequelize) return candidates;
+  try {
+    const rows = await sequelize.query(
+      `SELECT buyer_id
+         FROM rcm_downline_nodes
+        WHERE root_buyer_id = :rootNum OR buyer_id = :rootStr
+        ORDER BY COALESCE(last_synced_at, '1970-01-01') ASC, level ASC
+        LIMIT :lim`,
+      {
+        replacements: { rootNum: Number(rootId), rootStr: String(rootId), lim: Number(limit) || 400 },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+    const seen = new Set(candidates);
+    for (const r of rows) {
+      const id = String(r.buyer_id);
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        candidates.push(id);
+      }
+    }
+  } catch (err) {
+    console.warn('[DELTA CANDIDATES WARN]:', err.message);
+  }
+  return candidates;
+}
+
+async function runStructureCrawl({ session, root, state, io, fullTree = false }) {
+  state.phase = fullTree ? 'STRUCTURE_INITIAL' : 'STRUCTURE_DELTA';
   const monthKey = `${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}`;
-  const queue = [{ distNo: root, depth: 0 }];
-  const visited = new Set([root]);
+
+  const seedIds = fullTree
+    ? [String(root)]
+    : await pickDeltaCandidates(root, DELTA_SCAN_LIMIT);
+
+  const queue = seedIds.map((id, idx) => ({ distNo: id, depth: idx === 0 ? 0 : 1 }));
+  const visited = new Set();
   let aborted = false;
+  let scanned = 0;
 
   const processNode = async (node) => {
+    const key = String(node.distNo);
+    if (visited.has(key)) return;
+    visited.add(key);
+
+    if (!fullTree && scanned >= DELTA_SCAN_LIMIT) return;
+    scanned += 1;
+
     try {
-      const children = await fetchDownline(session, node.distNo);
+      const children = await fetchDownline(session, key);
       for (let i = 0; i < children.length; i++) {
         const parsed = parseDownlineItem(children[i], i);
-        if (!parsed || visited.has(parsed.id)) continue;
-        visited.add(parsed.id);
+        if (!parsed) continue;
 
-        await persistParsedNode(parsed, node.distNo, node.depth + 1, root, monthKey);
-        state.count++;
-        queue.push({ distNo: parsed.id, depth: node.depth + 1 });
+        const existedBefore = DownlineNode && typeof DownlineNode.findByPk === 'function'
+          ? Boolean(await DownlineNode.findByPk(String(parsed.id)).catch(() => null))
+          : false;
+
+        await persistParsedNode(parsed, key, node.depth + 1, root, monthKey);
+        if (!existedBefore) state.count += 1;
+
+        if (fullTree) {
+          if (parsed.status !== 0 && !visited.has(parsed.id)) {
+            queue.push({ distNo: parsed.id, depth: node.depth + 1 });
+          }
+        } else if (!existedBefore && parsed.status !== 0 && !visited.has(parsed.id) && scanned < DELTA_SCAN_LIMIT) {
+          queue.push({ distNo: parsed.id, depth: node.depth + 1 });
+        }
       }
     } catch (err) {
       if (err.message === 'SESSION_EXPIRED') {
@@ -989,14 +1219,19 @@ async function runStructureCrawl({ session, root, state, io }) {
   };
 
   while (queue.length > 0 && !aborted) {
+    if (!fullTree && scanned >= DELTA_SCAN_LIMIT) break;
     const batch = queue.splice(0, CRAWL_CONCURRENCY);
     await Promise.all(batch.map(processNode));
     await sleep(randomBetween(NODE_DELAY_MIN_MS, NODE_DELAY_MAX_MS));
   }
+
+  if (!aborted) {
+    await markShielded([root], CONCURRENT_SHIELD_TTL_SEC);
+  }
   return { aborted };
 }
 
-function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, year, io, forceFullCrawl = true }) {
+function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, year, io, forceFullCrawl = null, knownMacroPv = 0, onComplete = null }) {
   const root = String(buyerId);
   const existing = activeCrawls.get(root);
   if (existing && existing.running) return getCrawlStatus(root);
@@ -1012,28 +1247,89 @@ function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, 
     skeletonDone: false,
     skeleton: null
   };
+
   activeCrawls.set(root, state);
 
   setImmediate(async () => {
     let aborted = false;
+    let wasShieldedBeforeRun = false;
+    let hasExistingTree = false;
+    const now = new Date();
+    const m = month || (now.getMonth() + 1);
+    const y = year || now.getFullYear();
+    const monthKey = `${y}${String(m).padStart(2, '0')}`;
+
     try {
-      const r = await runSkeletonSync({ session, root, month, year, state, io });
-      aborted = r.aborted;
+      wasShieldedBeforeRun = await isShieldedRecently(root);
+      hasExistingTree = DownlineNode && typeof DownlineNode.count === 'function'
+        ? (await DownlineNode.count({ where: { parent_id: root } }).catch(() => 0)) > 0
+        : false;
+
+      const pvSnap = await fetchPvOnlyFull(session, root, m, y);
+      const effectiveMacroPv = round2(Math.max(pvSnap.ok ? pvSnap.groupPv : 0, parseNum(knownMacroPv)));
+      const currentSig = effectiveMacroPv > 0
+        ? `${effectiveMacroPv}:${round2(pvSnap.ok ? pvSnap.selfPv : 0)}`
+        : null;
+      const prevSig = currentSig ? await getLastPvSig(root, monthKey) : null;
+
+      let hasProcessedGap = true;
+      if (sequelize && effectiveMacroPv > 0) {
+        const stRows = await sequelize.query(
+          'SELECT state, processed_pv FROM rcm_sync_state WHERE owner_id = :owner AND month_key = :monthKey LIMIT 1',
+          {
+            replacements: { owner: Number(root), monthKey },
+            type: sequelize.QueryTypes.SELECT
+          }
+        ).catch(() => []);
+        const st = stRows[0];
+        if (st && st.state === 'VERIFIED' && Math.abs(effectiveMacroPv - parseNum(st.processed_pv)) <= MONEY_EPS) {
+          hasProcessedGap = false;
+        }
+      }
+
+      const pvUnchanged = Boolean(currentSig && prevSig && currentSig === prevSig && hasExistingTree && !hasProcessedGap);
+
+      if (pvUnchanged && forceFullCrawl !== true) {
+        state.phase = 'SKELETON_SKIPPED_PV_UNCHANGED';
+        state.skeletonDone = true;
+      } else {
+        const r = await runSkeletonSync({ session, root, month: m, year: y, state, io, knownMacroPv: effectiveMacroPv });
+        aborted = r.aborted;
+        if (!aborted && currentSig && r.skeleton?.state === 'VERIFIED') {
+          await setLastPvSig(root, monthKey, currentSig);
+        }
+      }
+
+      if (typeof onComplete === 'function') {
+        try { await onComplete({ root, phase: 'SKELETON_DONE', count: state.count, isComplete: false }); } catch {}
+      }
     } catch (err) {
       state.error = err.message;
     }
 
-    if (!aborted && forceFullCrawl) {
-      try {
-        await runStructureCrawl({ session, root, state, io });
-      } catch (err) {
-        state.error = err.message;
+    if (!aborted) {
+      const isFirstTimeTree = !hasExistingTree;
+      const runFull = forceFullCrawl === true || isFirstTimeTree;
+      const shouldRunStructure = runFull || !wasShieldedBeforeRun;
+
+      if (shouldRunStructure) {
+        try {
+          await runStructureCrawl({ session, root, state, io, fullTree: runFull });
+        } catch (err) {
+          state.error = err.message;
+        }
       }
+
+      await markShielded([root], CONCURRENT_SHIELD_TTL_SEC);
     }
 
     state.running = false;
     state.finishedAt = new Date();
     state.phase = state.error ? 'ABORTED' : 'DONE';
+
+    if (typeof onComplete === 'function') {
+      try { await onComplete({ root, phase: state.phase, count: state.count, isComplete: true, error: state.error }); } catch {}
+    }
   });
 
   return getCrawlStatus(root);
@@ -1042,7 +1338,7 @@ function startBackgroundTreeCrawler({ session, buyerId, directLegs = [], month, 
 async function fetchChildrenOnDemand(rootId, parentId) {
   try {
     const { getSession } = require('./rcmSessionService');
-    const session = getSession(rootId);
+    const session = await getSession(rootId);
     if (!session) return { fetched: false, count: 0 };
     const monthKey = `${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}`;
 
@@ -1084,10 +1380,10 @@ module.exports = {
   fetchPvOnlyFull,
   fetchPvChildren,
   fetchDistributorInfo,
-  syncSkeletonNow: async ({ session, buyerId, month, year, io }) => {
+  syncSkeletonNow: async ({ session, buyerId, month, year, io, knownMacroPv = 0 }) => {
     const root = String(buyerId);
     const state = { count: 0, error: null, phase: 'SKELETON', skeletonDone: false, skeleton: null, failedNodes: [] };
-    const r = await runSkeletonSync({ session, root, month, year, state, io });
+    const r = await runSkeletonSync({ session, root, month, year, state, io, knownMacroPv });
     return { ...r.skeleton, aborted: r.aborted, error: state.error };
   }
 };

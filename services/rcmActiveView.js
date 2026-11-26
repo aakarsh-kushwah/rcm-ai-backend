@@ -4,13 +4,16 @@
  * services/rcmActiveView.js
  *
  * Stores month-scoped active buyers (self_pv > 0) for sub-millisecond bucket & leg analytics,
- * AND maintains complete tree counters (Total Members, Terminated, Inactive, Active Buyers).
+ * AND maintains complete tree counters (Total Members, Terminated, Inactive, Active Buyers)
+ * with zero RCM portal load and low DB overhead.
  */
 
 const models = require('../models');
 const { sequelize } = models;
 
 const BATCH = 400;
+const COUNT_CACHE_TTL_MS = 30 * 1000;
+const countCache = new Map();
 
 const DDL_VIEW = `
 CREATE TABLE IF NOT EXISTS rcm_active_view (
@@ -67,9 +70,12 @@ function ensureTables() {
     ensurePromise = (async () => {
       await sequelize.query(DDL_VIEW);
       await sequelize.query(DDL_STATE);
-      // Auto-add columns if table already existed without them
       const tryAddCol = async (colDef) => {
-        try { await sequelize.query(`ALTER TABLE rcm_sync_state ADD COLUMN ${colDef}`); } catch (e) { /* ignore existing */ }
+        try {
+          await sequelize.query(`ALTER TABLE rcm_sync_state ADD COLUMN ${colDef}`);
+        } catch (e) {
+          /* ignore existing column */
+        }
       };
       await tryAddCol('total_members INT NOT NULL DEFAULT 0');
       await tryAddCol('terminated_members INT NOT NULL DEFAULT 0');
@@ -90,14 +96,88 @@ const round2 = (v) => Math.round(num(v) * 100) / 100;
 const select = (sql, replacements = {}) =>
   sequelize.query(sql, { replacements, type: sequelize.QueryTypes.SELECT });
 
+async function computeTreeCountsCached(owner) {
+  const key = String(owner);
+  const hit = countCache.get(key);
+  if (hit && Date.now() - hit.at < COUNT_CACHE_TTL_MS) {
+    return hit.value;
+  }
+
+  let result = null;
+
+  // 1. Fast indexed lookup via root_buyer_id for top-level roots
+  try {
+    const rootCounts = await select(
+      `SELECT
+         COUNT(*) AS total_count,
+         SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END) AS term_count,
+         SUM(CASE WHEN status = 1 AND COALESCE(self_pv, 0) = 0 AND COALESCE(repurchase_amt, 0) = 0 THEN 1 ELSE 0 END) AS inact_count
+       FROM rcm_downline_nodes
+       WHERE root_buyer_id = :owner OR buyer_id = :owner`,
+      { owner }
+    );
+    const totalFromRoot = rootCounts && rootCounts[0] ? num(rootCounts[0].total_count) : 0;
+    if (totalFromRoot > 1) {
+      result = {
+        totalCount: totalFromRoot,
+        termCount: num(rootCounts[0].term_count),
+        inactCount: num(rootCounts[0].inact_count)
+      };
+    }
+  } catch {
+    /* ignore if root_buyer_id is not present */
+  }
+
+  // 2. Recursive subtree fallback via parent_id for downline leaders
+  if (!result) {
+    try {
+      const cteCounts = await select(
+        `WITH RECURSIVE subtree AS (
+           SELECT buyer_id, status, self_pv, repurchase_amt, 0 AS depth
+           FROM rcm_downline_nodes
+           WHERE buyer_id = :owner
+           UNION ALL
+           SELECT n.buyer_id, n.status, n.self_pv, n.repurchase_amt, s.depth + 1
+           FROM rcm_downline_nodes n
+           INNER JOIN subtree s ON n.parent_id = s.buyer_id
+           WHERE s.depth < 150
+         )
+         SELECT
+           COUNT(*) AS total_count,
+           SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END) AS term_count,
+           SUM(CASE WHEN status = 1 AND COALESCE(self_pv, 0) = 0 AND COALESCE(repurchase_amt, 0) = 0 THEN 1 ELSE 0 END) AS inact_count
+         FROM subtree`,
+        { owner }
+      );
+      const totalFromCte = cteCounts && cteCounts[0] ? num(cteCounts[0].total_count) : 0;
+      if (totalFromCte > 0) {
+        result = {
+          totalCount: totalFromCte,
+          termCount: num(cteCounts[0].term_count),
+          inactCount: num(cteCounts[0].inact_count)
+        };
+      }
+    } catch {
+      /* ignore if CTE is not supported */
+    }
+  }
+
+  if (countCache.size > 100) {
+    countCache.clear();
+  }
+  countCache.set(key, { at: Date.now(), value: result });
+  return result;
+}
+
 async function replaceOwnerView({ ownerId, monthKey, rows, deleteStale }) {
   await ensureTables();
   const stamp = new Date();
   const seq = nextSeq();
   const owner = Number(ownerId);
+  const safeRows = Array.isArray(rows) ? rows : [];
 
-  for (let i = 0; i < rows.length; i += BATCH) {
-    const part = rows.slice(i, i + BATCH).map((r) => [
+  for (let i = 0; i < safeRows.length; i += BATCH) {
+    const part = safeRows.slice(i, i + BATCH).map((r) => [
       owner,
       monthKey,
       Number(r.buyer_id),
@@ -136,33 +216,25 @@ async function replaceOwnerView({ ownerId, monthKey, rows, deleteStale }) {
   }
 }
 
-async function saveSyncState({ ownerId, monthKey, sk }) {
+async function saveSyncState({ ownerId, monthKey, sk = {} }) {
   await ensureTables();
   const now = new Date();
   const owner = Number(ownerId);
 
-  // Read actual tree counts from rcm_downline_nodes if available
-  let totalMem = sk.totalMembers || 0;
-  let termMem = sk.terminatedMembers || 0;
-  let inactMem = sk.inactiveMembers || 0;
+  let totalMem = num(sk.totalMembers);
+  let termMem = num(sk.terminatedMembers);
+  let inactMem = num(sk.inactiveMembers);
+  const activeBuyers = num(sk.buyers);
 
   try {
-    const counts = await select(
-      `SELECT 
-         COUNT(*) AS total_count,
-         SUM(status = 0 OR terminated = 1) AS term_count,
-         SUM((status = 1 AND (terminated = 0 OR terminated IS NULL)) AND (self_pv = 0 AND repurchase_amt = 0)) AS inact_count
-       FROM rcm_downline_nodes 
-       WHERE root_dist_no = :owner OR dist_no = :owner`,
-      { owner: String(ownerId) }
-    );
-    if (counts && counts[0] && num(counts[0].total_count) > 0) {
-      totalMem = Math.max(totalMem, num(counts[0].total_count));
-      termMem = Math.max(termMem, num(counts[0].term_count));
-      inactMem = Math.max(inactMem, num(counts[0].inact_count));
+    const dbCounts = await computeTreeCountsCached(owner);
+    if (dbCounts && dbCounts.totalCount > 0) {
+      totalMem = Math.max(totalMem, dbCounts.totalCount);
+      termMem = dbCounts.termCount;
+      inactMem = Math.max(0, totalMem - termMem - activeBuyers);
     }
   } catch (e) {
-    // optional enrichment
+    console.warn(`[rcmActiveView] saveSyncState node count enrichment failed for ${owner}:`, e.message);
   }
 
   await sequelize.query(
@@ -177,9 +249,9 @@ async function saveSyncState({ ownerId, monthKey, sk }) {
        state = VALUES(state), macro_pv = VALUES(macro_pv), processed_pv = VALUES(processed_pv),
        residual_pv = VALUES(residual_pv), verified_amt = VALUES(verified_amt),
        est_low = VALUES(est_low), est_high = VALUES(est_high),
-       total_members = GREATEST(total_members, VALUES(total_members)),
-       terminated_members = GREATEST(terminated_members, VALUES(terminated_members)),
-       inactive_members = GREATEST(inactive_members, VALUES(inactive_members)),
+       total_members = IF(VALUES(total_members) > 0, GREATEST(total_members, VALUES(total_members)), total_members),
+       terminated_members = IF(VALUES(total_members) > 0, VALUES(terminated_members), terminated_members),
+       inactive_members = IF(VALUES(total_members) > 0, VALUES(inactive_members), inactive_members),
        buyers = VALUES(buyers), live_nodes = VALUES(live_nodes), coverage_pct = VALUES(coverage_pct),
        anomalies = VALUES(anomalies), pv_mismatch = VALUES(pv_mismatch),
        verified_at = IF(VALUES(state) = 'VERIFIED', VALUES(verified_at), verified_at),
@@ -188,7 +260,7 @@ async function saveSyncState({ ownerId, monthKey, sk }) {
       replacements: {
         owner,
         monthKey,
-        state: sk.state,
+        state: sk.state || 'BOUNDED',
         macroPv: sk.macroPv || 0,
         processedPv: sk.processedPv || 0,
         residualPv: sk.residualPv || 0,
@@ -198,7 +270,7 @@ async function saveSyncState({ ownerId, monthKey, sk }) {
         totalMem,
         termMem,
         inactMem,
-        buyers: sk.buyers || 0,
+        buyers: activeBuyers,
         liveNodes: sk.liveNodes || 0,
         coverage: sk.coveragePct || 0,
         anomalies: sk.anomalies || 0,
@@ -242,7 +314,9 @@ async function getSummary(ownerId, monthKey) {
 
   const totalMembers = st ? num(st.total_members) : 0;
   const terminatedMembers = st ? num(st.terminated_members) : 0;
-  const inactiveMembers = st ? num(st.inactive_members) : Math.max(0, totalMembers - terminatedMembers - buyers);
+  const inactiveMembers = totalMembers > 0
+    ? Math.max(0, totalMembers - terminatedMembers - buyers)
+    : (st ? num(st.inactive_members) : 0);
 
   return {
     exists: true,

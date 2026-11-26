@@ -4,21 +4,15 @@
  */
 const express = require('express');
 const router = express.Router();
-const { scrapeAndSave } = require('../services/rcmScraper'); // Apni service file ka naam check karein
 
 // Route: GET /api/scraper/fill-data
-router.get('/fill-data', async (req, res) => {
-    console.log("⚡ Scraper Triggered via API...");
-    
-    // Background me process start karo (User ko wait mat karao)
-    scrapeAndSave().catch(err => console.error("Scraper Error:", err));
-    
-    res.json({ 
-        success: true, 
-        message: "✅ Command Received. Scraper background me start ho gaya hai." 
+router.get('/fill-data', (req, res) => {
+    res.status(503).json({
+        success: false,
+        code: 'LOCAL_WORKER_REQUIRED',
+        status: 'OFFLOADED',
+        message: 'RCM portal scraping runs in the local portal worker.',
     });
 });
-
-const { Product } = require('../models');
 
 module.exports = router;

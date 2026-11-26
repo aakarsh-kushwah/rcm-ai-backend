@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /**
  * controllers/lifelinesLiveController.js
@@ -16,7 +16,6 @@ const num = (v, fallback = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 };
-const round2 = (v) => Math.round(num(v) * 100) / 100;
 const truthy = (v) => ['1', 'true', 'yes'].includes(String(v || '').toLowerCase());
 const monthKeyOf = (d) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
 
@@ -84,8 +83,10 @@ function shapeSummary(summary, live) {
     status,
     verified: summary.state === 'VERIFIED',
     verifiedAt: summary.verifiedAt,
+    updatedAt: summary.updatedAt,
     macroPv: summary.macroPv,
     processedPv: summary.processedPv,
+    residualPv: summary.residualPv,
     coveragePct: summary.coveragePct,
     totalSale: {
       exact,
@@ -107,19 +108,23 @@ exports.getLiveSummary = async (req, res) => {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
-    const now = new Date();
-    const monthKey = monthKeyOf(now);
+    const currentMonthKey = monthKeyOf(new Date());
+    const requestedMonth = String(req.query.monthKey || req.query.month_key || '').trim();
+    const monthKey = /^\d{6}$/.test(requestedMonth) ? requestedMonth : currentMonthKey;
+    const isCurrentMonth = monthKey === currentMonthKey;
+
     const summary = await activeView.getSummary(rootId, monthKey);
 
     const live = {
-      checkRequested: truthy(req.query.check),
+      checkRequested: isCurrentMonth && truthy(req.query.check),
       checked: false,
       sessionActive: false,
-      refreshing: isRefreshing(rootId)
+      refreshing: isCurrentMonth ? isRefreshing(rootId) : false
     };
 
     if (live.checkRequested) {
-      const session = getSession(rootId);
+      live.checked = true;
+      const session = await getSession(rootId);
       if (session) {
         live.sessionActive = true;
         live.refreshing = startRefresh(rootId, session);
@@ -138,13 +143,17 @@ exports.getPvBuckets = async (req, res) => {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
-    const requestedMonth = String(req.query.monthKey || '').trim();
+    const requestedMonth = String(req.query.monthKey || req.query.month_key || '').trim();
     const monthKey = /^\d{6}$/.test(requestedMonth) ? requestedMonth : monthKeyOf(new Date());
+    const legRaw = String(req.query.leg || '').trim().toUpperCase().replace(/^LEG\s*/, '');
 
     const result = await activeView.getBuckets({
       ownerId: rootId,
       monthKey,
+      leg: legRaw || null,
       bucket: req.query.bucket || null,
+      minPv: req.query.minPv ?? null,
+      maxPv: req.query.maxPv ?? null,
       limit: num(req.query.limit, 200),
       offset: num(req.query.offset, 0)
     });
@@ -160,7 +169,7 @@ exports.postLiveRefresh = async (req, res) => {
     const rootId = resolveRoot(req, res, req.body?.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
-    const session = getSession(rootId);
+    const session = await getSession(rootId);
     if (!session) {
       return res.status(409).json({ success: false, message: 'Please log in again to refresh.' });
     }

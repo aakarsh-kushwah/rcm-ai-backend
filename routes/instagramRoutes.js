@@ -7,55 +7,46 @@ const express = require('express');
 const router = express.Router();
 const instagramController = require('../controllers/instagramController');
 const { isAuthenticated, isActiveUser, restrictTo } = require('../middleware/authMiddleware');
-const { getSyncActivity, isScraperEnabled } = require('../services/instagramSyncService');
 
 const admin = [isAuthenticated, isActiveUser, restrictTo('SUPER_ADMIN', 'ADMIN')];
-
-function requireScraperEnabled(req, res, next) {
-  if (!isScraperEnabled()) {
-    return res.status(503).json({
-      success: false,
-      code: 'SCRAPER_DISABLED',
-      message: 'Scraping is disabled on this server. Requests must go to the tablet scraper.',
-    });
-  }
-  return next();
-}
 
 router.get('/status', ...admin, (req, res) => {
   res.status(200).json({
     success: true,
-    message: 'Instagram admin service is active.',
-    scraperEnabled: isScraperEnabled(),
+    message: 'Instagram account management is active; scraping runs in the local worker.',
+    scraperEnabled: false,
+    worker: 'local',
   });
 });
 
 // Live sync activity & queue status (persists across page navigation/back)
 router.get('/sync/activity', ...admin, (req, res) => {
-  try {
-    const activity = getSyncActivity();
-    return res.status(200).json({
-      success: true,
-      data: activity,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to load sync activity.',
-    });
-  }
+  return res.status(200).json({
+    success: true,
+    data: {
+      scraperEnabled: false,
+      worker: 'local',
+      status: 'idle',
+      queuedCount: 0,
+      queuedItems: [],
+      activeAccountId: null,
+      activeUsername: null,
+      currentProgress: { scroll: 0, maxScrolls: 0, scrapedCount: 0, mode: null },
+      lastJob: null,
+      recentLogs: [],
+    },
+  });
 });
 
-// Import (offloaded to scraper worker)
-router.post('/import', ...admin, requireScraperEnabled, instagramController.importReelOrAccount);
-router.post('/import-bulk', ...admin, requireScraperEnabled, instagramController.bulkImport);
+// Account registration stays in the API; the standalone worker performs scraping.
+router.post('/import', ...admin, instagramController.importReelOrAccount);
+router.post('/import-bulk', ...admin, instagramController.bulkImport);
 
 // Accounts
 router.get('/accounts', ...admin, instagramController.getAccounts);
 router.post(
   '/accounts/:id/sync',
   ...admin,
-  requireScraperEnabled,
   instagramController.syncAccount
 );
 router.patch('/accounts/:id/toggle', ...admin, instagramController.toggleAccount);

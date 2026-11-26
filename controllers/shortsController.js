@@ -5,10 +5,8 @@
 const asyncHandler = require('express-async-handler');
 const axios = require('axios');
 const { Op, DataTypes, QueryTypes, literal } = require('sequelize');
-const { parse } = require('iso8601-duration');
 const models = require('../models');
-const { Channel, ChannelVideo, ShortInteraction, ShortComment, User } = models;
-const { syncChannel } = require('../services/channelSyncService');
+const { Channel, ChannelVideo, InstagramReel, ShortInteraction, ShortComment, User } = models;
 const instagramService = require('../services/instagramService');
 
 /* -------------------------------------------------------------------------- */
@@ -26,14 +24,10 @@ const FEED_DEFAULT_LIMIT = 10;
 const FEED_MAX_LIMIT = 30;
 const COMMENT_MAX_LENGTH = 500;
 const MAX_SHORT_SECONDS = 180;
-const IMPORT_MAX_PAGES = 6;
-const IMPORT_INPUT_MAX_LENGTH = 300;
 const CURSOR_MAX_LENGTH = 400;
 
 const CHANNEL_ATTRS = ['id', 'name', 'handle', 'logoUrl', 'youtubeChannelId'];
 const USER_ATTRS = ['id', 'fullName', 'avatar'];
-const IMPORT_PAYLOAD_KEYS = ['videoUrl', 'url', 'shortUrl', 'link', 'videoId'];
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 const POOL = {
   redisKey: 'shorts:feed:pool',
@@ -60,20 +54,10 @@ const POOL = {
 };
 
 const IG_STREAM = {
-  l1Max: 20000,
   ttlMs: 4 * 60 * 60 * 1000,
   maxAgeSec: 14400,
   expirySafetyMs: 5 * 60 * 1000,
   minUsableMs: 60 * 1000,
-  missTtlMs: 60 * 1000,
-  missTtlSec: 60,
-  redisTimeoutMs: 150,
-  lookupBudgetMs: 400,
-  scrapeTimeoutMs: 600,
-  scrapeMaxConcurrent: 6,
-  breakerFailures: 8,
-  breakerOpenMs: 60 * 1000,
-  maxContentBytes: 3 * 1024 * 1024,
 };
 const IG_MEDIA_HOST_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
 const SHORTCODE_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -99,14 +83,6 @@ const log = {
   warn: (...a) => console.warn(stamp(), '[shorts]', ...a),
   error: (...a) => console.error(stamp(), '[shorts]', ...a),
 };
-
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.name = 'HttpError';
-    this.status = status;
-  }
-}
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 
@@ -209,23 +185,6 @@ function normalizeId(raw) {
   return /^[A-Za-z0-9_-]{1,64}$/.test(s) ? s : null;
 }
 
-function durationToSeconds(iso) {
-  if (!iso || typeof iso !== 'string') return 0;
-  try {
-    const d = parse(iso);
-    return Math.floor(
-      (d.weeks || 0) * 604800 +
-        (d.days || 0) * 86400 +
-        (d.hours || 0) * 3600 +
-        (d.minutes || 0) * 60 +
-        (d.seconds || 0)
-    );
-  } catch (e) {
-    log.warn(`could not parse duration "${iso}": ${e.message}`);
-    return 0;
-  }
-}
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function withTimeout(promise, ms, label) {
@@ -270,12 +229,6 @@ function creatorKeyOf(row) {
 
 const platformOf = (row) => (String(row.id).startsWith('ig_') ? 'ig' : 'yt');
 const poolCreatorKey = (row) => `${platformOf(row)}:${creatorKeyOf(row) || '_'}`;
-
-function lruSet(map, key, value, max) {
-  if (map.has(key)) map.delete(key);
-  else if (map.size >= max) map.delete(map.keys().next().value);
-  map.set(key, value);
-}
 
 function safeRequire(path) {
   try {
@@ -553,14 +506,6 @@ exports.getShortsByChannel = asyncHandler(async (req, res) => {
 /* Instagram stream engine: GET /api/shorts/ig-stream/:shortcode              */
 /* -------------------------------------------------------------------------- */
 
-const igStream = {
-  hits: new Map(),
-  misses: new Map(),
-  inflight: new Map(),
-  activeScrapes: 0,
-  breaker: { fails: 0, openUntil: 0 },
-};
-
 function setStreamCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
@@ -592,239 +537,8 @@ function evaluateMediaUrl(raw) {
   return { url: u.href, ttlMs };
 }
 
-function streamCacheGet(shortcode) {
-  const e = igStream.hits.get(shortcode);
-  if (!e) return null;
-  const remaining = e.exp - Date.now();
-  if (remaining <= 0) {
-    igStream.hits.delete(shortcode);
-    return null;
-  }
-  return { url: e.url, ttlMs: remaining };
-}
-
-function streamCacheSet(shortcode, url, ttlMs) {
-  lruSet(igStream.hits, shortcode, { url, exp: Date.now() + ttlMs }, IG_STREAM.l1Max);
-  igStream.misses.delete(shortcode);
-}
-
-function streamIsMissed(shortcode) {
-  const exp = igStream.misses.get(shortcode);
-  if (!exp) return false;
-  if (exp <= Date.now()) {
-    igStream.misses.delete(shortcode);
-    return false;
-  }
-  return true;
-}
-
-function streamMarkMiss(shortcode) {
-  lruSet(igStream.misses, shortcode, Date.now() + IG_STREAM.missTtlMs, IG_STREAM.l1Max);
-}
-
-function getInstagramReelModel() {
-  return models.InstagramReel || safeRequire('../models/InstagramReel');
-}
-
 function getInstagramAccountModel() {
   return models.InstagramAccount || safeRequire('../models/InstagramAccount');
-}
-
-function persistStreamUrl(shortcode, url, ttlMs) {
-  setImmediate(async () => {
-    const redis = safeRedis();
-    if (redis) {
-      try {
-        await redis.set(`ig:stream:${shortcode}`, url, 'EX', Math.max(60, Math.floor(ttlMs / 1000)));
-      } catch (_) {}
-    }
-    try {
-      const Reel = getInstagramReelModel();
-      if (Reel) await Reel.update({ videoUrl: url }, { where: { shortcode } });
-    } catch (err) {
-      log.warn(`ig-stream: could not store videoUrl for ${shortcode}: ${err.message}`);
-    }
-  });
-}
-
-function persistStreamMiss(shortcode) {
-  setImmediate(async () => {
-    const redis = safeRedis();
-    if (!redis) return;
-    try {
-      await redis.set(`ig:stream:miss:${shortcode}`, '1', 'EX', IG_STREAM.missTtlSec);
-    } catch (_) {}
-  });
-}
-
-function forgetStream(shortcode) {
-  igStream.hits.delete(shortcode);
-  igStream.misses.delete(shortcode);
-  const redis = safeRedis();
-  if (redis) redis.del(`ig:stream:${shortcode}`, `ig:stream:miss:${shortcode}`).catch(() => {});
-}
-
-async function readStreamFromRedis(redis, shortcode) {
-  const pipe = redis.pipeline();
-  pipe.get(`ig:stream:${shortcode}`);
-  pipe.pttl(`ig:stream:${shortcode}`);
-  pipe.get(`ig:stream:miss:${shortcode}`);
-  const results = assertPipeline(await withTimeout(pipe.exec(), IG_STREAM.redisTimeoutMs, 'redis'));
-  return { url: results[0][1], pttl: Number(results[1][1]), missed: Boolean(results[2][1]) };
-}
-
-const scraperBreakerOpen = () => Date.now() < igStream.breaker.openUntil;
-
-function scraperSucceeded() {
-  igStream.breaker.fails = 0;
-}
-
-function scraperFailed() {
-  igStream.breaker.fails += 1;
-  if (igStream.breaker.fails >= IG_STREAM.breakerFailures) {
-    igStream.breaker.openUntil = Date.now() + IG_STREAM.breakerOpenMs;
-    igStream.breaker.fails = 0;
-    log.warn(`ig-stream: scraper circuit opened for ${IG_STREAM.breakerOpenMs}ms`);
-  }
-}
-
-async function scrapeInstagramVideoUrl(shortcode) {
-  const sessionId = process.env.INSTAGRAM_SESSION_ID;
-  const headers = {
-    'User-Agent':
-      'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-    Accept: '*/*',
-  };
-  if (sessionId) headers.Cookie = `sessionid=${sessionId}; ds_user_id=${sessionId.split('%')[0]}`;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), IG_STREAM.scrapeTimeoutMs);
-  try {
-    const response = await axios.get(`https://www.instagram.com/reel/${shortcode}/?__a=1&__d=dis`, {
-      headers,
-      validateStatus: () => true,
-      timeout: IG_STREAM.scrapeTimeoutMs,
-      signal: controller.signal,
-      maxContentLength: IG_STREAM.maxContentBytes,
-      maxRedirects: 2,
-    });
-
-    if (response.status === 429 || response.status === 403 || response.status >= 500) {
-      return { url: null, transient: true };
-    }
-
-    const data = response.data;
-    let rawUrl =
-      (data &&
-        data.items &&
-        data.items[0] &&
-        data.items[0].video_versions &&
-        data.items[0].video_versions[0] &&
-        data.items[0].video_versions[0].url) ||
-      (data && data.graphql && data.graphql.shortcode_media && data.graphql.shortcode_media.video_url) ||
-      null;
-
-    if (!rawUrl && typeof data === 'string') {
-      const ogMatch = data.match(/<meta property="og:video" content="([^"]+)"/i);
-      const jsonMatch = data.match(/"video_url":"(https:[^"]+)"/i);
-      rawUrl = ogMatch ? ogMatch[1] : jsonMatch ? jsonMatch[1] : null;
-    }
-
-    if (!rawUrl) return { url: null, transient: false };
-    const cleaned = String(rawUrl).replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
-    return { url: cleaned, transient: false };
-  } catch (err) {
-    log.warn(`ig-stream live scrape failed for ${shortcode}: ${err.message}`);
-    return { url: null, transient: true };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function lookupStreamUrl(shortcode) {
-  const redis = safeRedis();
-  if (redis) {
-    try {
-      const hit = await readStreamFromRedis(redis, shortcode);
-      if (hit.url) {
-        const ev = evaluateMediaUrl(hit.url);
-        if (ev) {
-          const ttlMs = hit.pttl > 0 ? Math.min(hit.pttl, ev.ttlMs) : ev.ttlMs;
-          streamCacheSet(shortcode, ev.url, ttlMs);
-          return { url: ev.url, ttlMs };
-        }
-      }
-      if (hit.missed) return { url: null, missed: true };
-    } catch (_) {}
-  }
-
-  try {
-    const Reel = getInstagramReelModel();
-    if (Reel) {
-      const row = await Reel.findOne({ where: { shortcode }, attributes: ['videoUrl'], raw: true });
-      const ev = evaluateMediaUrl(row && row.videoUrl);
-      if (ev) {
-        streamCacheSet(shortcode, ev.url, ev.ttlMs);
-        persistStreamUrl(shortcode, ev.url, ev.ttlMs);
-        return { url: ev.url, ttlMs: ev.ttlMs };
-      }
-    }
-  } catch (err) {
-    log.warn(`ig-stream: DB lookup failed for ${shortcode}: ${err.message}`);
-  }
-  return { url: null };
-}
-
-async function scrapeWithBudget(shortcode) {
-  if (scraperBreakerOpen() || igStream.activeScrapes >= IG_STREAM.scrapeMaxConcurrent) return { url: null };
-  igStream.activeScrapes += 1;
-  try {
-    const result = await withTimeout(scrapeInstagramVideoUrl(shortcode), IG_STREAM.scrapeTimeoutMs, 'live scrape');
-    const ev = evaluateMediaUrl(result && result.url);
-    if (ev) {
-      scraperSucceeded();
-      streamCacheSet(shortcode, ev.url, ev.ttlMs);
-      persistStreamUrl(shortcode, ev.url, ev.ttlMs);
-      return { url: ev.url, ttlMs: ev.ttlMs };
-    }
-    if (result && result.transient) scraperFailed();
-    return { url: null };
-  } catch (_) {
-    scraperFailed();
-    return { url: null };
-  } finally {
-    igStream.activeScrapes -= 1;
-  }
-}
-
-async function doResolveStream(shortcode) {
-  let found = { url: null };
-  try {
-    found = await withTimeout(lookupStreamUrl(shortcode), IG_STREAM.lookupBudgetMs, 'redis/db lookup');
-  } catch (_) {
-    found = { url: null };
-  }
-  if (found.url) return found;
-  if (found.missed) {
-    streamMarkMiss(shortcode);
-    return { url: null };
-  }
-
-  const scraped = await scrapeWithBudget(shortcode);
-  if (scraped.url) return scraped;
-
-  streamMarkMiss(shortcode);
-  persistStreamMiss(shortcode);
-  return { url: null };
-}
-
-function resolveInstagramStream(shortcode) {
-  if (igStream.inflight.has(shortcode)) return igStream.inflight.get(shortcode);
-  const p = doResolveStream(shortcode).finally(() => {
-    if (igStream.inflight.get(shortcode) === p) igStream.inflight.delete(shortcode);
-  });
-  igStream.inflight.set(shortcode, p);
-  return p;
 }
 
 function redirectToMedia(res, url, ttlMs) {
@@ -842,44 +556,38 @@ function streamUnavailable(res) {
 
 exports.getInstagramStream = async (req, res) => {
   setStreamCorsHeaders(res);
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
+  const shortcode = req.params.shortcode;
+  if (!shortcode || !SHORTCODE_RE.test(shortcode) || isMockShortcode(shortcode)) {
+    return streamUnavailable(res);
+  }
+
   try {
-    if (req.method === 'OPTIONS') return res.status(204).end();
-
-    const shortcode = req.params.shortcode;
-    if (!shortcode || !SHORTCODE_RE.test(shortcode) || isMockShortcode(shortcode)) {
-      return streamUnavailable(res);
-    }
-
-    const hot = streamCacheGet(shortcode);
-    if (hot) return redirectToMedia(res, hot.url, hot.ttlMs);
-    if (streamIsMissed(shortcode)) return streamUnavailable(res);
-
-    const result = await resolveInstagramStream(shortcode);
-    if (result && result.url) return redirectToMedia(res, result.url, result.ttlMs);
-    return streamUnavailable(res);
+    const reel = await InstagramReel.findOne({
+      where: { shortcode },
+      attributes: ['videoUrl'],
+      raw: true,
+    });
+    const media = evaluateMediaUrl(reel && reel.videoUrl);
+    if (!media) return streamUnavailable(res);
+    return redirectToMedia(res, media.url, media.ttlMs);
   } catch (err) {
-    log.error(`ig-stream failed: ${err && err.message}`);
-    if (res.headersSent) return undefined;
-    return streamUnavailable(res);
+    log.error(`ig-stream database lookup failed for ${shortcode}: ${err.message}`);
+    return res.status(500).json({ success: false, message: 'Failed to load Instagram Reel stream.' });
   }
 };
 
-exports.reportUnavailable = (req, res) => {
-  res.status(200).json({ success: true });
-
-  setImmediate(() => {
-    try {
-      const id = String((req.params && req.params.id) || '');
-      if (!id.startsWith('ig_')) return;
-      const shortcode = id.slice(3);
-      if (SHORTCODE_RE.test(shortcode)) forgetStream(shortcode);
-    } catch (err) {
-      log.warn(`reportUnavailable failed: ${err.message}`);
+exports.reportUnavailable = asyncHandler(async (req, res) => {
+  const id = String((req.params && req.params.id) || '');
+  if (id.startsWith('ig_')) {
+    const shortcode = id.slice(3);
+    if (SHORTCODE_RE.test(shortcode)) {
+      await InstagramReel.update({ videoUrl: null }, { where: { shortcode } });
     }
-  });
-};
+  }
+  return res.status(200).json({ success: true });
+});
 
 /* -------------------------------------------------------------------------- */
 /* Likes & comments                                                           */
@@ -1124,372 +832,153 @@ exports.adminDeleteShort = asyncHandler(async (req, res) => {
   res.status(200).json({ success: true, message: 'Short video deleted successfully.' });
 });
 
-/* -------------------------------------------------------------------------- */
-/* Import: input extraction & detection                                       */
-/* -------------------------------------------------------------------------- */
-
-function extractImportInput(req) {
-  const pick = (src, allowJson) => {
-    if (src === undefined || src === null) return null;
-    if (Buffer.isBuffer(src)) src = src.toString('utf8');
-
-    if (typeof src === 'string') {
-      const s = src.trim();
-      if (!s) return null;
-      if (allowJson && (s[0] === '{' || s[0] === '[' || s[0] === '"')) {
-        try {
-          const nested = pick(JSON.parse(s), false);
-          if (nested) return nested;
-        } catch (_) {}
-      }
-      return s;
-    }
-
-    if (Array.isArray(src)) {
-      for (const item of src) {
-        const v = pick(item, false);
-        if (v) return v;
-      }
-      return null;
-    }
-
-    if (typeof src === 'object') {
-      for (const key of IMPORT_PAYLOAD_KEYS) {
-        const v = src[key];
-        if (typeof v === 'string' && v.trim()) return v.trim();
-      }
-    }
-    return null;
-  };
-
-  try {
-    return pick(req.body, true) || pick(req.query, false) || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function detectYouTubeInput(input) {
-  const unknown = { type: 'unknown', value: null };
-  if (typeof input !== 'string') return unknown;
-  const s = input.trim();
-  if (!s || s.length > IMPORT_INPUT_MAX_LENGTH) return unknown;
-
-  if (/^UC[\w-]{22}$/.test(s)) return { type: 'channel', value: s, kind: 'id', shortsOnly: false };
-  if (/^@[\w.-]{1,100}$/.test(s)) return { type: 'channel', value: s.slice(1), kind: 'handle', shortsOnly: false };
-  if (/^[\w-]{11}$/.test(s)) return { type: 'video', value: s };
-
-  let u;
-  try {
-    u = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`);
-  } catch (_) {
-    return unknown;
-  }
-
-  const host = u.hostname.toLowerCase().replace(/^(www\.|m\.|music\.)/, '');
-  const path = u.pathname;
-  let m;
-
-  if (host === 'youtu.be') {
-    m = path.match(/^\/([\w-]{11})/);
-    return m ? { type: 'video', value: m[1] } : unknown;
-  }
-  if (host !== 'youtube.com') return unknown;
-
-  if ((m = path.match(/^\/shorts\/channel\/(UC[\w-]{22})/))) {
-    return { type: 'channel', value: m[1], kind: 'id', shortsOnly: true };
-  }
-  if ((m = path.match(/^\/channel\/(UC[\w-]{22})/))) {
-    return { type: 'channel', value: m[1], kind: 'id', shortsOnly: false };
-  }
-  if ((m = path.match(/^\/@([\w.-]+)/))) {
-    return { type: 'channel', value: m[1], kind: 'handle', shortsOnly: /\/shorts\/?$/.test(path) };
-  }
-  if ((m = path.match(/^\/(?:c|user)\/([\w.-]+)/))) {
-    return { type: 'channel', value: m[1], kind: 'legacy', shortsOnly: false };
-  }
-
-  const v = u.searchParams.get('v');
-  if (v && /^[\w-]{11}$/.test(v)) return { type: 'video', value: v };
-  if ((m = path.match(/^\/(?:shorts|embed|live|v)\/([\w-]{11})/))) return { type: 'video', value: m[1] };
-
-  return unknown;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Import: YouTube API access                                                 */
-/* -------------------------------------------------------------------------- */
-
-const getApiKey = () => process.env.YOUTUBE_API_KEY;
-
-async function ytGet(resource, params) {
-  const { data } = await axios.get(`https://www.googleapis.com/youtube/v3/${resource}`, {
-    params: { ...params, key: getApiKey() },
-    timeout: 10000,
-  });
-  return data;
-}
-
-async function fetchChannelFromYouTube(detected) {
-  const part = 'snippet,statistics,contentDetails';
-  let data;
-  if (detected.kind === 'id') {
-    data = await ytGet('channels', { part, id: detected.value });
-  } else if (detected.kind === 'handle') {
-    data = await ytGet('channels', { part, forHandle: `@${detected.value}` });
-  } else {
-    data = await ytGet('channels', { part, forUsername: detected.value });
-    if (!(data.items || []).length) {
-      data = await ytGet('channels', { part, forHandle: `@${detected.value}` });
-    }
-  }
-  return (data.items || [])[0] || null;
-}
-
-function pickThumbnail(thumbnails, order) {
-  if (!thumbnails) return null;
-  for (const size of order) {
-    if (thumbnails[size] && thumbnails[size].url) return thumbnails[size].url;
-  }
-  return null;
-}
-
-function channelPayloadFromYouTube(chData, { shortsOnly = false } = {}) {
-  const sn = chData.snippet || {};
-  const st = chData.statistics || {};
-  const cd = chData.contentDetails || {};
-  return {
-    youtubeChannelId: chData.id,
-    name: sn.title || 'Unknown Channel',
-    handle: sn.customUrl || null,
-    logoUrl: pickThumbnail(sn.thumbnails, ['high', 'medium']),
-    description: sn.description || null,
-    subscriberCount: st.subscriberCount ? parseInt(st.subscriberCount, 10) : 0,
-    videoCount: st.videoCount ? parseInt(st.videoCount, 10) : 0,
-    viewCount: st.viewCount ? parseInt(st.viewCount, 10) : 0,
-    uploadsPlaylistId: (cd.relatedPlaylists && cd.relatedPlaylists.uploads) || null,
-    isActive: true,
-    source: shortsOnly ? 'shorts-only' : 'channel',
-    isShortsOnly: shortsOnly,
-  };
-}
-
-async function applyShortsOnlyMode(channel, shortsOnly) {
-  if (!shortsOnly || !channel) return channel;
-  let dirty = false;
-  if (Channel.rawAttributes && Channel.rawAttributes.isShortsOnly && !channel.isShortsOnly) {
-    channel.isShortsOnly = true;
-    dirty = true;
-  }
-  if (Channel.rawAttributes && Channel.rawAttributes.source && channel.source !== 'shorts-only') {
-    channel.source = 'shorts-only';
-    dirty = true;
-  }
-  if (dirty) await channel.save();
-  return channel;
-}
-
-async function findOrCreateChannelFromYouTubeData(chData, opts) {
-  const existing = await Channel.findOne({ where: { youtubeChannelId: chData.id } });
-  if (existing) {
-    return applyShortsOnlyMode(existing, Boolean(opts && opts.shortsOnly));
-  }
-  try {
-    return await Channel.create(channelPayloadFromYouTube(chData, opts));
-  } catch (err) {
-    if (err.name === 'SequelizeUniqueConstraintError') {
-      const again = await Channel.findOne({ where: { youtubeChannelId: chData.id } });
-      if (again) return applyShortsOnlyMode(again, Boolean(opts && opts.shortsOnly));
-    }
-    throw err;
-  }
-}
-
-function findChannelInDb(detected) {
-  if (detected.kind === 'id') return Channel.findOne({ where: { youtubeChannelId: detected.value } });
-  return Channel.findOne({
-    where: {
-      [Op.or]: [{ handle: `@${detected.value}` }, { handle: detected.value }, { name: detected.value }],
-    },
-  });
-}
-
-/* -------------------------------------------------------------------------- */
-/* Import: operations                                                         */
-/* -------------------------------------------------------------------------- */
-
-const importLocks = new Set();
-
-async function importChannel(detected, forceShortsOnly = false) {
-  const effectiveShortsOnly = Boolean(detected.shortsOnly || forceShortsOnly);
-  const lockKey = `${detected.kind}:${String(detected.value).toLowerCase()}`;
-  if (importLocks.has(lockKey)) {
-    throw new HttpError(409, 'This channel is already being imported. Please wait.');
-  }
-  importLocks.add(lockKey);
-
-  try {
-    let channel = await findChannelInDb(detected);
-
-    if (!channel) {
-      log.info(`import: channel not in DB, fetching from YouTube: ${detected.value}`);
-      const chData = await fetchChannelFromYouTube(detected);
-      if (!chData) throw new HttpError(404, 'Channel not found on YouTube.');
-      channel = await findOrCreateChannelFromYouTubeData(chData, { shortsOnly: effectiveShortsOnly });
-    } else if (effectiveShortsOnly) {
-      channel = await applyShortsOnlyMode(channel, true);
-    }
-
-    const isShortsOnlyChannel = Boolean(
-      effectiveShortsOnly || channel.isShortsOnly || channel.source === 'shorts-only'
-    );
-
-    log.info(
-      `import: syncing channel "${channel.name}" (id=${channel.id}, shortsOnly=${isShortsOnlyChannel})`
-    );
-    const newShortsCount = await syncChannel(channel, {
-      skipAlerts: true,
-      maxPages: IMPORT_MAX_PAGES,
-      shortsOnly: isShortsOnlyChannel,
-    });
-
-    const { demoted } = await reconcileChannelShorts(channel.id, { promote: false });
-    if (demoted > 0) log.warn(`import: demoted ${demoted} non-short videos for channel ${channel.id}`);
-
-    const shortsCount = await refreshShortsCount(channel.id);
-    invalidateFeedCache();
-
-    return {
-      message: isShortsOnlyChannel
-        ? `Shorts-only channel "${channel.name}" synced. Added ${newShortsCount} new shorts.`
-        : `Channel "${channel.name}" synced. Added ${newShortsCount} new videos.`,
-      data: {
-        channelId: channel.id,
-        name: channel.name,
-        shortsOnly: isShortsOnlyChannel,
-        newShortsCount,
-        shortsCount,
-      },
-    };
-  } finally {
-    importLocks.delete(lockKey);
-  }
-}
-
-async function importVideo(videoId, force) {
-  const videoRes = await ytGet('videos', { part: 'snippet,contentDetails,statistics', id: videoId });
-  const ytVideo = (videoRes.items || [])[0];
-  if (!ytVideo) throw new HttpError(404, 'Video not found on YouTube.');
-
-  const snippet = ytVideo.snippet || {};
-  const contentDetails = ytVideo.contentDetails || {};
-  const statistics = ytVideo.statistics || {};
-
-  const totalSeconds = durationToSeconds(contentDetails.duration);
-  const qualifiesAsShort = isValidShortDuration(totalSeconds);
-
-  if (!force && !qualifiesAsShort) {
-    throw new HttpError(
-      400,
-      `This does not look like a Short (duration ${totalSeconds}s, must be 1-${MAX_SHORT_SECONDS}s).`
-    );
-  }
-
-  let channel = await Channel.findOne({ where: { youtubeChannelId: snippet.channelId } });
-  if (!channel) {
-    const chData = await fetchChannelFromYouTube({ kind: 'id', value: snippet.channelId });
-    if (!chData) throw new HttpError(502, "Could not fetch the video's channel from YouTube.");
-    channel = await findOrCreateChannelFromYouTubeData(chData, { shortsOnly: false });
-  }
-
-  const fields = {
-    channelId: channel.id,
-    title: snippet.title || 'Untitled Short',
-    description: snippet.description || '',
-    thumbnailUrl: pickThumbnail(snippet.thumbnails, ['high', 'medium', 'default']) || '',
-    durationStr: contentDetails.duration || '',
-    totalSeconds,
-    viewCount: statistics.viewCount ? parseInt(statistics.viewCount, 10) : 0,
-    publishedAt: snippet.publishedAt ? new Date(snippet.publishedAt) : new Date(),
-    isAvailable: true,
-    isShort: qualifiesAsShort,
-  };
-
-  const [dbVideo, created] = await ChannelVideo.findOrCreate({
-    where: { youtubeVideoId: videoId },
-    defaults: { ...fields, youtubeVideoId: videoId },
-  });
-  if (!created) await dbVideo.update(fields);
-
-  await refreshShortsCount(channel.id);
-  invalidateFeedCache();
-
-  return {
-    message: qualifiesAsShort
-      ? `Short "${dbVideo.title}" imported successfully.`
-      : `Video "${dbVideo.title}" imported as long-form (not added to Shorts).`,
-    data: dbVideo,
-  };
-}
-
-function mapImportError(err) {
-  if (err instanceof HttpError) return { status: err.status, message: err.message };
-
-  if (err && err.isAxiosError) {
-    const upstream = err.response && err.response.status;
-    if (upstream === 403 || upstream === 429) return { status: 503, message: 'YouTube API quota or permission issue.' };
-    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
-      return { status: 504, message: 'YouTube API request timed out.' };
-    }
-    return { status: 502, message: 'YouTube API request failed.' };
-  }
-
-  return { status: 500, message: IS_PRODUCTION ? 'Import failed.' : (err && err.message) || 'Import failed.' };
-}
-
 exports.adminImportSingleShort = asyncHandler(async (req, res) => {
+  const input = String((req.body && (req.body.videoUrl || req.body.url)) || '').trim();
+  if (!input) return fail(res, 400, 'A YouTube Short or channel URL is required.');
+
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({
+      success: false,
+      message: 'YouTube channel resolution is unavailable; configure YOUTUBE_API_KEY.',
+    });
+  }
+
+  const videoMatch = input.match(
+    /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:shorts|embed|live|v)\/|youtu\.be\/)([A-Za-z0-9_-]{11})(?:[/?#]|$)/i
+  );
+  const isVideoImport = Boolean(videoMatch);
+  const channelIdMatch = input.match(/^(UC[\w-]{22})$/);
+  let handle = null;
+  let channelId = channelIdMatch ? channelIdMatch[1] : null;
+  let isShortsOnly = Boolean(req.body && req.body.shortsOnly === true);
+
+  if (!videoMatch && !channelId) {
+    if (input.startsWith('@')) {
+      handle = input.slice(1);
+    } else {
+      try {
+        const url = new URL(input);
+        if (!/(^|\.)youtube\.com$/i.test(url.hostname)) {
+          return fail(res, 400, 'Provide a valid YouTube Short or channel URL.');
+        }
+        const path = url.pathname;
+        const channelPath = path.match(/^\/channel\/(UC[\w-]{22})\/?$/i);
+        const handlePath = path.match(/^\/@([\w.-]{1,100})(?:\/.*)?$/);
+        const customPath = path.match(/^\/(?:c|user)\/([\w.-]{1,100})(?:\/.*)?$/i);
+        if (channelPath) channelId = channelPath[1];
+        else if (handlePath) handle = handlePath[1];
+        else if (customPath) handle = customPath[1];
+        else return fail(res, 400, 'Provide a valid YouTube Short or channel URL.');
+      } catch (_) {
+        return fail(res, 400, 'Provide a valid YouTube Short or channel URL.');
+      }
+    }
+  }
+
   try {
-    const rawInput = extractImportInput(req);
-
-    if (!rawInput) {
-      return fail(
-        res,
-        400,
-        `YouTube URL or ID is required. Send it as one of: ${IMPORT_PAYLOAD_KEYS.join(', ')} (JSON body), a plain-text body, or a query parameter.`
-      );
+    if (videoMatch) {
+      const { data } = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+        params: { part: 'snippet', id: videoMatch[1], key: apiKey },
+        timeout: 10000,
+      });
+      const video = (data.items || [])[0];
+      if (!video || !video.snippet || !video.snippet.channelId) {
+        return res.status(404).json({ success: false, message: 'YouTube video was not found.' });
+      }
+      channelId = video.snippet.channelId;
+    } else if (!channelId) {
+      const { data } = await axios.get('https://www.googleapis.com/youtube/v3/channels', {
+        params: { part: 'id', forHandle: handle, key: apiKey },
+        timeout: 10000,
+      });
+      const matchedChannel = (data.items || [])[0];
+      if (matchedChannel) channelId = matchedChannel.id;
+      else {
+        const search = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+          params: { part: 'snippet', type: 'channel', q: handle, maxResults: 1, key: apiKey },
+          timeout: 10000,
+        });
+        channelId = ((search.data.items || [])[0] || {}).id?.channelId;
+      }
     }
-    if (rawInput.length > IMPORT_INPUT_MAX_LENGTH) {
-      return fail(res, 400, `Input is too long (max ${IMPORT_INPUT_MAX_LENGTH} characters).`);
+
+    if (!channelId) return res.status(404).json({ success: false, message: 'YouTube channel was not found.' });
+
+    const { data } = await axios.get('https://www.googleapis.com/youtube/v3/channels', {
+      params: {
+        part: 'snippet,contentDetails,statistics,brandingSettings',
+        id: channelId,
+        key: apiKey,
+      },
+      timeout: 10000,
+    });
+    const details = (data.items || [])[0];
+    const snippet = (details && details.snippet) || {};
+    const uploadsPlaylistId =
+      details && details.contentDetails && details.contentDetails.relatedPlaylists
+        ? details.contentDetails.relatedPlaylists.uploads
+        : null;
+    if (!details || !uploadsPlaylistId) {
+      return res.status(404).json({ success: false, message: 'YouTube channel details were not found.' });
     }
-    if (!getApiKey()) {
-      log.error('YOUTUBE_API_KEY is not configured');
-      return fail(res, 500, 'YouTube API key not configured on backend.');
+
+    const statistics = details.statistics || {};
+    const branding = details.brandingSettings || {};
+    const thumbnails = snippet.thumbnails || {};
+    const existing = await Channel.findOne({ where: { youtubeChannelId: details.id } });
+    const values = {
+      youtubeChannelId: details.id,
+      handle: snippet.customUrl || (handle ? `@${handle}` : ''),
+      name: snippet.title || 'Unknown Channel',
+      logoUrl:
+        (thumbnails.high && thumbnails.high.url) ||
+        (thumbnails.medium && thumbnails.medium.url) ||
+        (thumbnails.default && thumbnails.default.url) ||
+        '',
+      bannerUrl: (branding.image && branding.image.bannerExternalUrl) || '',
+      description: snippet.description || '',
+      subscriberCount: Number(statistics.subscriberCount) || 0,
+      videoCount: Number(statistics.videoCount) || 0,
+      viewCount: Number(statistics.viewCount) || 0,
+      joinedDate: snippet.publishedAt ? new Date(snippet.publishedAt) : null,
+      country: snippet.country || null,
+      uploadsPlaylistId,
+      lastSyncStatus: 'pending',
+      lastSyncError: null,
+    };
+
+    let channel;
+    if (existing) {
+      if (isShortsOnly) {
+        values.source = 'shorts-only';
+        values.isShortsOnly = true;
+      }
+      await existing.update(values);
+      channel = existing;
+    } else {
+      channel = await Channel.create({
+        ...values,
+        isActive: true,
+        source: isShortsOnly || isVideoImport ? 'shorts-only' : 'channel',
+        isShortsOnly: isShortsOnly || isVideoImport,
+      });
     }
 
-    const detected = detectYouTubeInput(rawInput);
-    if (detected.type === 'unknown') {
-      return fail(res, 400, 'Invalid YouTube URL or ID. Please provide a valid channel or video link.');
-    }
-
-    const body = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body : {};
-    const force = body.force === true || body.force === 'true';
-    const forceShortsOnly =
-      body.shortsOnly === true ||
-      body.shortsOnly === 'true' ||
-      req.query.shortsOnly === 'true' ||
-      req.query.shortsOnly === '1';
-
-    const result =
-      detected.type === 'channel'
-        ? await importChannel(detected, forceShortsOnly)
-        : await importVideo(detected.value, force);
-
-    return res.status(200).json({ success: true, ...result });
+    return res.status(existing ? 200 : 201).json({
+      success: true,
+      message: 'Channel sync requested; the local worker will process it on its next run.',
+      count: 0,
+      newVideosCount: 0,
+      data: { channel, newShortsCount: 0 },
+      worker: 'local',
+    });
   } catch (err) {
-    const { status, message } = mapImportError(err);
-    if (status >= 500) log.error(`import failed (${status}): ${err && err.stack ? err.stack : err}`);
-    else log.warn(`import rejected (${status}): ${message}`);
-    return fail(res, status, message);
+    log.error(`Shorts import channel resolution failed: ${err.message}`);
+    return res.status(502).json({
+      success: false,
+      message: 'Failed to resolve the YouTube channel for worker sync.',
+    });
   }
 });
 
@@ -2097,9 +1586,6 @@ function toClientInstagramRow(row) {
   const derivedCode = String(out.id).replace(/^ig_/, '');
   const shortcode = String(out.shortcode || (SHORTCODE_RE.test(derivedCode) ? derivedCode : '') || '');
   if (shortcode) out.shortcode = shortcode;
-
-  const ev = evaluateMediaUrl(firstPresent(...IG_VIDEO_KEYS.map((k) => out[k])));
-  if (ev && shortcode && SHORTCODE_RE.test(shortcode)) streamCacheSet(shortcode, ev.url, ev.ttlMs);
 
   IG_VIDEO_KEYS.forEach((key) => {
     delete out[key];
@@ -2965,8 +2451,6 @@ exports.__test = {
   interleaveByChannel,
   interleaveYtAndIg,
   roundRobinByCreator,
-  detectYouTubeInput,
-  extractImportInput,
   encodeCursor,
   decodeCursor,
   encodePoolCursor,

@@ -1,7 +1,6 @@
 const axios = require('axios');
 const asyncHandler = require('express-async-handler');
 const { Channel, ChannelVideo } = require('../models');
-const { syncChannel } = require('../services/channelSyncService');
 const logger = require('../utils/logger');
 const { Op } = require('sequelize');
 
@@ -256,20 +255,13 @@ exports.createChannel = asyncHandler(async (req, res) => {
     isActive: true,
     source: shortsOnlyFlag ? 'shorts-only' : 'channel',
     isShortsOnly: shortsOnlyFlag,
-  });
-
-  Promise.resolve().then(async () => {
-    try {
-      await syncChannel(channel, { shortsOnly: shortsOnlyFlag });
-      logger.info(`Initial sync completed for newly added channel ${channel.name} (shortsOnly=${shortsOnlyFlag}).`);
-    } catch (err) {
-      logger.error(`Initial sync failed for newly added channel ${channel.name}: ${err.message}`);
-    }
+    lastSyncStatus: 'pending',
+    lastSyncError: null,
   });
 
   res.status(201).json({
     success: true,
-    message: 'Channel added successfully and initial sync triggered in background.',
+    message: 'Channel added successfully; the local worker will sync it.',
     data: channel,
   });
 });
@@ -595,20 +587,16 @@ exports.syncChannelOnDemand = asyncHandler(async (req, res) => {
 
   const isShortsOnly = Boolean(channel.isShortsOnly || channel.source === 'shorts-only');
 
-  try {
-    const newCount = await syncChannel(channel, { shortsOnly: isShortsOnly });
-    res.status(200).json({
-      success: true,
-      message: `Channel synced successfully. ${newCount} new videos added.`,
-      newVideosCount: newCount,
-      shortsOnly: isShortsOnly,
-    });
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      message: `Failed to sync channel: ${err.message}`,
-    });
-  }
+  channel.lastSyncStatus = 'pending';
+  channel.lastSyncError = null;
+  await channel.save();
+  res.status(200).json({
+    success: true,
+    message: 'Sync requested; the local worker will process active channels on its next run.',
+    newVideosCount: 0,
+    shortsOnly: isShortsOnly,
+    worker: 'local',
+  });
 });
 
 /**
@@ -700,20 +688,13 @@ exports.createShortsOnlyChannel = asyncHandler(async (req, res) => {
     isActive: true,
     source: 'shorts-only',
     isShortsOnly: true,
-  });
-
-  Promise.resolve().then(async () => {
-    try {
-      await syncChannel(channel, { shortsOnly: true });
-      logger.info(`Initial sync completed for newly added shorts-only channel ${channel.name}.`);
-    } catch (err) {
-      logger.error(`Initial sync failed for newly added shorts-only channel ${channel.name}: ${err.message}`);
-    }
+    lastSyncStatus: 'pending',
+    lastSyncError: null,
   });
 
   res.status(201).json({
     success: true,
-    message: 'Shorts-only channel added successfully and initial sync triggered in background.',
+    message: 'Shorts-only channel added successfully; the local worker will sync it.',
     data: channel,
   });
 });
@@ -755,22 +736,15 @@ exports.syncChannelShortsNow = asyncHandler(async (req, res) => {
     return res.status(404).json({ success: false, message: 'Channel not found.' });
   }
 
-  try {
-    const newVideosCount = await syncChannel(channel, { shortsOnly: true });
-    const shortsCount = await ChannelVideo.count({ where: { channelId: channel.id, isShort: true } });
-    await Channel.update({ shortsCount }, { where: { id: channel.id } });
-
-    res.status(200).json({
-      success: true,
-      count: newVideosCount,
-      shortsCount,
-      message: 'Channel shorts synced successfully',
-    });
-  } catch (err) {
-    logger.error(`Failed to sync shorts for channel ${channel.name}: ${err.message}`);
-    res.status(500).json({
-      success: false,
-      message: `Failed to sync channel shorts: ${err.message}`,
-    });
-  }
+  channel.lastSyncStatus = 'pending';
+  channel.lastSyncError = null;
+  await channel.save();
+  const shortsCount = await ChannelVideo.count({ where: { channelId: channel.id, isShort: true } });
+  res.status(200).json({
+    success: true,
+    count: 0,
+    shortsCount,
+    message: 'Shorts sync requested; the local worker will process it on its next run.',
+    worker: 'local',
+  });
 });

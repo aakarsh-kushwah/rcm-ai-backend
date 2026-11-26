@@ -5,83 +5,18 @@
  */
 
 const { SiteMap, Sequelize } = require('../models');
-const { scrapeAndSave } = require('../services/rcmScraper'); // Real Scraper
 const Op = Sequelize.Op;
 
 // ============================================================
 // 🗺️ 1. LIVE SITEMAP GENERATOR (Hybrid Engine)
 // ============================================================
 exports.generateSiteMapLive = async (req, res) => {
-    try {
-        console.log("🗺️ [CONTROLLER] Triggering Knowledge Graph Update...");
-
-        // 1. Koshish karein Real Scraper chalane ki
-        try {
-            // Background process trigger
-            scrapeAndSave(); 
-            
-            return res.status(200).json({
-                success: true,
-                message: "✅ Titan Explorer Started. Website mapping in progress...",
-                status: "MAPPING"
-            });
-
-        } catch (scraperError) {
-            console.warn("⚠️ Scraper unavailable, loading Emergency Knowledge Graph.");
-            throw new Error("Scraper Service Down");
-        }
-
-    } catch (error) {
-        // 2. Fallback: Emergency Data (Agar Scraper na chale)
-        // Ye data AI ko 'dumb' hone se bachata hai
-        console.log("⚡ Injecting Critical Navigation Data...");
-
-        const emergencyMap = [
-            {
-                title: "Monthly Statement",
-                link: "https://www.rcmbusiness.com/Business/MonthlyStatement",
-                section: "Business",
-                guideSteps: ["Login to App", "Go to Menu", "Click 'My Business'", "Select 'Monthly Statement'"],
-                keywords: ["income", "commission", "paisa", "statement", "check"],
-                requiredFields: ["User ID", "Password"]
-            },
-            {
-                title: "New Joining (KYC)",
-                link: "https://www.rcmbusiness.com/Registration/NewUser",
-                section: "Registration",
-                guideSteps: ["Open Form", "Fill Personal Details", "Upload Aadhar & Pan", "Add Bank Details", "Submit OTP"],
-                keywords: ["join", "new member", "id banana", "joining", "kyc"],
-                requiredFields: ["Aadhar Card", "PAN Card", "Bank Passbook", "Photo"]
-            },
-            {
-                title: "Forgot Password",
-                link: "https://www.rcmbusiness.com/Login/ForgotPassword",
-                section: "Security",
-                guideSteps: ["Click Forgot Password", "Enter User ID", "Enter Registered Mobile", "Enter OTP", "Set New Password"],
-                keywords: ["password reset", "bhul gaya", "login nahi ho raha"],
-                requiredFields: ["User ID", "Mobile Number"]
-            },
-            {
-                title: "Delivery Centers (PUC)",
-                link: "https://www.rcmbusiness.com/World/DeliveryCenters",
-                section: "Tools",
-                guideSteps: ["Select State", "Select District", "Click Search"],
-                keywords: ["shop", "dukan", "store", "pickup center", "puc"],
-                requiredFields: ["State", "District"]
-            }
-        ];
-
-        // Bulk Upsert
-        for (const mapItem of emergencyMap) {
-            await SiteMap.upsert(mapItem);
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: "⚠️ Scraper Busy. Emergency Knowledge Graph Loaded.",
-            topics: emergencyMap.length
-        });
-    }
+    return res.status(503).json({
+        success: false,
+        code: "LOCAL_WORKER_REQUIRED",
+        status: "OFFLOADED",
+        message: "RCM portal scraping runs in the local portal worker.",
+    });
 };
 
 // ============================================================

@@ -4,7 +4,7 @@
  *   - CORS config         -> config/cors.js
  *   - Rate limiting       -> middleware/rateLimiter.js
  *   - Metrics             -> middleware/metrics.js
- *   - Cron / sync jobs    -> workers/scheduler.js   (separate process)
+ *   - Social sync jobs    -> ../rcm-reels-worker   (local process; not started by this server)
  *   - Push notifications  -> In-process direct batching (controllers/notificationController.js)
  *   - Seeding             -> scripts/seedSuperAdmin.js
  */

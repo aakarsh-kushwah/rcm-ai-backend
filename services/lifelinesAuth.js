@@ -1,71 +1,89 @@
-/**
- * @file lifelinesAuth.js
- * @description Authentication, token issuance, rate limiting, and middleware for Lifelines API.
- */
-
-'use strict';
+﻿'use strict';
 
 const crypto = require('crypto');
 
-// In-memory token store: token -> { buyerId, createdAt }
-const activeTokens = new Map();
-
-// In-memory rate limiter store: key -> { count, resetTime }
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const rateLimitStore = new Map();
+const revokedTokens = new Set();
 
-/**
- * Issue a secure token for an authenticated RCM buyer root.
- * @param {number|string} buyerId 
- * @returns {string} token
- */
-function issueToken(buyerId) {
-  const token = crypto.randomBytes(32).toString('hex');
-  activeTokens.set(token, {
-    buyerId: Number(buyerId),
-    createdAt: Date.now()
-  });
-  return token;
+function getSigningSecret() {
+  const secret = process.env.LIFELINES_TOKEN_SECRET || process.env.JWT_SECRET;
+  if (!secret) {
+    throw new Error('JWT_SECRET or LIFELINES_TOKEN_SECRET must be set for stateless Lifelines auth.');
+  }
+  return secret;
 }
 
-/**
- * Revoke an active lifelines token.
- * @param {string} token 
- */
-function revokeToken(token) {
-  if (token) {
-    activeTokens.delete(token);
+function signPayload(encodedPayload) {
+  return crypto
+    .createHmac('sha256', getSigningSecret())
+    .update(encodedPayload)
+    .digest('base64url');
+}
+
+function issueToken(buyerId) {
+  const payload = {
+    b: Number(buyerId),
+    iat: Date.now(),
+    exp: Date.now() + TOKEN_TTL_MS,
+    jti: crypto.randomBytes(8).toString('hex')
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = signPayload(encoded);
+  return `${encoded}.${sig}`;
+}
+
+function verifyToken(token) {
+  if (!token || typeof token !== 'string' || revokedTokens.has(token)) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+
+  const [encoded, sig] = parts;
+  const expectedSig = signPayload(encoded);
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expectedSig);
+
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (!payload.b || (payload.exp && Date.now() > payload.exp)) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
   }
 }
 
-/**
- * Express middleware to authenticate requests using x-lifelines-token or Authorization Bearer.
- */
-function requireLifelinesAuth(req, res, next) {
-  const token = req.headers['x-lifelines-token'] || 
-                req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
-                req.query?.lifelinesToken;
+function revokeToken(token) {
+  if (token) {
+    revokedTokens.add(token);
+  }
+}
 
-  if (!token || !activeTokens.has(token)) {
+function requireLifelinesAuth(req, res, next) {
+  const token =
+    req.headers['x-lifelines-token'] ||
+    req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
+    req.query?.lifelinesToken;
+
+  const payload = verifyToken(token);
+  if (!payload) {
     return res.status(401).json({
       success: false,
-      message: 'Unauthorized. Please re-authenticate with your RCM password via /sync.'
+      message: 'Session expired. Please login again with your RCM Buyer ID and Password.'
     });
   }
 
-  const sessionData = activeTokens.get(token);
   req.lifelinesToken = token;
-  req.lifelinesRoot = sessionData.buyerId;
+  req.lifelinesRoot = Number(payload.b);
   next();
 }
 
-/**
- * Simple in-memory sliding window rate limiter check.
- * @param {string} key 
- * @param {number} maxAttempts 
- * @param {number} windowMs 
- * @returns {boolean} allowed
- */
-function allowAttempt(key, maxAttempts = 10, windowMs = 60 * 1000) {
+function allowAttempt(key, maxAttempts = 15, windowMs = 60 * 1000) {
   const now = Date.now();
   let record = rateLimitStore.get(key);
 
@@ -83,16 +101,13 @@ function allowAttempt(key, maxAttempts = 10, windowMs = 60 * 1000) {
   return true;
 }
 
-/**
- * Clear rate limit attempts on successful login/action.
- * @param {string} key 
- */
 function clearAttempts(key) {
   rateLimitStore.delete(key);
 }
 
 module.exports = {
   issueToken,
+  verifyToken,
   revokeToken,
   requireLifelinesAuth,
   allowAttempt,

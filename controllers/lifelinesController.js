@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const { Op } = require('sequelize');
 const { RcmIdentity, RcmMonthlyTurnoverHistory, MemberMonthlySnapshot, sequelize } = require('../models');
@@ -14,6 +14,7 @@ const { searchLifelineMembers } = require('../utils/treeSearchHelper');
 const { emitProgress } = require('../services/socketService');
 const { issueToken, revokeToken, allowAttempt, clearAttempts } = require('../services/lifelinesAuth');
 const activeView = require('../services/rcmActiveView');
+
 // ---------------------------------------------------------------------------
 // Resilient Scraper & Session Adapters (Zero-crash fallbacks)
 // ---------------------------------------------------------------------------
@@ -34,9 +35,9 @@ async function persistSessionSafely(buyerId, session) {
   return null;
 }
 
-function retrieveSessionSafely(buyerId) {
-  if (typeof getSession === 'function') return getSession(buyerId);
-  if (typeof rcmGroupScraper.getSession === 'function') return rcmGroupScraper.getSession(buyerId);
+async function retrieveSessionSafely(buyerId) {
+  if (typeof getSession === 'function') return await getSession(buyerId);
+  if (typeof rcmGroupScraper.getSession === 'function') return await rcmGroupScraper.getSession(buyerId);
   return null;
 }
 
@@ -104,8 +105,24 @@ async function scrapeGroupSafe(session, buyerId, macroInfo) {
       session,
       buyerId,
       directLegs: macroInfo?.legs || macroInfo?.directLegs || [],
+      knownMacroPv: firstDefined(macroInfo?.totalPv, macroInfo?.total_pv, 0),
       month: new Date().getMonth() + 1,
-      year: new Date().getFullYear()
+      year: new Date().getFullYear(),
+      forceFullCrawl: null,
+      onComplete: ({ phase, count, isComplete, error }) => {
+        invalidateTree(buyerId);
+        if (typeof emitProgress === 'function' && isComplete) {
+          emitProgress('LIFELINES_SYNC_PROGRESS', {
+            buyerId,
+            status: error ? 'error' : 'completed',
+            percent: 100,
+            count,
+            phase,
+            isComplete: true,
+            message: error ? 'Tree sync interrupted.' : 'Lifelines tree and new joinings updated.'
+          });
+        }
+      }
     });
   }
   return undefined;
@@ -128,6 +145,11 @@ async function fetchChildrenOnDemandSafe(rootId, parentId) {
 // ---------------------------------------------------------------------------
 // Generic helpers
 // ---------------------------------------------------------------------------
+function sendSafe(res, statusCode, payload) {
+  if (!res || res.headersSent || res.writableEnded) return undefined;
+  return res.status(statusCode).json(payload);
+}
+
 function safeNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -210,13 +232,17 @@ function resolveRoot(req, res, suppliedRoot) {
   const supplied = safeNumber(suppliedRoot, 0);
   if (tokenRoot) {
     if (supplied && supplied !== tokenRoot) {
-      res.status(403).json({ success: false, message: 'You can only access your own tree.' });
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(403).json({ success: false, message: 'You can only access your own tree.' });
+      }
       return null;
     }
     return tokenRoot;
   }
   if (!supplied) {
-    res.status(400).json({ success: false, message: 'buyerId is required.' });
+    if (!res.headersSent && !res.writableEnded) {
+      res.status(400).json({ success: false, message: 'buyerId is required.' });
+    }
     return null;
   }
   return supplied;
@@ -240,7 +266,7 @@ async function loadIdentities(ids) {
   if (!ids || ids.length === 0) return map;
   const attributes = IDENTITY_WANTED.filter((a) => RcmIdentity.rawAttributes[a]);
   for (const part of chunk(ids, 2000)) {
-    const rows = await RcmIdentity.findAll({ where: { buyer_id: part }, attributes, raw: true });
+    const rows = await RcmIdentity.findAll({ where: { buyer_id: part }, attributes, raw: true }).catch(() => []);
     rows.forEach((r) => map.set(Number(r.buyer_id), r));
   }
   return map;
@@ -253,33 +279,39 @@ const pickPin = (identity = {}) =>
   identity.max_pin || identity.highest_pin || identity.curr_pin || identity.pin || null;
 
 // ---------------------------------------------------------------------------
-// TREE ENGINE: Ultra-Fast Single Query & In-Memory BFS
+// TREE ENGINE: Shared In-Memory Graph + Instant Multi-User Subtree Slicing
 // ---------------------------------------------------------------------------
 const NODE_COLUMN_CANDIDATES = [
   'buyer_id', 'parent_id', 'name', 'status', 'kyc_status', 'leg_type', 'level',
   'current_pv', 'self_pv', 'repurchase_amt', 'purchase_amt', 'total_group_pv', 'children_count'
 ];
-const TREE_TTL_MS = 10 * 1000;
-const TREE_MIN_RELOAD_MS = 2 * 1000;
-const MAX_CACHED_TREES = 20;
+const GRAPH_TTL_MS = 60 * 1000;
+const GRAPH_MIN_RELOAD_MS = 5 * 1000;
+const TREE_TTL_MS = 30 * 1000;
+const SUBTREE_ID_TTL_MS = 60 * 1000;
+const MAX_CACHED_TREES = 30;
 
-let nodeColumnsPromise = null;
-function getNodeColumns() {
-  if (!nodeColumnsPromise) {
-    nodeColumnsPromise = sequelize.getQueryInterface().describeTable('rcm_downline_nodes')
+let nodeDescPromise = null;
+function getNodeDesc() {
+  if (!nodeDescPromise) {
+    nodeDescPromise = sequelize.getQueryInterface().describeTable('rcm_downline_nodes')
       .then((desc) => {
-        const cols = NODE_COLUMN_CANDIDATES.filter((c) => desc[c]);
-        if (!cols.includes('buyer_id') || !cols.includes('parent_id')) {
+        if (!desc.buyer_id || !desc.parent_id) {
           throw new Error('rcm_downline_nodes must have buyer_id and parent_id columns.');
         }
-        return cols;
+        return desc;
       })
       .catch((err) => {
-        nodeColumnsPromise = null;
+        nodeDescPromise = null;
         throw err;
       });
   }
-  return nodeColumnsPromise;
+  return nodeDescPromise;
+}
+
+async function getNodeColumns() {
+  const desc = await getNodeDesc();
+  return NODE_COLUMN_CANDIDATES.filter((c) => desc[c]);
 }
 
 const columnSql = (cols) => cols.map((c) => `\`${c}\``).join(', ');
@@ -288,7 +320,7 @@ function normalizeNode(row, depth) {
   const selfPv = safeNumber(firstDefined(row.self_pv, row.current_pv));
   return {
     buyer_id: Number(row.buyer_id),
-    parent_id: row.parent_id === null || row.parent_id === undefined ? null : Number(row.parent_id),
+    parent_id: row.parent_id === null || row.parent_id === undefined || row.parent_id === '' ? null : Number(row.parent_id),
     name: row.name || null,
     status: Number(row.status ?? 1),
     kyc_status: row.kyc_status || null,
@@ -303,26 +335,52 @@ function normalizeNode(row, depth) {
   };
 }
 
-async function fetchSubtreeFromDb(rootId) {
-  const cols = columnSql(await getNodeColumns());
-  const nodeMap = new Map();
-  const childrenMap = new Map();
+let globalGraphEntry = null;
 
-  const allRows = await select(`SELECT ${cols} FROM rcm_downline_nodes`);
-  for (const row of allRows) {
-    const key = String(row.buyer_id);
-    const node = normalizeNode(row, 0);
-    nodeMap.set(key, node);
-    if (row.parent_id !== null && row.parent_id !== undefined) {
-      const parentKey = String(row.parent_id);
-      if (!childrenMap.has(parentKey)) childrenMap.set(parentKey, []);
-      childrenMap.get(parentKey).push(node);
-    }
+function loadGlobalGraph({ fresh = false } = {}) {
+  const now = Date.now();
+  const age = globalGraphEntry ? now - globalGraphEntry.at : Infinity;
+  if (globalGraphEntry && (fresh ? age < GRAPH_MIN_RELOAD_MS : age < GRAPH_TTL_MS)) {
+    return globalGraphEntry.promise;
   }
 
+  const promise = (async () => {
+    const cols = columnSql(await getNodeColumns());
+    const rows = await select(`SELECT ${cols} FROM rcm_downline_nodes`);
+    const nodeMap = new Map();
+    const childrenMap = new Map();
+
+    for (const row of rows) {
+      const key = String(row.buyer_id);
+      const node = normalizeNode(row, 0);
+      nodeMap.set(key, node);
+      if (node.parent_id !== null && node.parent_id !== node.buyer_id) {
+        const parentKey = String(node.parent_id);
+        let list = childrenMap.get(parentKey);
+        if (!list) {
+          list = [];
+          childrenMap.set(parentKey, list);
+        }
+        list.push(node);
+      }
+    }
+
+    return { nodeMap, childrenMap, builtAt: Date.now() };
+  })().catch((err) => {
+    if (globalGraphEntry && globalGraphEntry.promise === promise) {
+      globalGraphEntry = null;
+    }
+    throw err;
+  });
+
+  globalGraphEntry = { at: now, promise };
+  return promise;
+}
+
+function sliceSubtreeFromGraph(graph, rootId) {
   const rootKey = String(rootId);
-  if (!nodeMap.has(rootKey)) {
-    return { nodeMap: new Map(), childrenMap: new Map(), builtAt: Date.now(), truncated: false };
+  if (!graph.nodeMap.has(rootKey)) {
+    return { nodeMap: new Map(), childrenMap: new Map(), builtAt: graph.builtAt, truncated: false };
   }
 
   const subtreeNodeMap = new Map();
@@ -330,19 +388,17 @@ async function fetchSubtreeFromDb(rootId) {
   const queue = [{ id: rootKey, depth: 0 }];
   const visited = new Set();
 
-  while (queue.length > 0) {
-    const { id, depth } = queue.shift();
+  for (let qi = 0; qi < queue.length; qi += 1) {
+    const { id, depth } = queue[qi];
     if (visited.has(id)) continue;
     visited.add(id);
 
-    const node = nodeMap.get(id);
-    if (node) {
-      node.depth = depth;
-      subtreeNodeMap.set(id, node);
-    }
+    const src = graph.nodeMap.get(id);
+    if (!src) continue;
+    subtreeNodeMap.set(id, { ...src, depth });
 
-    const kids = childrenMap.get(id);
-    if (kids) {
+    const kids = graph.childrenMap.get(id);
+    if (kids && kids.length > 0) {
       subtreeChildrenMap.set(id, kids);
       for (const kid of kids) {
         const kidId = String(kid.buyer_id);
@@ -353,20 +409,31 @@ async function fetchSubtreeFromDb(rootId) {
     }
   }
 
-  return { nodeMap: subtreeNodeMap, childrenMap: subtreeChildrenMap, builtAt: Date.now(), truncated: false };
+  return { nodeMap: subtreeNodeMap, childrenMap: subtreeChildrenMap, builtAt: graph.builtAt, truncated: false };
 }
 
 const treeCache = new Map();
+const subtreeIdCache = new Map();
 
 function invalidateTree(rootId) {
-  treeCache.delete(String(rootId));
+  if (rootId !== undefined && rootId !== null) {
+    const key = String(rootId);
+    treeCache.delete(key);
+    subtreeIdCache.delete(key);
+  } else {
+    treeCache.clear();
+    subtreeIdCache.clear();
+  }
+  if (globalGraphEntry && Date.now() - globalGraphEntry.at >= GRAPH_MIN_RELOAD_MS) {
+    globalGraphEntry = null;
+  }
 }
 
 function loadTree(rootId, { fresh = false } = {}) {
   const key = String(rootId);
   const hit = treeCache.get(key);
   const age = hit ? Date.now() - hit.at : Infinity;
-  if (hit && (fresh ? age < TREE_MIN_RELOAD_MS : age < TREE_TTL_MS)) return hit.promise;
+  if (hit && (fresh ? age < GRAPH_MIN_RELOAD_MS : age < TREE_TTL_MS)) return hit.promise;
 
   if (treeCache.size >= MAX_CACHED_TREES) {
     for (const [k, v] of treeCache) {
@@ -375,12 +442,75 @@ function loadTree(rootId, { fresh = false } = {}) {
     if (treeCache.size >= MAX_CACHED_TREES) treeCache.delete(treeCache.keys().next().value);
   }
 
-  const promise = fetchSubtreeFromDb(Number(rootId)).catch((err) => {
-    treeCache.delete(key);
-    throw err;
-  });
+  const promise = loadGlobalGraph({ fresh })
+    .then((graph) => sliceSubtreeFromGraph(graph, rootId))
+    .catch((err) => {
+      treeCache.delete(key);
+      throw err;
+    });
   treeCache.set(key, { at: Date.now(), promise });
   return promise;
+}
+
+async function findSubtreeMemberIds(rootId) {
+  const rStr = String(rootId);
+  const cachedIds = subtreeIdCache.get(rStr);
+  if (cachedIds && Date.now() - cachedIds.at < SUBTREE_ID_TTL_MS) {
+    return cachedIds.promise;
+  }
+
+  const promise = loadTree(rootId).then((tree) => {
+    const set = new Set();
+    for (const k of tree.nodeMap.keys()) {
+      const n = Number(k);
+      if (n) set.add(n);
+    }
+    return set;
+  });
+
+  subtreeIdCache.set(rStr, { at: Date.now(), promise });
+  return promise;
+}
+
+async function buildAncestorPath(rootId, targetId) {
+  const tree = await loadTree(rootId);
+  const chain = [];
+  const visited = new Set();
+  let curr = String(targetId);
+
+  for (let hop = 0; hop < 150 && curr; hop += 1) {
+    if (visited.has(curr)) break;
+    visited.add(curr);
+
+    const node = tree.nodeMap.get(curr);
+    if (!node) break;
+    chain.push(node);
+
+    if (Number(node.buyer_id) === Number(rootId) || !node.parent_id) break;
+    curr = String(node.parent_id);
+  }
+
+  const ids = chain.map((n) => n.buyer_id);
+  const identities = await loadIdentities(ids);
+  const path = [];
+
+  for (let i = chain.length - 1; i >= 0; i -= 1) {
+    const n = chain[i];
+    const idRow = identities.get(n.buyer_id) || {};
+    path.push({
+      buyer_id: n.buyer_id,
+      parent_id: n.parent_id,
+      name: idRow.name || n.name || `Associate #${n.buyer_id}`,
+      photo_url: pickPhoto(idRow),
+      highest_pin: pickPin(idRow) || 'ASSOCIATE BUYER',
+      status: n.status,
+      self_pv: n.self_pv,
+      repurchase_amt: n.repurchase_amt,
+      total_group_pv: n.total_group_pv
+    });
+  }
+
+  return path;
 }
 
 async function isInSubtree(rootId, memberId) {
@@ -388,8 +518,10 @@ async function isInSubtree(rootId, memberId) {
   const m = Number(memberId);
   if (!r || !m) return false;
   if (r === m) return true;
+
   let tree = await loadTree(r);
   if (tree.nodeMap.has(String(m))) return true;
+
   tree = await loadTree(r, { fresh: true });
   return tree.nodeMap.has(String(m));
 }
@@ -482,19 +614,28 @@ function analyzeTree(tree, rootId) {
 // ---------------------------------------------------------------------------
 async function fetchChildrenRows(parentId) {
   const cols = columnSql(await getNodeColumns());
-  const rows = await select(`SELECT ${cols} FROM rcm_downline_nodes WHERE parent_id = :parentId`, { parentId });
+  const rows = await select('SELECT ' + cols + ' FROM rcm_downline_nodes WHERE parent_id = :parentId', {
+    parentId: String(parentId)
+  });
   const nodes = rows.map((r) => normalizeNode(r, 0));
   nodes.sort((a, b) =>
     b.total_group_pv - a.total_group_pv || b.pv - a.pv || a.buyer_id - b.buyer_id);
 
   const withKids = new Set();
-  if (nodes.length > 0) {
+  const needChildLookup = [];
+  for (const n of nodes) {
+    if (n.children_count > 0) withKids.add(n.buyer_id);
+    else needChildLookup.push(n.buyer_id);
+  }
+
+  for (const part of chunk(needChildLookup, 500)) {
     const kidRows = await select(
       'SELECT DISTINCT parent_id FROM rcm_downline_nodes WHERE parent_id IN (:ids)',
-      { ids: nodes.map((n) => n.buyer_id) }
+      { ids: part.map(String) }
     );
     kidRows.forEach((r) => withKids.add(Number(r.parent_id)));
   }
+
   return nodes.map((n) => ({ ...n, has_children: withKids.has(n.buyer_id) }));
 }
 
@@ -524,24 +665,42 @@ function formatNode(node, identity = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Turnover history helpers
+// Turnover history helpers (deduplicated by month)
 // ---------------------------------------------------------------------------
 const rowMonthKey = (row) => String(row.month_key || row.year_month || '').replace('-', '');
 
 async function fetchTurnoverRows(buyerId, limit = 12) {
   const attrs = RcmMonthlyTurnoverHistory.rawAttributes || {};
   const orderCol = attrs.year_month ? 'year_month' : attrs.month_key ? 'month_key' : null;
-  return RcmMonthlyTurnoverHistory.findAll({
+  const order = [];
+  if (orderCol) order.push([orderCol, 'DESC']);
+  if (attrs.updated_at) order.push(['updated_at', 'DESC']);
+  if (attrs.id) order.push(['id', 'DESC']);
+
+  const rawRows = await RcmMonthlyTurnoverHistory.findAll({
     where: { buyer_id: buyerId },
-    ...(orderCol ? { order: [[orderCol, 'DESC']] } : {}),
-    limit,
+    ...(order.length ? { order } : {}),
+    limit: Math.max(limit * 4, 48),
     raw: true
   });
+
+  const seen = new Set();
+  const deduped = [];
+  for (const row of rawRows) {
+    const key = rowMonthKey(row);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(row);
+    if (deduped.length >= limit) break;
+  }
+  return deduped;
 }
 
 // ---------------------------------------------------------------------------
 // POST /sync
 // ---------------------------------------------------------------------------
+const activeBackgroundCrawls = new Set();
+
 exports.syncLifelines = async (req, res) => {
   try {
     const rawId = req.body?.buyerId || req.body?.buyer_id || req.body?.dist_no || req.body?.distNo || req.body?.rcmId || req.body?.id;
@@ -549,12 +708,12 @@ exports.syncLifelines = async (req, res) => {
     const buyerId = safeNumber(rawId, 0);
 
     if (!/^\d{6,10}$/.test(String(buyerId)) || !password) {
-      return res.status(400).json({ success: false, message: 'Valid buyerId and password are required.' });
+      return sendSafe(res, 400, { success: false, message: 'Valid buyerId and password are required.' });
     }
 
     const idKey = `sync:id:${buyerId}`;
-    if (!allowAttempt(`sync:ip:${req.ip}`, 20) || !allowAttempt(idKey, 5)) {
-      return res.status(429).json({ success: false, message: 'Too many attempts. Please try again in a few minutes.' });
+    if (!allowAttempt(idKey, 8, 60 * 1000)) {
+      return sendSafe(res, 429, { success: false, message: 'Too many login attempts for this ID. Please wait a minute and retry.' });
     }
 
     const session = createRcmSession({
@@ -574,7 +733,7 @@ exports.syncLifelines = async (req, res) => {
       const msg = String(loginErr?.message || '');
       const isCredentialError = /password|credential|invalid|incorrect|login failed|unauthori/i.test(msg);
       emitProgress('LIFELINES_SYNC_PROGRESS', { buyerId, status: 'error', isComplete: true, message: 'Login failed.' });
-      return res.status(isCredentialError ? 401 : 502).json({
+      return sendSafe(res, isCredentialError ? 401 : 502, {
         success: false,
         message: isCredentialError ? 'Invalid RCM ID or password.' : 'RCM portal is not reachable right now. Please retry.'
       });
@@ -582,71 +741,80 @@ exports.syncLifelines = async (req, res) => {
 
     clearAttempts(idKey);
     await persistSessionSafely(buyerId, session);
-    invalidateTree(buyerId);
     const token = issueToken(buyerId);
 
-    const macroInfo = await fetchMacroSafe(session, buyerId);
+    let macroInfo = {};
+    try {
+      macroInfo = (await fetchMacroSafe(session, buyerId)) || {};
+    } catch (macroErr) {
+      console.warn('[MACRO FETCH FALLBACK]:', macroErr.message);
+    }
 
-    res.status(200).json({
+    invalidateTree(buyerId);
+
+    sendSafe(res, 200, {
       success: true,
       message: 'Instant macro overview unlocked.',
       token,
       lifelinesToken: token,
       buyerId,
-      identity: macroInfo?.identity || {},
+      identity: macroInfo?.identity || { buyer_id: buyerId },
       macroData: {
         buyer_id: buyerId,
-        name: macroInfo.associateName,
-        curr_pin: macroInfo.currPin,
-        max_pin: macroInfo.maxPin,
-        photo_url: macroInfo.photoUrl,
-        kyc_status: macroInfo.kycStatus,
-        join_date: macroInfo.joinDate,
-        total_pv: firstDefined(macroInfo.totalPv, macroInfo.total_pv),
-        self_pv: firstDefined(macroInfo.selfPv, macroInfo.self_pv),
-        closed_month_pv: macroInfo.closedMonthPv,
-        closed_self_pv: macroInfo.closedSelfPv,
-        directLegs: macroInfo.directLegs || macroInfo.legs
+        name: macroInfo.associateName || macroInfo.identity?.name || '',
+        curr_pin: macroInfo.currPin || macroInfo.identity?.curr_pin || '',
+        max_pin: macroInfo.maxPin || macroInfo.identity?.highest_pin || '',
+        photo_url: macroInfo.photoUrl || macroInfo.identity?.photo_url || '',
+        kyc_status: macroInfo.kycStatus || macroInfo.identity?.kyc_status || '',
+        join_date: macroInfo.joinDate || macroInfo.identity?.join_date || '',
+        total_pv: firstDefined(macroInfo.totalPv, macroInfo.total_pv, 0),
+        self_pv: firstDefined(macroInfo.selfPv, macroInfo.self_pv, 0),
+        closed_month_pv: macroInfo.closedMonthPv ?? null,
+        closed_self_pv: macroInfo.closedSelfPv ?? null,
+        directLegs: macroInfo.directLegs || macroInfo.legs || []
       }
     });
 
-    setImmediate(async () => {
-      try {
-        await scrapeGroupSafe(session, buyerId, macroInfo);
-      } catch (err) {
-        console.error('[BACKGROUND CRAWL ERROR]:', err.message);
-        emitProgress('LIFELINES_SYNC_PROGRESS', { buyerId, status: 'error', isComplete: true, message: 'Tree sync failed.' });
-      } finally {
-        invalidateTree(buyerId);
-      }
-    });
+    const crawlKey = String(buyerId);
+    if (!activeBackgroundCrawls.has(crawlKey)) {
+      activeBackgroundCrawls.add(crawlKey);
+      setImmediate(async () => {
+        try {
+          await scrapeGroupSafe(session, buyerId, macroInfo);
+        } catch (err) {
+          console.error('[BACKGROUND CRAWL ERROR]:', err.message);
+          emitProgress('LIFELINES_SYNC_PROGRESS', { buyerId, status: 'error', isComplete: true, message: 'Tree sync failed.' });
+        } finally {
+          activeBackgroundCrawls.delete(crawlKey);
+          invalidateTree(buyerId);
+        }
+      });
+    }
     return undefined;
   } catch (error) {
     console.error('Error in syncLifelines:', error.message);
-    if (!res.headersSent) {
-      return res.status(500).json({ success: false, message: 'Lifelines sync failed.' });
-    }
-    return undefined;
+    return sendSafe(res, 500, { success: false, message: 'Lifelines sync failed.' });
   }
 };
 
 exports.logoutLifelines = async (req, res) => {
   if (req.lifelinesRoot) {
     removeSessionSafely(req.lifelinesRoot);
-    invalidateTree(req.lifelinesRoot);
+    treeCache.delete(String(req.lifelinesRoot));
+    subtreeIdCache.delete(String(req.lifelinesRoot));
   }
   revokeToken(req.lifelinesToken);
-  return res.status(200).json({ success: true });
+  return sendSafe(res, 200, { success: true });
 };
 
 exports.getSyncStatus = async (req, res) => {
   const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
   if (!rootId) return undefined;
-  return res.status(200).json({
+  return sendSafe(res, 200, {
     success: true,
     data: {
       crawl: getCrawlStatusSafe(rootId),
-      hasSession: Boolean(retrieveSessionSafely(rootId))
+      hasSession: Boolean(await retrieveSessionSafely(rootId))
     }
   });
 };
@@ -660,12 +828,15 @@ exports.getLifelinesOverview = async (req, res) => {
     if (!rootId) return undefined;
 
     const { currentKey, closedKey } = getCurrentAndClosedMonthKeys();
+    const historyMonths = Math.min(Math.max(Math.floor(safeNumber(req.query.months, 3)), 1), 12);
 
     const [identityMap, tree, historyRows] = await Promise.all([
       loadIdentities([rootId]),
       loadTree(rootId),
-      fetchTurnoverRows(rootId, 12).catch(() => [])
+      fetchTurnoverRows(rootId, Math.max(historyMonths, 12)).catch(() => [])
     ]);
+
+    if (res.headersSent || res.writableEnded) return undefined;
 
     const identity = identityMap.get(rootId) || {};
     const analysis = analyzeTree(tree, rootId);
@@ -674,12 +845,7 @@ exports.getLifelinesOverview = async (req, res) => {
     const turnoverCurrent = historyRows.find((h) => rowMonthKey(h) === currentKey) || null;
     const turnoverClosed = historyRows.find((h) => rowMonthKey(h) === closedKey) || null;
 
-    const selfRepurchaseAmt = rootNode ? rootNode.repurchase_amt : 0;
-    const selfPv = firstPositive(turnoverCurrent?.self_pv, rootNode?.self_pv);
-    const totalPv = firstPositive(turnoverCurrent?.total_pv, rootNode?.total_group_pv, totals.pv + selfPv);
-
-    // Total Network Turnover (Rs.): every member's repurchase amount in the subtree + root's own purchase
-        let liveSummary = { exists: false };
+    let liveSummary = { exists: false };
     try {
       if (activeView && typeof activeView.getSummary === 'function') {
         liveSummary = await activeView.getSummary(rootId, currentKey);
@@ -687,29 +853,49 @@ exports.getLifelinesOverview = async (req, res) => {
     } catch (err) {
       console.warn('[ACTIVE VIEW LOAD NOTICE]:', err.message);
     }
+
+    const selfRepurchaseAmt = rootNode ? rootNode.repurchase_amt : 0;
+    const selfPv = firstPositive(turnoverCurrent?.self_pv, rootNode?.self_pv);
+    const totalPv = firstPositive(
+      liveSummary.exists ? liveSummary.macroPv : 0,
+      turnoverCurrent?.total_pv,
+      rootNode?.total_group_pv,
+      totals.pv + selfPv
+    );
+
     const liveVerified = Boolean(liveSummary.exists && liveSummary.state === 'VERIFIED' && liveSummary.amtComplete);
-    const totalTeamRepurchaseAmt = liveVerified
+    const totalTeamRepurchaseAmt = liveSummary.exists && liveSummary.totals && liveSummary.totals.amt > 0
       ? round2(liveSummary.totals.amt)
       : round2(totals.repurchase + selfRepurchaseAmt);
 
-    // Active Purchasers: non-terminated members with PV > 0 or repurchase > 0
     const rootIsActivePurchaser = Boolean(
       rootNode && Number(rootNode.status) !== 0 && (rootNode.pv > 0 || rootNode.repurchase_amt > 0 || selfPv > 0)
     );
-        const activePurchasers = liveVerified
-      ? liveSummary.totals.buyers
-      : totals.active + (rootIsActivePurchaser ? 1 : 0);
+    const treeActivePurchasers = totals.active + (rootIsActivePurchaser ? 1 : 0);
+
+    const liveCounts = liveSummary.exists && liveSummary.counts ? liveSummary.counts : null;
+    const effectiveTotalTeam = liveCounts && liveCounts.totalMembers > 0
+      ? Math.max(liveCounts.totalMembers, totals.members)
+      : (totals.members || 0);
+    const effectiveTerminated = liveCounts && liveCounts.totalMembers > 0
+      ? liveCounts.terminatedMembers
+      : (totals.terminated || 0);
+    const effectiveActive = liveCounts && (liveVerified || liveCounts.activeBuyers > 0)
+      ? liveCounts.activeBuyers
+      : treeActivePurchasers;
+    const effectiveInactive = effectiveTotalTeam > 0
+      ? Math.max(0, effectiveTotalTeam - effectiveTerminated - effectiveActive)
+      : (totals.inactive || 0);
 
     const legIdentities = await loadIdentities(legs.map((l) => l.head.buyer_id));
 
-    // Clean direct-leg cards: identity, Leg PV, and Team Repurchase Rs.
     const directLegs = legs.map((leg, idx) => {
       const head = leg.head;
       const legIdentity = legIdentities.get(head.buyer_id) || {};
       const turnoverLegPv = idx === 0 ? safeNumber(turnoverCurrent?.leg_a_pv) : idx === 1 ? safeNumber(turnoverCurrent?.leg_b_pv) : 0;
       const officialPv = firstPositive(head.total_group_pv, turnoverLegPv, leg.pv);
-            const liveLeg = liveVerified ? (liveSummary.legs || []).find((l) => l.leg === leg.letter) : null;
-      const legRepurchase = liveLeg ? round2(liveLeg.amt) : round2(leg.repurchase);
+      const liveLeg = liveSummary.exists ? (liveSummary.legs || []).find((l) => l.leg === leg.letter) : null;
+      const legRepurchase = liveLeg && liveLeg.amt > 0 ? round2(liveLeg.amt) : round2(leg.repurchase);
       const name = legIdentity.name || head.name;
 
       return {
@@ -735,7 +921,7 @@ exports.getLifelinesOverview = async (req, res) => {
 
     const monthlyHistory = [];
     const now = new Date();
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < historyMonths; i += 1) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const key = monthKeyOf(d);
       const hist = i === 0 ? turnoverCurrent : historyRows.find((h) => rowMonthKey(h) === key) || null;
@@ -747,6 +933,7 @@ exports.getLifelinesOverview = async (req, res) => {
         hasData,
         totalPv: i === 0 ? totalPv : (hist ? safeNumber(hist.total_pv) : null),
         selfPv: i === 0 ? selfPv : (hist ? safeNumber(hist.self_pv) : null),
+        selfRepurchaseAmt: i === 0 ? round2(selfRepurchaseAmt) : (hist && hist.self_repurchase_amt !== undefined ? round2(hist.self_repurchase_amt) : null),
         legAPv: i === 0 ? (directLegs[0]?.pv ?? 0) : (hist ? safeNumber(hist.leg_a_pv) : null),
         legBPv: i === 0 ? (directLegs[1]?.pv ?? 0) : (hist ? safeNumber(hist.leg_b_pv) : null)
       });
@@ -758,7 +945,7 @@ exports.getLifelinesOverview = async (req, res) => {
     const closedTotalPv = turnoverClosed ? safeNumber(turnoverClosed.total_pv) : null;
     const closedSelfPv = turnoverClosed ? safeNumber(turnoverClosed.self_pv) : null;
 
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       data: {
         buyerId: rootId,
@@ -773,7 +960,7 @@ exports.getLifelinesOverview = async (req, res) => {
         highest_pin: officialPin,
         photo_url: profilePic,
         photoUrl: profilePic,
-        synced: Boolean(rootNode || turnoverCurrent),
+        synced: Boolean(rootNode || turnoverCurrent || liveSummary.exists),
         treeTruncated: Boolean(tree.truncated),
         total_pv: totalPv,
         totalPv,
@@ -782,16 +969,16 @@ exports.getLifelinesOverview = async (req, res) => {
         self_repurchase_amt: round2(selfRepurchaseAmt),
         selfRepurchaseAmt: round2(selfRepurchaseAmt),
         total_repurchase_amt: totalTeamRepurchaseAmt,
-        total_team_repurchase_amt: liveSummary.exists && liveSummary.totals && liveSummary.totals.amt > 0 ? liveSummary.totals.amt : (totalTeamRepurchaseAmt || 0),
+        total_team_repurchase_amt: totalTeamRepurchaseAmt,
         totalTeamRepurchaseAmt,
         total_network_turnover: totalTeamRepurchaseAmt,
         totalNetworkTurnover: totalTeamRepurchaseAmt,
         closed_month_pv: closedTotalPv,
         closed_self_pv: closedSelfPv,
-        total_team: liveSummary.exists && liveSummary.counts ? liveSummary.counts.totalMembers : (totals.members || 0),
-        active_purchasers: liveSummary.exists && liveSummary.counts ? liveSummary.counts.activeBuyers : (activePurchasers || 0),
-        inactive_members: liveSummary.exists && liveSummary.counts ? liveSummary.counts.inactiveMembers : 0,
-        terminated_members: liveSummary.exists && liveSummary.counts ? liveSummary.counts.terminatedMembers : 0,
+        total_team: effectiveTotalTeam,
+        active_purchasers: effectiveActive,
+        inactive_members: effectiveInactive,
+        terminated_members: effectiveTerminated,
         identity: {
           buyer_id: rootId,
           name: displayName,
@@ -808,29 +995,28 @@ exports.getLifelinesOverview = async (req, res) => {
           state: identity.state || null
         },
         totals: {
-          totalMembers: totals.members,
-          active: activePurchasers,
-          inactive: totals.inactive,
-          terminated: totals.terminated,
-          zeroPv: totals.inactive,
+          totalMembers: effectiveTotalTeam,
+          active: effectiveActive,
+          inactive: effectiveInactive,
+          terminated: effectiveTerminated,
+          zeroPv: effectiveInactive,
           totalPv,
           selfPv,
           totalRepurchaseAmt: totalTeamRepurchaseAmt,
           totalNetworkTurnover: totalTeamRepurchaseAmt,
-          activePurchasers
+          activePurchasers: effectiveActive
         },
         directLegs,
         legs: directLegs,
-                monthlyHistory,
+        monthlyHistory,
         crawl: getCrawlStatusSafe(rootId),
         live: liveSummary,
         liveState: liveSummary.exists ? liveSummary.state : 'CACHED'
-
       }
     });
   } catch (error) {
     console.error('Error in getLifelinesOverview:', error.message);
-    return res.status(500).json({ success: false, code: 'OVERVIEW_FAILED', message: 'Could not build the overview. Please retry.' });
+    return sendSafe(res, 500, { success: false, code: 'OVERVIEW_FAILED', message: 'Could not build the overview. Please retry.' });
   }
 };
 
@@ -844,34 +1030,41 @@ exports.getLifelinesChildren = async (req, res) => {
     const parentId = safeNumber(req.query.parentId || req.query.parent_id, rootId) || rootId;
 
     if (!(await isInSubtree(rootId, parentId))) {
-      return res.status(404).json({ success: false, message: 'Member not found in your tree.' });
+      return sendSafe(res, 404, { success: false, message: 'Member not found in your tree.' });
     }
 
     let rows = await fetchChildrenRows(parentId);
 
-    if (rows.length === 0 && retrieveSessionSafely(rootId)) {
-      const result = await fetchChildrenOnDemandSafe(rootId, parentId);
-      if (result?.fetched && result.count > 0) {
-        rows = await fetchChildrenRows(parentId);
-        invalidateTree(rootId);
+    if (rows.length === 0 && (await retrieveSessionSafely(rootId))) {
+      try {
+        const result = await Promise.race([
+          fetchChildrenOnDemandSafe(rootId, parentId),
+          new Promise((resolve) => setTimeout(() => resolve({ fetched: false, count: 0 }), 5500))
+        ]);
+        if (result?.fetched && result.count > 0) {
+          rows = await fetchChildrenRows(parentId);
+          invalidateTree(rootId);
+        }
+      } catch {
+        /* ignore slow/failed on-demand portal fetch */
       }
     }
 
     const identities = await loadIdentities(rows.map((n) => n.buyer_id));
     const data = rows.map((node) => formatNode(node, identities.get(node.buyer_id)));
 
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       data,
       meta: {
         parentId,
         crawlRunning: Boolean(getCrawlStatusSafe(rootId)?.running),
-        hasSession: Boolean(retrieveSessionSafely(rootId))
+        hasSession: Boolean(await retrieveSessionSafely(rootId))
       }
     });
   } catch (error) {
-    console.error('Error in getLifelinesChildren:', error.message);
-    return res.status(200).json({ success: true, data: [], warning: 'Could not load children.' });
+    console.warn('Error in getLifelinesChildren:', error.message);
+    return sendSafe(res, 200, { success: true, data: [], warning: 'Could not load children.' });
   }
 };
 
@@ -913,7 +1106,7 @@ const getNewJoinings = async (req, res) => {
     const { members } = analyzeTree(tree, rootId);
 
     if (members.length === 0) {
-      return res.status(200).json({
+      return sendSafe(res, 200, {
         success: true,
         rootBuyerId: rootId,
         totalNewJoinings: 0,
@@ -973,7 +1166,7 @@ const getNewJoinings = async (req, res) => {
     results.sort((a, b) => b._sort - a._sort || b.buyer_id - a.buyer_id);
     const data = results.slice(0, limit).map(({ _sort, ...rest }) => rest);
 
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       rootBuyerId: rootId,
       totalNewJoinings: results.length,
@@ -984,7 +1177,7 @@ const getNewJoinings = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in getNewJoinings:', error.message);
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       totalNewJoinings: 0,
       months: [],
@@ -1028,19 +1221,35 @@ exports.getAssistantQuery = async (req, res) => {
     const monthLabels = dynamicMonths.map((m) => m.label);
 
     const tree = await loadTree(rootId);
-    const { members } = analyzeTree(tree, rootId);
+    if (res.headersSent || res.writableEnded) return undefined;
 
+    const { members } = analyzeTree(tree, rootId);
     if (members.length === 0) {
-      return res.status(200).json({ success: true, months: monthLabels, monthKeys, count: 0, data: [] });
+      return sendSafe(res, 200, { success: true, months: monthLabels, monthKeys, count: 0, data: [] });
     }
 
-    const memberIds = members.map((n) => n.buyer_id);
+    const wantsTerminated = queryString.toLowerCase().includes('terminated');
+    const preFiltered = [];
+    for (const node of members) {
+      if (legFilter && node.leg_letter !== legFilter) continue;
+      if (wantsTerminated && node.status !== 0) continue;
+      if (parsed.minPv !== null && parsed.minPv !== undefined && node.pv < parsed.minPv) continue;
+      if (parsed.maxPv !== null && parsed.maxPv !== undefined && node.pv > parsed.maxPv) continue;
+      if (parsed.targetPv !== null && parsed.targetPv !== undefined && node.pv !== parsed.targetPv) continue;
+      preFiltered.push(node);
+    }
+
+    preFiltered.sort((a, b) => b.pv - a.pv || b.repurchase_amt - a.repurchase_amt || a.buyer_id - b.buyer_id);
+
+    const candidateCap = parsed.pureConsumers ? Math.min(preFiltered.length, limit * 6) : Math.min(preFiltered.length, Math.max(limit * 2, 300));
+    const candidates = preFiltered.slice(0, candidateCap);
+    const candidateIds = candidates.map((n) => n.buyer_id);
     const snapshotMap = new Map();
 
     const [identityMap] = await Promise.all([
-      loadIdentities(memberIds),
+      loadIdentities(candidateIds),
       (async () => {
-        for (const part of chunk(memberIds, 5000)) {
+        for (const part of chunk(candidateIds, 1000)) {
           const snaps = await MemberMonthlySnapshot.findAll({
             where: { buyer_id: part, month_key: monthKeys },
             raw: true
@@ -1057,11 +1266,13 @@ exports.getAssistantQuery = async (req, res) => {
       })()
     ]);
 
-    const wantsTerminated = queryString.toLowerCase().includes('terminated');
-    const rows = [];
+    if (res.headersSent || res.writableEnded) return undefined;
 
-    for (const node of members) {
+    const rows = [];
+    for (const node of candidates) {
       const identity = identityMap.get(node.buyer_id) || {};
+      if (parsed.pureConsumers && identity.highest_pin) continue;
+
       const snaps = snapshotMap.get(node.buyer_id) || {};
       const monthlyPv = {};
       const monthlyPurchaseAmt = {};
@@ -1077,13 +1288,6 @@ exports.getAssistantQuery = async (req, res) => {
       });
 
       const currentMonthPv = monthlyPv[dynamicMonths[0].label] || 0;
-
-      if (legFilter && node.leg_letter !== legFilter) continue;
-      if (parsed.minPv !== null && parsed.minPv !== undefined && currentMonthPv < parsed.minPv) continue;
-      if (parsed.maxPv !== null && parsed.maxPv !== undefined && currentMonthPv > parsed.maxPv) continue;
-      if (parsed.targetPv !== null && parsed.targetPv !== undefined && currentMonthPv !== parsed.targetPv) continue;
-      if (parsed.pureConsumers && identity.highest_pin) continue;
-      if (wantsTerminated && node.status !== 0) continue;
 
       rows.push({
         buyer_id: node.buyer_id,
@@ -1111,17 +1315,17 @@ exports.getAssistantQuery = async (req, res) => {
 
     rows.sort((a, b) => b.current_month_pv - a.current_month_pv || b.repurchase_amt - a.repurchase_amt);
 
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       rootBuyerId: rootId,
       months: monthLabels,
       monthKeys,
-      count: rows.length,
+      count: parsed.pureConsumers ? rows.length : preFiltered.length,
       data: rows.slice(0, limit)
     });
   } catch (error) {
     console.error('Error in getAssistantQuery:', error.message);
-    return res.status(200).json({ success: true, months: [], count: 0, data: [], warning: 'Could not build matrix.' });
+    return sendSafe(res, 200, { success: true, months: [], count: 0, data: [], warning: 'Could not build matrix.' });
   }
 };
 
@@ -1131,13 +1335,13 @@ exports.getAssistantQuery = async (req, res) => {
 exports.getMemberFullProfile = async (req, res) => {
   try {
     const memberId = safeNumber(req.params.buyerId || req.query.buyerId, 0);
-    if (!memberId) return res.status(400).json({ success: false, message: 'buyerId is required.' });
+    if (!memberId) return sendSafe(res, 400, { success: false, message: 'buyerId is required.' });
 
     const rootId = resolveRoot(req, res, req.query.rootBuyerId);
     if (!rootId) return undefined;
 
     if (!(await isInSubtree(rootId, memberId))) {
-      return res.status(404).json({ success: false, message: 'Member not found in your tree.' });
+      return sendSafe(res, 404, { success: false, message: 'Member not found in your tree.' });
     }
 
     const [identityMap, nodeRows] = await Promise.all([
@@ -1149,13 +1353,13 @@ exports.getMemberFullProfile = async (req, res) => {
     const node = raw ? normalizeNode(raw, 0) : null;
 
     if (!identity && !node) {
-      return res.status(404).json({ success: false, message: 'Member profile not found.' });
+      return sendSafe(res, 404, { success: false, message: 'Member profile not found.' });
     }
 
     const name = identity?.name || node?.name || `Associate #${memberId}`;
     const terminated = node && node.status === 0;
 
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       data: {
         buyer_id: memberId,
@@ -1191,7 +1395,7 @@ exports.getMemberFullProfile = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in getMemberFullProfile:', error.message);
-    return res.status(500).json({ success: false, message: 'Failed to load member profile.' });
+    return sendSafe(res, 500, { success: false, message: 'Failed to load member profile.' });
   }
 };
 
@@ -1199,20 +1403,132 @@ exports.getMemberFullProfile = async (req, res) => {
 // GET /search
 // ---------------------------------------------------------------------------
 exports.searchLifelines = async (req, res) => {
-  try {
-    const rootId = resolveRoot(req, res, req.query.rootBuyerId || req.query.rootBuyerID || req.query.buyerId);
-    if (!rootId) return undefined;
-    const searchQuery = req.query.q || req.query.search || req.query.query;
-    if (!searchQuery) return res.status(400).json({ success: false, message: 'Search query is required.' });
+  const rootId = resolveRoot(req, res, req.query.rootBuyerId || req.query.rootBuyerID || req.query.buyerId);
+  if (!rootId) return undefined;
 
-    const results = await searchLifelineMembers({
-      rootBuyerId: rootId,
-      searchQuery,
-      limit: safeNumber(req.query.limit, 20) || 20
+  const rawQ = String(req.query.q || req.query.search || req.query.query || '').trim();
+  if (!rawQ) {
+    return sendSafe(res, 400, { success: false, message: 'Search query is required.' });
+  }
+
+  const limit = Math.min(Math.max(safeNumber(req.query.limit, 20), 1), 50);
+  const isNumericId = /^\d+$/.test(rawQ);
+  const qLower = rawQ.toLowerCase();
+  const qTokens = qLower.split(/\s+/).filter(Boolean);
+
+  try {
+    const tree = await loadTree(rootId);
+    if (res.headersSent || res.writableEnded) return undefined;
+
+    const scored = [];
+    for (const node of tree.nodeMap.values()) {
+      const idStr = String(node.buyer_id);
+      const nameLower = String(node.name || '').toLowerCase();
+
+      if (isNumericId) {
+        if (idStr === rawQ) scored.push({ node, rank: 0 });
+        else if (idStr.startsWith(rawQ)) scored.push({ node, rank: 1 });
+        else if (idStr.includes(rawQ)) scored.push({ node, rank: 2 });
+      } else if (nameLower) {
+        if (nameLower === qLower) scored.push({ node, rank: 0 });
+        else if (nameLower.startsWith(qLower)) scored.push({ node, rank: 1 });
+        else if (qTokens.every((t) => nameLower.includes(t))) scored.push({ node, rank: 2 });
+      }
+    }
+
+    scored.sort((a, b) =>
+      a.rank - b.rank ||
+      b.node.total_group_pv - a.node.total_group_pv ||
+      b.node.pv - a.node.pv ||
+      a.node.buyer_id - b.node.buyer_id
+    );
+
+    const matchedNodes = scored.slice(0, limit).map((s) => s.node);
+    const identities = await loadIdentities(matchedNodes.map((n) => n.buyer_id));
+
+    const filtered = matchedNodes.map((node) => {
+      const idRow = identities.get(node.buyer_id) || {};
+      const pin = pickPin(idRow) || 'ASSOCIATE BUYER';
+      const hasKids = (tree.childrenMap.get(String(node.buyer_id)) || []).length > 0 || node.children_count > 0;
+      return {
+        id: node.buyer_id,
+        buyer_id: node.buyer_id,
+        parent_id: node.parent_id,
+        depth: node.depth,
+        name: idRow.name || node.name || `Associate #${node.buyer_id}`,
+        highest_pin: pin,
+        curr_pin: idRow.curr_pin || pin,
+        max_pin: idRow.max_pin || pin,
+        mobile_no: pickMobile(idRow) || null,
+        district: idRow.district || null,
+        state: idRow.state || null,
+        leg_type: node.leg_type || null,
+        level: node.level ?? node.depth,
+        status: node.status,
+        statusLabel: node.status === 1 ? 'ACTIVE' : 'TERMINATED',
+        self_pv: node.self_pv,
+        current_pv: node.self_pv,
+        repurchase_amt: node.repurchase_amt,
+        total_group_pv: node.total_group_pv,
+        children_count: node.children_count,
+        has_children: hasKids,
+        photo_url: pickPhoto(idRow)
+      };
     });
-    return res.status(200).json({ success: true, data: results });
+
+    if (res.headersSent || res.writableEnded) return undefined;
+
+    let selectedPath = null;
+    if (filtered.length === 1 && isNumericId && String(filtered[0].buyer_id) === rawQ) {
+      try {
+        selectedPath = await buildAncestorPath(rootId, filtered[0].buyer_id);
+      } catch {
+        selectedPath = null;
+      }
+    }
+
+    return sendSafe(res, 200, {
+      success: true,
+      data: filtered,
+      selectedPath
+    });
   } catch (error) {
-    return res.status(500).json({ success: false, message: 'Failed to search Lifelines tree.' });
+    if (res.headersSent || res.writableEnded) return undefined;
+    console.warn('Search fallback triggered:', error.message);
+    try {
+      const helperRes = await searchLifelineMembers({
+        rootBuyerId: rootId,
+        searchQuery: rawQ,
+        limit
+      });
+      return sendSafe(res, 200, {
+        success: true,
+        data: Array.isArray(helperRes) ? helperRes : [],
+        selectedPath: null
+      });
+    } catch {
+      return sendSafe(res, 200, { success: true, data: [], selectedPath: null });
+    }
+  }
+};
+
+exports.getMemberPath = async (req, res) => {
+  try {
+    const rootId = resolveRoot(req, res, req.query.rootBuyerId || req.query.buyerId);
+    if (!rootId) return undefined;
+    const memberId = safeNumber(req.params.memberId || req.query.memberId, 0);
+    if (!memberId) {
+      return sendSafe(res, 400, { success: false, message: 'memberId is required.' });
+    }
+
+    if (!(await isInSubtree(rootId, memberId))) {
+      return sendSafe(res, 404, { success: false, message: 'Member not found in your tree.' });
+    }
+
+    const path = await buildAncestorPath(rootId, memberId);
+    return sendSafe(res, 200, { success: true, data: path });
+  } catch {
+    return sendSafe(res, 200, { success: true, data: [] });
   }
 };
 
@@ -1268,7 +1584,7 @@ exports.getTerritorySummary = async (req, res) => {
     if (!defaultLocalFocus && territoryList.length > 0) defaultLocalFocus = territoryList[0];
 
     const rows = [...identityMap.values()];
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       data: {
         buyerId: rootId,
@@ -1281,7 +1597,7 @@ exports.getTerritorySummary = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in getTerritorySummary:', error.message);
-    return res.status(500).json({ success: false, message: 'Failed to fetch territory summary.' });
+    return sendSafe(res, 500, { success: false, message: 'Failed to fetch territory summary.' });
   }
 };
 
@@ -1323,10 +1639,10 @@ exports.getFollowupList = async (req, res) => {
         photo_url: pickPhoto(identity)
       };
     });
-    return res.status(200).json({ success: true, data });
+    return sendSafe(res, 200, { success: true, data });
   } catch (error) {
     console.error('Error in getFollowupList:', error.message);
-    return res.status(200).json({ success: true, data: [] });
+    return sendSafe(res, 200, { success: true, data: [] });
   }
 };
 
@@ -1338,9 +1654,9 @@ exports.getTurnoverHistory = async (req, res) => {
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
     const rows = await fetchTurnoverRows(rootId, 12);
-    return res.status(200).json({ success: true, data: rows });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: 'Failed to fetch turnover history.' });
+    return sendSafe(res, 200, { success: true, data: rows });
+  } catch {
+    return sendSafe(res, 500, { success: false, message: 'Failed to fetch turnover history.' });
   }
 };
 
@@ -1355,28 +1671,28 @@ exports.updateCustomPhoto = async (req, res) => {
     const targetId = safeNumber(req.body?.buyerId || req.body?.buyer_id, rootId) || rootId;
     const photoUrl = String(req.body?.custom_photo_url || req.body?.photoUrl || req.body?.photo_url || '').trim();
 
-    if (!photoUrl) return res.status(400).json({ success: false, message: 'custom_photo_url is required.' });
+    if (!photoUrl) return sendSafe(res, 400, { success: false, message: 'custom_photo_url is required.' });
     if (!photoUrl.startsWith('http://') && !photoUrl.startsWith('https://') && !photoUrl.startsWith('/uploads/')) {
-      return res.status(400).json({ success: false, message: 'Invalid photo URL.' });
+      return sendSafe(res, 400, { success: false, message: 'Invalid photo URL.' });
     }
     if (!(await isInSubtree(rootId, targetId))) {
-      return res.status(403).json({ success: false, message: 'You can only update photos in your own tree.' });
+      return sendSafe(res, 403, { success: false, message: 'You can only update photos in your own tree.' });
     }
 
     const member = await RcmIdentity.findByPk(targetId);
-    if (!member) return res.status(404).json({ success: false, message: 'Member not found.' });
+    if (!member) return sendSafe(res, 404, { success: false, message: 'Member not found.' });
 
     member.custom_photo_url = photoUrl;
     member.updated_at = new Date();
     await member.save();
 
-    return res.status(200).json({
+    return sendSafe(res, 200, {
       success: true,
       message: 'Custom photo updated.',
       data: { buyer_id: targetId, custom_photo_url: photoUrl }
     });
-  } catch (error) {
-    return res.status(400).json({ success: false, message: 'Failed to update custom photo.' });
+  } catch {
+    return sendSafe(res, 400, { success: false, message: 'Failed to update custom photo.' });
   }
 };
 

@@ -5,7 +5,6 @@
  */
 
 const { Product, Sequelize } = require("../models");
-const { scrapeAndSave } = require("../services/rcmScraper"); // Real Scraper Service
 const { uploadProductImage } = require("../services/cloudinaryService"); // Cloudinary Service
 const { invalidateProductCache } = require("../services/aiService");
 const Op = Sequelize.Op;
@@ -15,21 +14,12 @@ const { logger } = require("../utils/logger"); // Import logger from common util
 // 🕷️ 1. LIVE SCRAPER (Hybrid Engine)
 // ============================================================
 exports.scrapeProductsLive = async (req, res) => {
-    try {
-        logger.info({ traceId: req.id }, "Triggering Live Scraper...");
-        // Background me start karein (await nahi karenge taaki timeout na ho)
-        scrapeAndSave(); 
-        
-        return res.status(200).json({
-            success: true,
-            message: "✅ Titan Explorer Started in Background. Data will appear shortly.",
-            status: "PROCESSING"
-        });
-
-    } catch (error) {
-        logger.error({ traceId: req.id, error: error.message, stack: error.stack }, "Scraper Trigger Error");
-        return res.status(500).json({ success: false, message: "Failed to trigger scraper." });
-    }
+    return res.status(503).json({
+        success: false,
+        code: "LOCAL_WORKER_REQUIRED",
+        status: "OFFLOADED",
+        message: "RCM product scraping runs in the local portal worker.",
+    });
 };
 
 // ============================================================
