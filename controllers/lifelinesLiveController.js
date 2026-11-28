@@ -5,12 +5,23 @@
  * Exposes live accurate counters:
  *  - total_members, terminated_members, inactive_members, active_buyers
  *  - total_sale (Rs.) and group PV
- *  - PV buckets and leg splits
+ *  - PV buckets and leg splits (A, B, C, ...)
+ *  - Smart live-check refresh (avoids redundant crawls when PV is unchanged & verified)
  */
 
 const activeView = require('../services/rcmActiveView');
 const rcmGroupScraper = require('../services/rcmGroupScraper');
 const { getSession } = require('../services/rcmSessionService');
+
+let treeSearchHelper = null;
+try {
+  treeSearchHelper = require('../utils/treeSearchHelper');
+} catch (e) {
+  // Optional cache invalidator
+}
+
+const MONEY_EPS = 0.05;
+const REFRESH_LOCK_TTL_MS = 10 * 60 * 1000;
 
 const num = (v, fallback = 0) => {
   const n = Number(v);
@@ -18,6 +29,16 @@ const num = (v, fallback = 0) => {
 };
 const truthy = (v) => ['1', 'true', 'yes'].includes(String(v || '').toLowerCase());
 const monthKeyOf = (d) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
+
+function invalidateTreeSafe(rootId) {
+  try {
+    if (treeSearchHelper && typeof treeSearchHelper.invalidateTree === 'function') {
+      treeSearchHelper.invalidateTree(String(rootId));
+    }
+  } catch (e) {
+    // Best-effort cache invalidation
+  }
+}
 
 function resolveRoot(req, res, suppliedRoot) {
   const tokenRoot = req.lifelinesRoot ? Number(req.lifelinesRoot) : null;
@@ -40,19 +61,52 @@ const refreshing = new Map();
 
 function isRefreshing(rootId) {
   const key = String(rootId);
-  if (refreshing.has(key)) return true;
+  const startedAt = refreshing.get(key);
+  if (startedAt) {
+    if (Date.now() - startedAt < REFRESH_LOCK_TTL_MS) return true;
+    refreshing.delete(key);
+  }
   const crawl = rcmGroupScraper.getCrawlStatus(key);
-  return Boolean(crawl && crawl.running && crawl.phase === 'SKELETON');
+  return Boolean(crawl && crawl.running);
 }
 
-function startRefresh(rootId, session) {
+function startRefresh(rootId, session, { knownMacroPv = 0, includeStructure = true, forceFullCrawl = false } = {}) {
   const key = String(rootId);
   if (isRefreshing(key)) return true;
   refreshing.set(key, Date.now());
+
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+
+  if (includeStructure && typeof rcmGroupScraper.startBackgroundTreeCrawler === 'function') {
+    try {
+      rcmGroupScraper.startBackgroundTreeCrawler({
+        session,
+        buyerId: key,
+        month,
+        year,
+        knownMacroPv,
+        forceFullCrawl: forceFullCrawl ? true : null,
+        onComplete: ({ isComplete }) => {
+          invalidateTreeSafe(key);
+          if (isComplete) refreshing.delete(key);
+        }
+      });
+      return true;
+    } catch (err) {
+      console.warn(`[LIVE CRAWLER START WARN] ${key}:`, err.message);
+      refreshing.delete(key);
+    }
+  }
+
   rcmGroupScraper
-    .syncSkeletonNow({ session, buyerId: key })
+    .syncSkeletonNow({ session, buyerId: key, month, year, knownMacroPv })
     .catch((err) => console.warn(`[LIVE REFRESH WARN] ${key}:`, err.message))
-    .finally(() => refreshing.delete(key));
+    .finally(() => {
+      invalidateTreeSafe(key);
+      refreshing.delete(key);
+    });
   return true;
 }
 
@@ -63,6 +117,7 @@ function shapeSummary(summary, live) {
       synced: false,
       state: 'NOT_SYNCED',
       status: live.refreshing ? 'UPDATING' : 'WAITING',
+      macroPv: live.livePv || 0,
       totalSale: { exact: false, amt: 0, verifiedAmt: 0, estLow: 0, estHigh: 0 },
       counts: { totalMembers: 0, terminatedMembers: 0, inactiveMembers: 0, activeBuyers: 0 },
       buyers: 0,
@@ -71,22 +126,28 @@ function shapeSummary(summary, live) {
     };
   }
 
-  const exact = summary.state === 'VERIFIED' && summary.amtComplete;
+  const exact = summary.state === 'VERIFIED' && summary.amtComplete && !live.pvChanged;
   let status = 'CACHED';
   if (live.refreshing) status = 'UPDATING';
-  else if (summary.state === 'VERIFIED') status = 'LIVE';
+  else if (summary.state === 'VERIFIED' && !live.pvChanged) status = 'LIVE';
+
+  const effectiveMacroPv = live.livePv > 0
+    ? Math.max(num(summary.macroPv, 0), live.livePv)
+    : num(summary.macroPv, 0);
 
   return {
     month: summary.monthKey,
     synced: true,
-    state: summary.state,
+    state: live.pvChanged ? 'BOUNDED' : summary.state,
     status,
-    verified: summary.state === 'VERIFIED',
+    verified: summary.state === 'VERIFIED' && !live.pvChanged,
     verifiedAt: summary.verifiedAt,
     updatedAt: summary.updatedAt,
-    macroPv: summary.macroPv,
+    macroPv: effectiveMacroPv,
     processedPv: summary.processedPv,
-    residualPv: summary.residualPv,
+    residualPv: live.pvChanged
+      ? Math.max(0, Math.round((effectiveMacroPv - num(summary.processedPv, 0)) * 100) / 100)
+      : summary.residualPv,
     coveragePct: summary.coveragePct,
     totalSale: {
       exact,
@@ -105,29 +166,68 @@ function shapeSummary(summary, live) {
 
 exports.getLiveSummary = async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
-    const currentMonthKey = monthKeyOf(new Date());
+    const now = new Date();
+    const currentMonthKey = monthKeyOf(now);
     const requestedMonth = String(req.query.monthKey || req.query.month_key || '').trim();
     const monthKey = /^\d{6}$/.test(requestedMonth) ? requestedMonth : currentMonthKey;
     const isCurrentMonth = monthKey === currentMonthKey;
+    const force = truthy(req.query.force);
 
     const summary = await activeView.getSummary(rootId, monthKey);
 
     const live = {
-      checkRequested: isCurrentMonth && truthy(req.query.check),
+      checkRequested: isCurrentMonth && (truthy(req.query.check) || force),
       checked: false,
       sessionActive: false,
+      sessionExpired: false,
+      pvChanged: false,
+      hasGap: false,
+      livePv: 0,
+      liveSelfPv: 0,
       refreshing: isCurrentMonth ? isRefreshing(rootId) : false
     };
 
     if (live.checkRequested) {
       live.checked = true;
       const session = await getSession(rootId);
-      if (session) {
+      if (!session) {
+        live.sessionExpired = true;
+      } else {
         live.sessionActive = true;
-        live.refreshing = startRefresh(rootId, session);
+        const m = now.getMonth() + 1;
+        const y = now.getFullYear();
+        const pvSnap = typeof rcmGroupScraper.fetchPvOnlyFull === 'function'
+          ? await rcmGroupScraper.fetchPvOnlyFull(session, rootId, m, y)
+          : { ok: false };
+
+        if (pvSnap?.error === 'SESSION_EXPIRED') {
+          live.sessionActive = false;
+          live.sessionExpired = true;
+        } else {
+          if (pvSnap?.ok) {
+            live.livePv = num(pvSnap.groupPv, 0);
+            live.liveSelfPv = num(pvSnap.selfPv, 0);
+            live.pvChanged = Math.abs(live.livePv - num(summary.macroPv, 0)) > MONEY_EPS;
+          }
+
+          live.hasGap =
+            !summary.exists ||
+            summary.state !== 'VERIFIED' ||
+            !summary.amtComplete ||
+            (pvSnap?.ok && Math.abs(live.livePv - num(summary.processedPv, 0)) > MONEY_EPS);
+
+          if (force || live.pvChanged || live.hasGap) {
+            live.refreshing = startRefresh(rootId, session, {
+              knownMacroPv: live.livePv || num(summary.macroPv, 0),
+              includeStructure: true,
+              forceFullCrawl: false
+            });
+          }
+        }
       }
     }
 
@@ -140,6 +240,7 @@ exports.getLiveSummary = async (req, res) => {
 
 exports.getPvBuckets = async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
@@ -160,23 +261,40 @@ exports.getPvBuckets = async (req, res) => {
 
     return res.status(200).json({ success: true, data: { month: monthKey, ...result } });
   } catch (error) {
+    console.error('Error in getPvBuckets:', error.message);
     return res.status(500).json({ success: false, message: 'Could not load PV buckets.' });
   }
 };
 
 exports.postLiveRefresh = async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const rootId = resolveRoot(req, res, req.body?.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
     const session = await getSession(rootId);
     if (!session) {
-      return res.status(409).json({ success: false, message: 'Please log in again to refresh.' });
+      return res.status(409).json({
+        success: false,
+        sessionExpired: true,
+        message: 'Please log in again to refresh.'
+      });
     }
+
+    const forceFullCrawl = truthy(req.body?.forceFullCrawl || req.query.forceFullCrawl);
     const wasRunning = isRefreshing(rootId);
-    startRefresh(rootId, session);
-    return res.status(202).json({ success: true, started: !wasRunning, refreshing: true });
+    startRefresh(rootId, session, {
+      includeStructure: true,
+      forceFullCrawl
+    });
+
+    return res.status(202).json({
+      success: true,
+      started: !wasRunning,
+      refreshing: true
+    });
   } catch (error) {
+    console.error('Error in postLiveRefresh:', error.message);
     return res.status(500).json({ success: false, message: 'Could not start refresh.' });
   }
 };

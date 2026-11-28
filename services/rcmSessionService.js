@@ -1,5 +1,7 @@
 ﻿'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
@@ -10,6 +12,8 @@ const LOGIN_API_URL = 'https://ecomapi.rcmworld.com/api/generic/users/login-user
 const ECOM_BASE = 'https://ecomapi.rcmworld.com/api';
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const SESSION_TTL_SEC = 24 * 60 * 60; // 24 hours
+const SESSION_TTL_MS = SESSION_TTL_SEC * 1000;
+const DISK_STORE_PATH = path.join(process.cwd(), 'tmp', 'rcm-sessions.json');
 
 const sessionCache = new Map();
 
@@ -36,6 +40,42 @@ class RcmParseError extends Error {
 
 function redisKey(buyerId) {
   return `rcm:session:${String(buyerId).trim()}`;
+}
+
+function readDiskSessions() {
+  try {
+    if (!fs.existsSync(DISK_STORE_PATH)) return {};
+    const raw = fs.readFileSync(DISK_STORE_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    if (!parsed || typeof parsed !== 'object') return {};
+
+    const now = Date.now();
+    const clean = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && v.token && v.savedAt && now - Number(v.savedAt) < SESSION_TTL_MS) {
+        clean[k] = v;
+      }
+    }
+    return clean;
+  } catch {
+    return {};
+  }
+}
+
+function writeDiskSession(buyerId, entryOrNull) {
+  try {
+    const dir = path.dirname(DISK_STORE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const store = readDiskSessions();
+    if (entryOrNull) {
+      store[String(buyerId)] = entryOrNull;
+    } else {
+      delete store[String(buyerId)];
+    }
+    fs.writeFileSync(DISK_STORE_PATH, JSON.stringify(store), 'utf8');
+  } catch {
+    // ignore disk write issues in restricted envs
+  }
 }
 
 function normalizeUrl(rawUrl, baseUrl) {
@@ -214,6 +254,7 @@ function buildSessionObject({ buyerId, token = '', refreshToken = '', baseUrl = 
         timeout: 6000
       });
 
+      if (res.status === 401 || res.status === 403) return false;
       return Boolean(res.status === 200 && res.data && res.data.success !== false);
     } catch {
       return false;
@@ -365,16 +406,21 @@ async function saveSession(buyerIdOrSession, maybeSession) {
 
     if (!bId || !sess) return false;
 
+    const now = Date.now();
     sessionCache.set(bId, {
       session: sess,
-      savedAt: Date.now()
+      savedAt: now
     });
 
-    if (redisClient && typeof redisClient.set === 'function' && redisClient.status === 'ready') {
-      const serialized = typeof sess.toSerializable === 'function'
-        ? sess.toSerializable()
-        : { buyerId: bId, token: sess.token || '' };
+    const serialized = typeof sess.toSerializable === 'function'
+      ? sess.toSerializable()
+      : { buyerId: bId, token: sess.token || '', savedAt: now };
 
+    if (serialized.token) {
+      writeDiskSession(bId, { ...serialized, savedAt: now });
+    }
+
+    if (redisClient && typeof redisClient.set === 'function' && redisClient.status === 'ready') {
       await redisClient.set(redisKey(bId), JSON.stringify(serialized), 'EX', SESSION_TTL_SEC).catch(() => null);
     }
 
@@ -391,7 +437,10 @@ async function getSession(buyerId) {
 
   const cached = sessionCache.get(bId);
   if (cached && cached.session) {
-    return cached.session;
+    if (Date.now() - Number(cached.savedAt || 0) < SESSION_TTL_MS) {
+      return cached.session;
+    }
+    sessionCache.delete(bId);
   }
 
   try {
@@ -415,6 +464,19 @@ async function getSession(buyerId) {
     console.warn('[SESSION REDIS READ WARN]:', err.message);
   }
 
+  const diskStore = readDiskSessions();
+  const diskEntry = diskStore[bId];
+  if (diskEntry && diskEntry.token) {
+    const rebuilt = buildSessionObject({
+      buyerId: bId,
+      token: diskEntry.token,
+      refreshToken: diskEntry.refreshToken,
+      baseUrl: diskEntry.baseUrl
+    });
+    sessionCache.set(bId, { session: rebuilt, savedAt: Number(diskEntry.savedAt) || Date.now() });
+    return rebuilt;
+  }
+
   return null;
 }
 
@@ -422,6 +484,7 @@ async function clearSession(buyerId) {
   const bId = String(buyerId || '').trim();
   if (bId) {
     sessionCache.delete(bId);
+    writeDiskSession(bId, null);
     try {
       if (redisClient && typeof redisClient.del === 'function' && redisClient.status === 'ready') {
         await redisClient.del(redisKey(bId)).catch(() => null);

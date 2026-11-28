@@ -1,6 +1,6 @@
 ﻿'use strict';
 
-const { Op } = require('sequelize');
+const axios = require('axios');
 const { RcmIdentity, RcmMonthlyTurnoverHistory, MemberMonthlySnapshot, sequelize } = require('../models');
 const { parseQuery } = require('../utils/queryParser');
 const {
@@ -15,20 +15,16 @@ const { emitProgress } = require('../services/socketService');
 const { issueToken, revokeToken, allowAttempt, clearAttempts } = require('../services/lifelinesAuth');
 const activeView = require('../services/rcmActiveView');
 
+const ECOM_BASE = 'https://ecomapi.rcmworld.com/api';
+
 // ---------------------------------------------------------------------------
-// Resilient Scraper & Session Adapters (Zero-crash fallbacks)
+// Resilient Scraper & Session Adapters
 // ---------------------------------------------------------------------------
 async function persistSessionSafely(buyerId, session) {
   try {
-    if (typeof saveSession === 'function') {
-      return await saveSession(buyerId, session);
-    }
-    if (typeof rcmGroupScraper.saveSession === 'function') {
-      return await rcmGroupScraper.saveSession(buyerId, session);
-    }
-    if (session && typeof session.saveSession === 'function') {
-      return await session.saveSession();
-    }
+    if (typeof saveSession === 'function') return await saveSession(buyerId, session);
+    if (typeof rcmGroupScraper.saveSession === 'function') return await rcmGroupScraper.saveSession(buyerId, session);
+    if (session && typeof session.saveSession === 'function') return await session.saveSession();
   } catch (err) {
     console.warn('[SESSION PERSIST NOTICE]:', err.message);
   }
@@ -96,6 +92,26 @@ async function fetchMacroSafe(session, buyerId) {
   return { identity: { buyer_id: buyerId }, total_pv: 0, self_pv: 0 };
 }
 
+const activeBackgroundCrawls = new Set();
+
+function triggerBackgroundDeltaCrawl(session, buyerId, macroInfo = {}) {
+  const crawlKey = String(buyerId);
+  if (activeBackgroundCrawls.has(crawlKey)) return false;
+  activeBackgroundCrawls.add(crawlKey);
+  setImmediate(async () => {
+    try {
+      await scrapeGroupSafe(session, buyerId, macroInfo);
+    } catch (err) {
+      console.error('[BACKGROUND CRAWL ERROR]:', err.message);
+      emitProgress('LIFELINES_SYNC_PROGRESS', { buyerId, status: 'error', isComplete: true, message: 'Tree sync failed.' });
+    } finally {
+      activeBackgroundCrawls.delete(crawlKey);
+      invalidateTree(buyerId);
+    }
+  });
+  return true;
+}
+
 async function scrapeGroupSafe(session, buyerId, macroInfo) {
   if (typeof rcmGroupScraper.scrapeYourGroup === 'function') {
     return await rcmGroupScraper.scrapeYourGroup(session, buyerId, macroInfo);
@@ -129,9 +145,7 @@ async function scrapeGroupSafe(session, buyerId, macroInfo) {
 }
 
 function getCrawlStatusSafe(rootId) {
-  if (typeof rcmGroupScraper.getCrawlStatus === 'function') {
-    return rcmGroupScraper.getCrawlStatus(rootId);
-  }
+  if (typeof rcmGroupScraper.getCrawlStatus === 'function') return rcmGroupScraper.getCrawlStatus(rootId);
   return { running: false, count: 0 };
 }
 
@@ -150,14 +164,16 @@ function sendSafe(res, statusCode, payload) {
   return res.status(statusCode).json(payload);
 }
 
+function setNoStore(res) {
+  if (res && !res.headersSent) res.set('Cache-Control', 'no-store');
+}
+
 function safeNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function round2(value) {
-  return Math.round(safeNumber(value) * 100) / 100;
-}
+const round2 = (v) => Math.round(safeNumber(v) * 100) / 100;
 
 function firstPositive(...values) {
   for (const v of values) {
@@ -169,15 +185,12 @@ function firstPositive(...values) {
 
 function firstDefined(...values) {
   for (const v of values) {
-    if (v !== undefined && v !== null && v !== '') return v;
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
   }
   return undefined;
 }
 
-function normalizeValue(value) {
-  if (value === undefined || value === null || value === '') return null;
-  return value;
-}
+const normalizeValue = (v) => (v === undefined || v === null || v === '' ? null : v);
 
 function chunk(arr, size) {
   const out = [];
@@ -198,7 +211,6 @@ const monthLabelOf = (d) => d.toLocaleDateString('en-IN', { month: 'short', year
 function parseDateLoose(value) {
   if (!value) return null;
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
-
   const str = String(value).trim();
   if (!str) return null;
 
@@ -207,19 +219,33 @@ function parseDateLoose(value) {
     const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
     return Number.isNaN(d.getTime()) ? null : d;
   }
-
   m = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
   if (m) {
     const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
     return Number.isNaN(d.getTime()) ? null : d;
   }
-
+  m = str.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (m) {
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
   const fallback = new Date(str);
   return Number.isNaN(fallback.getTime()) ? null : fallback;
 }
 
 const formatDateOnly = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+// Resolves official join_date first; falls back to discovered_at when is_baseline === 0
+function resolveEffectiveJoinDate(identity = {}, node = null) {
+  const official = parseDateLoose(firstDefined(identity?.join_date, node?.join_date));
+  if (official) return { date: official, source: 'official' };
+  if (node && Number(node.is_baseline ?? 1) === 0 && node.discovered_at) {
+    const discovered = parseDateLoose(node.discovered_at);
+    if (discovered) return { date: discovered, source: 'discovered' };
+  }
+  return null;
+}
 
 function getCurrentAndClosedMonthKeys() {
   const now = new Date();
@@ -232,17 +258,13 @@ function resolveRoot(req, res, suppliedRoot) {
   const supplied = safeNumber(suppliedRoot, 0);
   if (tokenRoot) {
     if (supplied && supplied !== tokenRoot) {
-      if (!res.headersSent && !res.writableEnded) {
-        res.status(403).json({ success: false, message: 'You can only access your own tree.' });
-      }
+      sendSafe(res, 403, { success: false, message: 'You can only access your own tree.' });
       return null;
     }
     return tokenRoot;
   }
   if (!supplied) {
-    if (!res.headersSent && !res.writableEnded) {
-      res.status(400).json({ success: false, message: 'buyerId is required.' });
-    }
+    sendSafe(res, 400, { success: false, message: 'buyerId is required.' });
     return null;
   }
   return supplied;
@@ -252,7 +274,7 @@ const select = (sql, replacements = {}) =>
   sequelize.query(sql, { replacements, type: sequelize.QueryTypes.SELECT });
 
 // ---------------------------------------------------------------------------
-// Identity loader (only columns that really exist on the model)
+// Identity loader & on-demand live portal enrichment
 // ---------------------------------------------------------------------------
 const IDENTITY_WANTED = [
   'buyer_id', 'name', 'custom_photo_url', 'profile_photo_url', 'photo_url',
@@ -263,11 +285,20 @@ const IDENTITY_WANTED = [
 
 async function loadIdentities(ids) {
   const map = new Map();
-  if (!ids || ids.length === 0) return map;
+  if (!ids || ids.length === 0 || !RcmIdentity || !RcmIdentity.rawAttributes) return map;
+  const cleanIds = [...new Set(ids.map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0))];
+  if (cleanIds.length === 0) return map;
+
   const attributes = IDENTITY_WANTED.filter((a) => RcmIdentity.rawAttributes[a]);
-  for (const part of chunk(ids, 2000)) {
-    const rows = await RcmIdentity.findAll({ where: { buyer_id: part }, attributes, raw: true }).catch(() => []);
-    rows.forEach((r) => map.set(Number(r.buyer_id), r));
+  const parts = chunk(cleanIds, 2000);
+  for (let i = 0; i < parts.length; i += 4) {
+    const batch = parts.slice(i, i + 4);
+    const results = await Promise.all(
+      batch.map((part) => RcmIdentity.findAll({ where: { buyer_id: part }, attributes, raw: true }).catch(() => []))
+    );
+    for (const rows of results) {
+      rows.forEach((r) => map.set(Number(r.buyer_id), r));
+    }
   }
   return map;
 }
@@ -278,17 +309,137 @@ const pickMobile = (identity = {}) => identity.mobile_no || identity.mobile || '
 const pickPin = (identity = {}) =>
   identity.max_pin || identity.highest_pin || identity.curr_pin || identity.pin || null;
 
+function pickFieldFromSources(sources, keys) {
+  for (const src of sources) {
+    if (!src || typeof src !== 'object') continue;
+    for (const k of keys) {
+      const v = src[k];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    }
+  }
+  return null;
+}
+
+const memberEnrichCooldown = new Map();
+const ENRICH_COOLDOWN_MS = 10 * 60 * 1000;
+
+async function fetchPortalJson(session, url, timeoutMs = 3000) {
+  const authHeader =
+    session?.client?.defaults?.headers?.common?.Authorization ||
+    (session?.token ? `Bearer ${session.token}` : '');
+  const cookieHeader = session?.client?.defaults?.headers?.common?.Cookie || '';
+
+  const headers = {
+    Origin: 'https://www.rcmworld.com',
+    Referer: 'https://www.rcmworld.com/',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    Resource: 'web',
+    resource: 'web',
+    'x-user-type': 'ab',
+    Accept: 'application/json, text/plain, */*'
+  };
+  if (authHeader) headers.Authorization = authHeader;
+  if (cookieHeader) headers.Cookie = cookieHeader;
+
+  const client = session?.client || axios;
+  const res = await client.get(url, { headers, timeout: timeoutMs, validateStatus: () => true });
+  if (res.status !== 200 || !res.data) return null;
+  const d = res.data.data;
+  return Array.isArray(d) ? d[0] : (d && typeof d === 'object' ? d : null);
+}
+
+async function enrichMemberIdentityFromPortal(rootId, memberId, existing = {}) {
+  const needsEnrich =
+    !existing?.proposer_id ||
+    !existing?.proposer_name ||
+    !existing?.sponsor_name ||
+    !existing?.join_date ||
+    !pickMobile(existing) ||
+    !existing?.district;
+
+  if (!needsEnrich) return null;
+
+  const ck = `${rootId}:${memberId}`;
+  const lastAt = memberEnrichCooldown.get(ck);
+  if (lastAt && Date.now() - lastAt < ENRICH_COOLDOWN_MS) return null;
+
+  const session = await retrieveSessionSafely(rootId);
+  if (!session) return null;
+
+  memberEnrichCooldown.set(ck, Date.now());
+  if (memberEnrichCooldown.size > 5000) memberEnrichCooldown.clear();
+
+  const now = new Date();
+  const m = now.getMonth() + 1;
+  const y = now.getFullYear();
+
+  try {
+    const [profileData, infoData] = await Promise.race([
+      Promise.all([
+        fetchPortalJson(session, `${ECOM_BASE}/user/business-info/your-purchase-volume/profile?distno=${memberId}&month=${m}&year=${y}`, 3000).catch(() => null),
+        fetchPortalJson(session, `${ECOM_BASE}/user/profile/get-distributor-info?dist_no=${memberId}`, 3000).catch(() => null)
+      ]),
+      new Promise((resolve) => setTimeout(() => resolve([null, null]), 3400))
+    ]);
+
+    const sources = [profileData, infoData].filter(Boolean);
+    if (sources.length === 0) return null;
+
+    const parsedJoin = parseDateLoose(pickFieldFromSources(sources, ['join_date', 'doj', 'joining_date', 'reg_date']));
+    const enriched = {
+      name: pickFieldFromSources(sources, ['dist_name', 'name', 'title']),
+      proposer_id: pickFieldFromSources(sources, ['proposer_id', 'proposer_no', 'proposer_ab_no', 'proposer_distno', 'proposer']),
+      proposer_name: pickFieldFromSources(sources, ['proposer_name', 'proposer_dist_name', 'proposer_ab_name']),
+      sponsor_id: pickFieldFromSources(sources, ['sponsor_id', 'sponsor_no', 'sponsor_ab_no', 'sponsor_distno', 'sponsor', 'upline_id', 'upline_no']),
+      sponsor_name: pickFieldFromSources(sources, ['sponsor_name', 'sponsor_dist_name', 'sponsor_ab_name', 'upline_name']),
+      mobile_no: pickFieldFromSources(sources, ['mobile_no', 'mobile', 'mob_no', 'phone', 'contact_no']),
+      district: pickFieldFromSources(sources, ['district', 'district_name', 'city']),
+      state: pickFieldFromSources(sources, ['state', 'state_name']),
+      tehsil: pickFieldFromSources(sources, ['tehsil', 'taluka']),
+      post_village: pickFieldFromSources(sources, ['post_village', 'village']),
+      pincode: pickFieldFromSources(sources, ['pincode', 'pin_code']),
+      address: pickFieldFromSources(sources, ['address', 'address_line']),
+      curr_pin: pickFieldFromSources(sources, ['curr_pin', 'current_pin', 'pin_level']),
+      max_pin: pickFieldFromSources(sources, ['max_pin', 'highest_pin']),
+      kyc_status: pickFieldFromSources(sources, ['kyc_status']),
+      photo_url: pickFieldFromSources(sources, ['user_image', 'photo_url', 'profile_photo_url']),
+      join_date: parsedJoin ? formatDateOnly(parsedJoin) : null
+    };
+
+    if (RcmIdentity && RcmIdentity.rawAttributes) {
+      const attrs = RcmIdentity.rawAttributes;
+      const upsertPayload = { buyer_id: Number(memberId) };
+      for (const [k, v] of Object.entries(enriched)) {
+        if (!v) continue;
+        if (attrs[k]) upsertPayload[k] = k === 'join_date' ? parsedJoin : v;
+      }
+      if (enriched.mobile_no && attrs.mobile && !upsertPayload.mobile) upsertPayload.mobile = enriched.mobile_no;
+      if (enriched.max_pin && attrs.highest_pin && !upsertPayload.highest_pin) upsertPayload.highest_pin = enriched.max_pin;
+      if (enriched.photo_url && attrs.profile_photo_url && !upsertPayload.profile_photo_url) upsertPayload.profile_photo_url = enriched.photo_url;
+
+      if (Object.keys(upsertPayload).length > 1) {
+        await RcmIdentity.upsert(upsertPayload).catch((err) => console.warn('[ENRICH UPSERT WARN]:', err.message));
+      }
+    }
+
+    return enriched;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // TREE ENGINE: Shared In-Memory Graph + Instant Multi-User Subtree Slicing
 // ---------------------------------------------------------------------------
 const NODE_COLUMN_CANDIDATES = [
   'buyer_id', 'parent_id', 'name', 'status', 'kyc_status', 'leg_type', 'level',
-  'current_pv', 'self_pv', 'repurchase_amt', 'purchase_amt', 'total_group_pv', 'children_count'
+  'current_pv', 'self_pv', 'repurchase_amt', 'purchase_amt', 'total_group_pv', 'children_count',
+  'join_date', 'sponsor_id', 'sponsor_name', 'proposer_id', 'proposer_name',
+  'is_baseline', 'discovered_at'
 ];
 const GRAPH_TTL_MS = 60 * 1000;
 const GRAPH_MIN_RELOAD_MS = 5 * 1000;
 const TREE_TTL_MS = 30 * 1000;
-const SUBTREE_ID_TTL_MS = 60 * 1000;
 const MAX_CACHED_TREES = 30;
 
 let nodeDescPromise = null;
@@ -331,6 +482,13 @@ function normalizeNode(row, depth) {
     repurchase_amt: Math.max(safeNumber(row.repurchase_amt), safeNumber(row.purchase_amt)),
     total_group_pv: safeNumber(row.total_group_pv),
     children_count: safeNumber(row.children_count),
+    join_date: row.join_date || null,
+    sponsor_id: row.sponsor_id || null,
+    sponsor_name: row.sponsor_name || null,
+    proposer_id: row.proposer_id || null,
+    proposer_name: row.proposer_name || null,
+    is_baseline: row.is_baseline === undefined || row.is_baseline === null ? 1 : Number(row.is_baseline),
+    discovered_at: row.discovered_at || null,
     depth
   };
 }
@@ -367,9 +525,7 @@ function loadGlobalGraph({ fresh = false } = {}) {
 
     return { nodeMap, childrenMap, builtAt: Date.now() };
   })().catch((err) => {
-    if (globalGraphEntry && globalGraphEntry.promise === promise) {
-      globalGraphEntry = null;
-    }
+    if (globalGraphEntry && globalGraphEntry.promise === promise) globalGraphEntry = null;
     throw err;
   });
 
@@ -402,9 +558,7 @@ function sliceSubtreeFromGraph(graph, rootId) {
       subtreeChildrenMap.set(id, kids);
       for (const kid of kids) {
         const kidId = String(kid.buyer_id);
-        if (!visited.has(kidId)) {
-          queue.push({ id: kidId, depth: depth + 1 });
-        }
+        if (!visited.has(kidId)) queue.push({ id: kidId, depth: depth + 1 });
       }
     }
   }
@@ -413,17 +567,10 @@ function sliceSubtreeFromGraph(graph, rootId) {
 }
 
 const treeCache = new Map();
-const subtreeIdCache = new Map();
 
 function invalidateTree(rootId) {
-  if (rootId !== undefined && rootId !== null) {
-    const key = String(rootId);
-    treeCache.delete(key);
-    subtreeIdCache.delete(key);
-  } else {
-    treeCache.clear();
-    subtreeIdCache.clear();
-  }
+  if (rootId !== undefined && rootId !== null) treeCache.delete(String(rootId));
+  else treeCache.clear();
   if (globalGraphEntry && Date.now() - globalGraphEntry.at >= GRAPH_MIN_RELOAD_MS) {
     globalGraphEntry = null;
   }
@@ -448,27 +595,8 @@ function loadTree(rootId, { fresh = false } = {}) {
       treeCache.delete(key);
       throw err;
     });
+
   treeCache.set(key, { at: Date.now(), promise });
-  return promise;
-}
-
-async function findSubtreeMemberIds(rootId) {
-  const rStr = String(rootId);
-  const cachedIds = subtreeIdCache.get(rStr);
-  if (cachedIds && Date.now() - cachedIds.at < SUBTREE_ID_TTL_MS) {
-    return cachedIds.promise;
-  }
-
-  const promise = loadTree(rootId).then((tree) => {
-    const set = new Set();
-    for (const k of tree.nodeMap.keys()) {
-      const n = Number(k);
-      if (n) set.add(n);
-    }
-    return set;
-  });
-
-  subtreeIdCache.set(rStr, { at: Date.now(), promise });
   return promise;
 }
 
@@ -481,19 +609,15 @@ async function buildAncestorPath(rootId, targetId) {
   for (let hop = 0; hop < 150 && curr; hop += 1) {
     if (visited.has(curr)) break;
     visited.add(curr);
-
     const node = tree.nodeMap.get(curr);
     if (!node) break;
     chain.push(node);
-
     if (Number(node.buyer_id) === Number(rootId) || !node.parent_id) break;
     curr = String(node.parent_id);
   }
 
-  const ids = chain.map((n) => n.buyer_id);
-  const identities = await loadIdentities(ids);
+  const identities = await loadIdentities(chain.map((n) => n.buyer_id));
   const path = [];
-
   for (let i = chain.length - 1; i >= 0; i -= 1) {
     const n = chain[i];
     const idRow = identities.get(n.buyer_id) || {};
@@ -509,7 +633,6 @@ async function buildAncestorPath(rootId, targetId) {
       total_group_pv: n.total_group_pv
     });
   }
-
   return path;
 }
 
@@ -521,7 +644,6 @@ async function isInSubtree(rootId, memberId) {
 
   let tree = await loadTree(r);
   if (tree.nodeMap.has(String(m))) return true;
-
   tree = await loadTree(r, { fresh: true });
   return tree.nodeMap.has(String(m));
 }
@@ -532,16 +654,18 @@ function classifyNode(node) {
   return 'inactive';
 }
 
-function assignLegLetters(heads) {
+function assignLegLetters(heads, { useStoredLeg = true } = {}) {
   const sortedById = heads.slice().sort((a, b) => a.buyer_id - b.buyer_id);
   const used = new Set();
   const letterOf = new Map();
 
-  for (const head of sortedById) {
-    const letter = parseLegLetter(head.leg_type);
-    if (letter && !used.has(letter)) {
-      used.add(letter);
-      letterOf.set(head.buyer_id, letter);
+  if (useStoredLeg) {
+    for (const head of sortedById) {
+      const letter = parseLegLetter(head.leg_type);
+      if (letter && !used.has(letter)) {
+        used.add(letter);
+        letterOf.set(head.buyer_id, letter);
+      }
     }
   }
 
@@ -563,19 +687,14 @@ function analyzeTree(tree, rootId) {
   const rootKey = String(rootId);
   const rootNode = tree.nodeMap.get(rootKey) || null;
   const heads = tree.childrenMap.get(rootKey) || [];
-  const orderedHeads = assignLegLetters(heads);
+  const orderedHeads = assignLegLetters(heads, { useStoredLeg: true });
 
   const totals = { members: 0, active: 0, inactive: 0, terminated: 0, pv: 0, repurchase: 0 };
   const members = [];
   const visited = new Set([rootKey]);
 
   const legs = orderedHeads.map(({ head, letter }) => {
-    const leg = {
-      head,
-      letter,
-      members: 0, active: 0, inactive: 0, terminated: 0, pv: 0, repurchase: 0
-    };
-
+    const leg = { head, letter, members: 0, active: 0, inactive: 0, terminated: 0, pv: 0, repurchase: 0 };
     const queue = [{ node: head, depth: 1 }];
     for (let qi = 0; qi < queue.length; qi += 1) {
       const { node, depth } = queue[qi];
@@ -610,33 +729,30 @@ function analyzeTree(tree, rootId) {
 }
 
 // ---------------------------------------------------------------------------
-// Direct SQL for fresh single-parent reads
+// Direct SQL for fresh single-parent reads (with accurate children_count)
 // ---------------------------------------------------------------------------
 async function fetchChildrenRows(parentId) {
   const cols = columnSql(await getNodeColumns());
-  const rows = await select('SELECT ' + cols + ' FROM rcm_downline_nodes WHERE parent_id = :parentId', {
+  const rows = await select(`SELECT ${cols} FROM rcm_downline_nodes WHERE parent_id = :parentId`, {
     parentId: String(parentId)
   });
   const nodes = rows.map((r) => normalizeNode(r, 0));
-  nodes.sort((a, b) =>
-    b.total_group_pv - a.total_group_pv || b.pv - a.pv || a.buyer_id - b.buyer_id);
+  nodes.sort((a, b) => b.total_group_pv - a.total_group_pv || b.pv - a.pv || a.buyer_id - b.buyer_id);
 
-  const withKids = new Set();
-  const needChildLookup = [];
-  for (const n of nodes) {
-    if (n.children_count > 0) withKids.add(n.buyer_id);
-    else needChildLookup.push(n.buyer_id);
-  }
-
-  for (const part of chunk(needChildLookup, 500)) {
+  const childCounts = new Map();
+  const ids = nodes.map((n) => n.buyer_id);
+  for (const part of chunk(ids, 500)) {
     const kidRows = await select(
-      'SELECT DISTINCT parent_id FROM rcm_downline_nodes WHERE parent_id IN (:ids)',
+      'SELECT parent_id, COUNT(*) AS cnt FROM rcm_downline_nodes WHERE parent_id IN (:ids) GROUP BY parent_id',
       { ids: part.map(String) }
     );
-    kidRows.forEach((r) => withKids.add(Number(r.parent_id)));
+    kidRows.forEach((r) => childCounts.set(Number(r.parent_id), Number(r.cnt) || 0));
   }
 
-  return nodes.map((n) => ({ ...n, has_children: withKids.has(n.buyer_id) }));
+  return nodes.map((n) => {
+    const actualCount = Math.max(childCounts.get(n.buyer_id) || 0, n.children_count || 0);
+    return { ...n, children_count: actualCount, has_children: actualCount > 0 };
+  });
 }
 
 function formatNode(node, identity = {}) {
@@ -650,8 +766,15 @@ function formatNode(node, identity = {}) {
     max_pin: identity.max_pin || identity.highest_pin || 'ASSOCIATE BUYER',
     highest_pin: identity.highest_pin || 'ASSOCIATE BUYER',
     kyc_status: node.kyc_status || identity.kyc_status || (Number(node.status) === 0 ? 'Terminated' : null),
-    join_date: identity.join_date || null,
+    join_date: identity.join_date || node.join_date || null,
     mobile_no: pickMobile(identity) || null,
+    district: identity.district || null,
+    state: identity.state || null,
+    leg_type: node.leg_type || null,
+    sponsor_id: firstDefined(identity.sponsor_id, node.sponsor_id, node.parent_id) || null,
+    sponsor_name: firstDefined(identity.sponsor_name, node.sponsor_name) || null,
+    proposer_id: firstDefined(identity.proposer_id, node.proposer_id) || null,
+    proposer_name: firstDefined(identity.proposer_name, node.proposer_name) || null,
     status: Number(node.status),
     statusLabel: Number(node.status) === 1 ? 'ACTIVE' : 'TERMINATED',
     self_pv: node.self_pv,
@@ -665,7 +788,7 @@ function formatNode(node, identity = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Turnover history helpers (deduplicated by month)
+// Turnover history helpers
 // ---------------------------------------------------------------------------
 const rowMonthKey = (row) => String(row.month_key || row.year_month || '').replace('-', '');
 
@@ -699,10 +822,9 @@ async function fetchTurnoverRows(buyerId, limit = 12) {
 // ---------------------------------------------------------------------------
 // POST /sync
 // ---------------------------------------------------------------------------
-const activeBackgroundCrawls = new Set();
-
 exports.syncLifelines = async (req, res) => {
   try {
+    setNoStore(res);
     const rawId = req.body?.buyerId || req.body?.buyer_id || req.body?.dist_no || req.body?.distNo || req.body?.rcmId || req.body?.id;
     const password = req.body?.password || req.body?.rcmPassword || req.body?.pass;
     const buyerId = safeNumber(rawId, 0);
@@ -775,21 +897,7 @@ exports.syncLifelines = async (req, res) => {
       }
     });
 
-    const crawlKey = String(buyerId);
-    if (!activeBackgroundCrawls.has(crawlKey)) {
-      activeBackgroundCrawls.add(crawlKey);
-      setImmediate(async () => {
-        try {
-          await scrapeGroupSafe(session, buyerId, macroInfo);
-        } catch (err) {
-          console.error('[BACKGROUND CRAWL ERROR]:', err.message);
-          emitProgress('LIFELINES_SYNC_PROGRESS', { buyerId, status: 'error', isComplete: true, message: 'Tree sync failed.' });
-        } finally {
-          activeBackgroundCrawls.delete(crawlKey);
-          invalidateTree(buyerId);
-        }
-      });
-    }
+    triggerBackgroundDeltaCrawl(session, buyerId, macroInfo);
     return undefined;
   } catch (error) {
     console.error('Error in syncLifelines:', error.message);
@@ -797,17 +905,143 @@ exports.syncLifelines = async (req, res) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// GET /live-check/:buyerId
+// ---------------------------------------------------------------------------
+exports.liveCheckLifelines = async (req, res) => {
+  try {
+    setNoStore(res);
+    const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
+    if (!rootId) return undefined;
+
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const year = now.getFullYear();
+    const monthKey = `${year}${String(month).padStart(2, '0')}`;
+    const yearMonth = `${year}-${String(month).padStart(2, '0')}`;
+
+    const session = await retrieveSessionSafely(rootId);
+    if (!session) {
+      return sendSafe(res, 200, {
+        success: true, hasSession: false, sessionExpired: true, pvChanged: false, deltaTriggered: false
+      });
+    }
+
+    if (typeof session.isAuthenticated === 'function') {
+      const authed = await Promise.race([
+        session.isAuthenticated(),
+        new Promise((resolve) => setTimeout(() => resolve(true), 2500))
+      ]);
+      if (!authed) {
+        removeSessionSafely(rootId);
+        return sendSafe(res, 200, {
+          success: true, hasSession: false, sessionExpired: true, pvChanged: false, deltaTriggered: false
+        });
+      }
+    }
+
+    let pvSnap = { ok: false };
+    if (typeof rcmGroupScraper.fetchPvOnlyFull === 'function') {
+      pvSnap = await Promise.race([
+        rcmGroupScraper.fetchPvOnlyFull(session, rootId, month, year),
+        new Promise((resolve) => setTimeout(() => resolve({ ok: false, timeout: true }), 4500))
+      ]);
+    }
+
+    if (!pvSnap.ok) {
+      return sendSafe(res, 200, {
+        success: true, hasSession: true, sessionExpired: false, liveCheckSkipped: true, pvChanged: false, deltaTriggered: false
+      });
+    }
+
+    const livePv = round2(pvSnap.groupPv || 0);
+    const liveSelfPv = round2(pvSnap.selfPv || 0);
+
+    let prevMacroPv = 0;
+    let prevProcessedPv = 0;
+    let prevState = '';
+    if (sequelize) {
+      const stRows = await select(
+        'SELECT state, macro_pv, processed_pv FROM rcm_sync_state WHERE owner_id = :owner AND month_key = :monthKey LIMIT 1',
+        { owner: Number(rootId), monthKey }
+      ).catch(() => []);
+      if (stRows[0]) {
+        prevState = String(stRows[0].state || '');
+        prevMacroPv = round2(stRows[0].macro_pv || 0);
+        prevProcessedPv = round2(stRows[0].processed_pv || 0);
+      }
+    }
+
+    const pvChanged = livePv > 0 && Math.abs(livePv - prevMacroPv) > 0.05;
+    const hasGap = livePv > 0 && (prevState !== 'VERIFIED' || Math.abs(livePv - prevProcessedPv) > 0.05);
+
+    if (livePv > 0 && sequelize) {
+      await sequelize.query(
+        `UPDATE rcm_sync_state
+            SET macro_pv = :macroPv,
+                residual_pv = GREATEST(0, ROUND(:macroPv - processed_pv, 2)),
+                state = IF(ABS(:macroPv - processed_pv) > 0.05, 'BOUNDED', state),
+                updated_at = :now
+          WHERE owner_id = :owner AND month_key = :monthKey`,
+        { replacements: { macroPv: livePv, now: new Date(), owner: Number(rootId), monthKey } }
+      ).catch(() => {});
+
+      if (RcmMonthlyTurnoverHistory) {
+        const attrs = RcmMonthlyTurnoverHistory.rawAttributes || {};
+        const monthCol = attrs.year_month ? 'year_month' : attrs.month_key ? 'month_key' : null;
+        if (monthCol) {
+          const monthVal = monthCol === 'year_month' ? yearMonth : monthKey;
+          const hist = await RcmMonthlyTurnoverHistory.findOne({
+            where: { buyer_id: Number(rootId), [monthCol]: monthVal }
+          }).catch(() => null);
+          if (hist) {
+            await hist.update({
+              total_pv: livePv,
+              ...(liveSelfPv > 0 ? { self_pv: liveSelfPv } : {}),
+              updated_at: new Date()
+            }).catch(() => {});
+          }
+        }
+      }
+    }
+
+    let deltaTriggered = false;
+    if (pvChanged || hasGap) {
+      invalidateTree(rootId);
+      deltaTriggered = triggerBackgroundDeltaCrawl(session, rootId, { totalPv: livePv, selfPv: liveSelfPv });
+    }
+
+    return sendSafe(res, 200, {
+      success: true,
+      hasSession: true,
+      sessionExpired: false,
+      totalPv: livePv,
+      selfPv: liveSelfPv,
+      pvChanged,
+      hasGap,
+      deltaTriggered,
+      checkedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.warn('Error in liveCheckLifelines:', error.message);
+    return sendSafe(res, 200, {
+      success: true, hasSession: true, sessionExpired: false, pvChanged: false, deltaTriggered: false
+    });
+  }
+};
+
 exports.logoutLifelines = async (req, res) => {
+  setNoStore(res);
   if (req.lifelinesRoot) {
     removeSessionSafely(req.lifelinesRoot);
     treeCache.delete(String(req.lifelinesRoot));
-    subtreeIdCache.delete(String(req.lifelinesRoot));
   }
   revokeToken(req.lifelinesToken);
   return sendSafe(res, 200, { success: true });
 };
 
 exports.getSyncStatus = async (req, res) => {
+  setNoStore(res);
   const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
   if (!rootId) return undefined;
   return sendSafe(res, 200, {
@@ -824,6 +1058,7 @@ exports.getSyncStatus = async (req, res) => {
 // ---------------------------------------------------------------------------
 exports.getLifelinesOverview = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
@@ -839,8 +1074,7 @@ exports.getLifelinesOverview = async (req, res) => {
     if (res.headersSent || res.writableEnded) return undefined;
 
     const identity = identityMap.get(rootId) || {};
-    const analysis = analyzeTree(tree, rootId);
-    const { rootNode, legs, totals } = analysis;
+    const { rootNode, legs, totals } = analyzeTree(tree, rootId);
 
     const turnoverCurrent = historyRows.find((h) => rowMonthKey(h) === currentKey) || null;
     const turnoverClosed = historyRows.find((h) => rowMonthKey(h) === closedKey) || null;
@@ -907,6 +1141,7 @@ exports.getLifelinesOverview = async (req, res) => {
         leg: leg.letter,
         leg_type: `Leg ${leg.letter}`,
         photo_url: pickPhoto(legIdentity),
+        highest_pin: pickPin(legIdentity),
         pv: officialPv,
         subtree_pv: officialPv,
         total_leg_subtree_pv: officialPv,
@@ -925,12 +1160,11 @@ exports.getLifelinesOverview = async (req, res) => {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const key = monthKeyOf(d);
       const hist = i === 0 ? turnoverCurrent : historyRows.find((h) => rowMonthKey(h) === key) || null;
-      const hasData = i === 0 || Boolean(hist);
       monthlyHistory.push({
         monthKey: key,
         monthLabel: monthLabelOf(d),
         isCurrent: i === 0,
-        hasData,
+        hasData: i === 0 || Boolean(hist),
         totalPv: i === 0 ? totalPv : (hist ? safeNumber(hist.total_pv) : null),
         selfPv: i === 0 ? selfPv : (hist ? safeNumber(hist.self_pv) : null),
         selfRepurchaseAmt: i === 0 ? round2(selfRepurchaseAmt) : (hist && hist.self_repurchase_amt !== undefined ? round2(hist.self_repurchase_amt) : null),
@@ -1025,6 +1259,7 @@ exports.getLifelinesOverview = async (req, res) => {
 // ---------------------------------------------------------------------------
 exports.getLifelinesChildren = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId || req.query.rootBuyerId);
     if (!rootId) return undefined;
     const parentId = safeNumber(req.query.parentId || req.query.parent_id, rootId) || rootId;
@@ -1034,7 +1269,6 @@ exports.getLifelinesChildren = async (req, res) => {
     }
 
     let rows = await fetchChildrenRows(parentId);
-
     if (rows.length === 0 && (await retrieveSessionSafely(rootId))) {
       try {
         const result = await Promise.race([
@@ -1045,9 +1279,7 @@ exports.getLifelinesChildren = async (req, res) => {
           rows = await fetchChildrenRows(parentId);
           invalidateTree(rootId);
         }
-      } catch {
-        /* ignore slow/failed on-demand portal fetch */
-      }
+      } catch { /* ignore slow portal */ }
     }
 
     const identities = await loadIdentities(rows.map((n) => n.buyer_id));
@@ -1069,10 +1301,11 @@ exports.getLifelinesChildren = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// GET /new-joinings/:buyerId
+// GET /new-joinings/:buyerId  (Uses official join_date OR is_baseline=0 + discovered_at)
 // ---------------------------------------------------------------------------
 const getNewJoinings = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId || req.query.rootBuyerId);
     if (!rootId) return undefined;
 
@@ -1104,43 +1337,37 @@ const getNewJoinings = async (req, res) => {
 
     const tree = await loadTree(rootId);
     const { members } = analyzeTree(tree, rootId);
-
     if (members.length === 0) {
       return sendSafe(res, 200, {
-        success: true,
-        rootBuyerId: rootId,
-        totalNewJoinings: 0,
-        months: monthLabels,
-        monthKeys,
-        monthCounts: {},
-        data: []
+        success: true, rootBuyerId: rootId, totalNewJoinings: 0,
+        months: monthLabels, monthKeys, monthCounts: {}, data: []
       });
     }
 
     const identityMap = await loadIdentities(members.map((m) => m.buyer_id));
-
     const results = [];
     const monthCounts = {};
     monthLabels.forEach((l) => { monthCounts[l] = 0; });
 
-    for (const node of members) {
-      const identity = identityMap.get(node.buyer_id);
-      if (!identity) continue;
+    const resolvePersonName = (id, explicitName) => {
+      if (explicitName) return explicitName;
+      if (!id) return null;
+      const nId = Number(id);
+      return identityMap.get(nId)?.name || tree.nodeMap.get(String(id))?.name || null;
+    };
 
-      const joined = parseDateLoose(identity.join_date);
-      if (!joined) continue;
+    for (const node of members) {
+      const identity = identityMap.get(node.buyer_id) || {};
+      const joinInfo = resolveEffectiveJoinDate(identity, node);
+      if (!joinInfo) continue;
+
+      const joined = joinInfo.date;
       if (joined < windowStart || joined >= windowEndExclusive) continue;
 
       const key = monthKeyOf(joined);
       const label = labelByKey.get(key) || monthLabelOf(joined);
-
-      const parentNode = node.parent_id !== null && node.parent_id !== undefined
-        ? tree.nodeMap.get(String(node.parent_id))
-        : null;
-
-      const sponsorId = firstDefined(identity.sponsor_id, node.parent_id);
-      const sponsorName = firstDefined(identity.sponsor_name, parentNode?.name);
-      const proposerId = identity.proposer_id;
+      const sponsorId = firstDefined(identity.sponsor_id, node.sponsor_id, node.parent_id);
+      const proposerId = firstDefined(identity.proposer_id, node.proposer_id);
 
       monthCounts[label] = (monthCounts[label] || 0) + 1;
 
@@ -1148,16 +1375,19 @@ const getNewJoinings = async (req, res) => {
         buyer_id: node.buyer_id,
         name: identity.name || node.name || `Associate #${node.buyer_id}`,
         join_date: formatDateOnly(joined),
+        join_date_source: joinInfo.source,
         month_label: label,
         leg_type: node.leg_type,
-        proposer_id: proposerId !== undefined && proposerId !== null && proposerId !== '' ? String(proposerId) : null,
-        proposer_name: identity.proposer_name || null,
-        sponsor_id: sponsorId !== undefined && sponsorId !== null && sponsorId !== '' ? String(sponsorId) : null,
-        sponsor_name: sponsorName || null,
+        proposer_id: proposerId ? String(proposerId) : null,
+        proposer_name: resolvePersonName(proposerId, firstDefined(identity.proposer_name, node.proposer_name)),
+        sponsor_id: sponsorId ? String(sponsorId) : null,
+        sponsor_name: resolvePersonName(sponsorId, firstDefined(identity.sponsor_name, node.sponsor_name)),
         mobile_no: pickMobile(identity) || null,
         kyc_status: node.kyc_status || identity.kyc_status || null,
         photo_url: pickPhoto(identity),
+        self_pv: node.self_pv,
         current_pv: node.pv,
+        repurchase_amt: node.repurchase_amt,
         status: node.status,
         _sort: joined.getTime()
       });
@@ -1167,31 +1397,23 @@ const getNewJoinings = async (req, res) => {
     const data = results.slice(0, limit).map(({ _sort, ...rest }) => rest);
 
     return sendSafe(res, 200, {
-      success: true,
-      rootBuyerId: rootId,
-      totalNewJoinings: results.length,
-      months: monthLabels,
-      monthKeys,
-      monthCounts,
-      data
+      success: true, rootBuyerId: rootId, totalNewJoinings: results.length,
+      months: monthLabels, monthKeys, monthCounts, data
     });
   } catch (error) {
     console.error('Error in getNewJoinings:', error.message);
     return sendSafe(res, 200, {
-      success: true,
-      totalNewJoinings: 0,
-      months: [],
-      data: [],
-      warning: 'Could not load new joinings.'
+      success: true, totalNewJoinings: 0, months: [], data: [], warning: 'Could not load new joinings.'
     });
   }
 };
 
 // ---------------------------------------------------------------------------
-// GET /assistant-query
+// GET /assistant-query  (Fixed past-month indexing — never leaks current PV into past months)
 // ---------------------------------------------------------------------------
 exports.getAssistantQuery = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.query.buyerId || req.query.rootBuyerId);
     if (!rootId) return undefined;
 
@@ -1204,7 +1426,9 @@ exports.getAssistantQuery = async (req, res) => {
     const legRaw = req.query.leg || parsed.leg || '';
     const legFilter = String(legRaw).toUpperCase().replace(/^LEG\s*/, '').trim();
 
-    let baseDate = new Date();
+    const now = new Date();
+    const actualCurrentKey = monthKeyOf(now);
+    let baseDate = now;
     if (/^\d{6}$/.test(requestedMonthKey)) {
       baseDate = new Date(parseInt(requestedMonthKey.slice(0, 4), 10), parseInt(requestedMonthKey.slice(4, 6), 10) - 1, 1);
     }
@@ -1212,13 +1436,17 @@ exports.getAssistantQuery = async (req, res) => {
     const dynamicMonths = [];
     for (let i = 0; i < monthCount; i += 1) {
       const d = new Date(baseDate.getFullYear(), baseDate.getMonth() - i, 1);
+      const key = monthKeyOf(d);
+      const isLive = key === actualCurrentKey;
       dynamicMonths.push({
-        key: monthKeyOf(d),
-        label: `${monthLabelOf(d)} (${i === 0 ? 'Current / Live' : 'Closed'})`
+        key,
+        isLive,
+        label: `${monthLabelOf(d)} (${isLive ? 'Current / Live' : 'Closed'})`
       });
     }
     const monthKeys = dynamicMonths.map((m) => m.key);
     const monthLabels = dynamicMonths.map((m) => m.label);
+    const isSelectedCurrentMonth = dynamicMonths[0]?.isLive === true;
 
     const tree = await loadTree(rootId);
     if (res.headersSent || res.writableEnded) return undefined;
@@ -1233,15 +1461,19 @@ exports.getAssistantQuery = async (req, res) => {
     for (const node of members) {
       if (legFilter && node.leg_letter !== legFilter) continue;
       if (wantsTerminated && node.status !== 0) continue;
-      if (parsed.minPv !== null && parsed.minPv !== undefined && node.pv < parsed.minPv) continue;
-      if (parsed.maxPv !== null && parsed.maxPv !== undefined && node.pv > parsed.maxPv) continue;
-      if (parsed.targetPv !== null && parsed.targetPv !== undefined && node.pv !== parsed.targetPv) continue;
+      if (isSelectedCurrentMonth) {
+        if (parsed.minPv !== null && parsed.minPv !== undefined && node.pv < parsed.minPv) continue;
+        if (parsed.maxPv !== null && parsed.maxPv !== undefined && node.pv > parsed.maxPv) continue;
+        if (parsed.targetPv !== null && parsed.targetPv !== undefined && node.pv !== parsed.targetPv) continue;
+      }
       preFiltered.push(node);
     }
 
     preFiltered.sort((a, b) => b.pv - a.pv || b.repurchase_amt - a.repurchase_amt || a.buyer_id - b.buyer_id);
 
-    const candidateCap = parsed.pureConsumers ? Math.min(preFiltered.length, limit * 6) : Math.min(preFiltered.length, Math.max(limit * 2, 300));
+    const candidateCap = parsed.pureConsumers || !isSelectedCurrentMonth
+      ? Math.min(preFiltered.length, limit * 6)
+      : Math.min(preFiltered.length, Math.max(limit * 2, 300));
     const candidates = preFiltered.slice(0, candidateCap);
     const candidateIds = candidates.map((n) => n.buyer_id);
     const snapshotMap = new Map();
@@ -1278,16 +1510,23 @@ exports.getAssistantQuery = async (req, res) => {
       const monthlyPurchaseAmt = {};
       let totalPv = 0;
 
-      dynamicMonths.forEach((m, idx) => {
+      dynamicMonths.forEach((m) => {
         const snap = snaps[m.key];
-        const pv = idx === 0 ? firstPositive(node.pv, snap?.pv) : safeNumber(snap?.pv);
-        const amt = idx === 0 ? firstPositive(node.repurchase_amt, snap?.purchase_amt) : safeNumber(snap?.purchase_amt);
+        const pv = m.isLive ? firstPositive(node.pv, snap?.pv) : safeNumber(snap?.pv);
+        const amt = m.isLive ? firstPositive(node.repurchase_amt, snap?.purchase_amt) : safeNumber(snap?.purchase_amt);
         monthlyPv[m.label] = pv;
         monthlyPurchaseAmt[m.label] = amt;
         totalPv += pv;
       });
 
-      const currentMonthPv = monthlyPv[dynamicMonths[0].label] || 0;
+      const selectedMonthPv = monthlyPv[dynamicMonths[0].label] || 0;
+      const selectedMonthAmt = monthlyPurchaseAmt[dynamicMonths[0].label] || 0;
+
+      if (!isSelectedCurrentMonth) {
+        if (parsed.minPv !== null && parsed.minPv !== undefined && selectedMonthPv < parsed.minPv) continue;
+        if (parsed.maxPv !== null && parsed.maxPv !== undefined && selectedMonthPv > parsed.maxPv) continue;
+        if (parsed.targetPv !== null && parsed.targetPv !== undefined && selectedMonthPv !== parsed.targetPv) continue;
+      }
 
       rows.push({
         buyer_id: node.buyer_id,
@@ -1300,8 +1539,8 @@ exports.getAssistantQuery = async (req, res) => {
         display_wall: identity.highest_pin || (node.status === 0 ? 'TERMINATED' : 'ASSOCIATE BUYER'),
         leg_letter: node.leg_letter,
         leg_type: node.leg_type,
-        current_month_pv: currentMonthPv,
-        repurchase_amt: node.repurchase_amt,
+        current_month_pv: selectedMonthPv,
+        repurchase_amt: selectedMonthAmt,
         monthly_pv: monthlyPv,
         monthly_purchase_amt: monthlyPurchaseAmt,
         total_pv: totalPv,
@@ -1320,7 +1559,7 @@ exports.getAssistantQuery = async (req, res) => {
       rootBuyerId: rootId,
       months: monthLabels,
       monthKeys,
-      count: parsed.pureConsumers ? rows.length : preFiltered.length,
+      count: parsed.pureConsumers || !isSelectedCurrentMonth ? rows.length : preFiltered.length,
       data: rows.slice(0, limit)
     });
   } catch (error) {
@@ -1330,10 +1569,11 @@ exports.getAssistantQuery = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// GET /member/:buyerId
+// GET /member/:buyerId  (Local legs, live enrichment, sponsor/proposer names, is_baseline new joinings)
 // ---------------------------------------------------------------------------
 exports.getMemberFullProfile = async (req, res) => {
   try {
+    setNoStore(res);
     const memberId = safeNumber(req.params.buyerId || req.query.buyerId, 0);
     if (!memberId) return sendSafe(res, 400, { success: false, message: 'buyerId is required.' });
 
@@ -1344,20 +1584,177 @@ exports.getMemberFullProfile = async (req, res) => {
       return sendSafe(res, 404, { success: false, message: 'Member not found in your tree.' });
     }
 
-    const [identityMap, nodeRows] = await Promise.all([
-      loadIdentities([memberId]),
-      select('SELECT * FROM rcm_downline_nodes WHERE buyer_id = :memberId LIMIT 1', { memberId })
-    ]);
-    const identity = identityMap.get(memberId) || null;
-    const raw = nodeRows[0] || null;
-    const node = raw ? normalizeNode(raw, 0) : null;
+    const tree = await loadTree(rootId);
+    const { members } = analyzeTree(tree, rootId);
+    const targetNode = tree.nodeMap.get(String(memberId)) || null;
+    const memberMeta = members.find((m) => Number(m.buyer_id) === Number(memberId)) || null;
 
-    if (!identity && !node) {
+    const now = new Date();
+    const currentMonthKey = monthKeyOf(now);
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+    const directKidsOfTarget = tree.childrenMap.get(String(memberId)) || [];
+    const isRootMember = Number(memberId) === Number(rootId);
+    const orderedLocalLegs = assignLegLetters(directKidsOfTarget, { useStoredLeg: isRootMember });
+
+    const legBuckets = new Map();
+    const childOwnership = new Map();
+
+    orderedLocalLegs.forEach(({ head: kid, letter: code }) => {
+      const bucket = {
+        legCode: code,
+        legLabel: `Leg ${code}`,
+        headId: kid.buyer_id,
+        headName: kid.name || `Associate #${kid.buyer_id}`,
+        count: 0,
+        joinings: []
+      };
+      legBuckets.set(String(kid.buyer_id), bucket);
+
+      const q = [String(kid.buyer_id)];
+      const seen = new Set([String(memberId)]);
+      for (let qi = 0; qi < q.length; qi += 1) {
+        const currId = q[qi];
+        if (seen.has(currId)) continue;
+        seen.add(currId);
+        childOwnership.set(currId, String(kid.buyer_id));
+
+        const subKids = tree.childrenMap.get(currId) || [];
+        for (const sk of subKids) {
+          const skId = String(sk.buyer_id);
+          if (!seen.has(skId)) q.push(skId);
+        }
+      }
+    });
+
+    const idsToLoad = new Set([memberId, ...childOwnership.keys()]);
+    if (targetNode?.parent_id) idsToLoad.add(targetNode.parent_id);
+
+    const identityMap = await loadIdentities([...idsToLoad]);
+    let identity = identityMap.get(memberId) || {};
+
+    const enriched = await enrichMemberIdentityFromPortal(rootId, memberId, identity);
+    if (enriched) {
+      identity = {
+        ...identity,
+        name: identity.name || enriched.name,
+        proposer_id: identity.proposer_id || enriched.proposer_id,
+        proposer_name: identity.proposer_name || enriched.proposer_name,
+        sponsor_id: identity.sponsor_id || enriched.sponsor_id,
+        sponsor_name: identity.sponsor_name || enriched.sponsor_name,
+        mobile_no: pickMobile(identity) || enriched.mobile_no,
+        mobile: pickMobile(identity) || enriched.mobile_no,
+        district: identity.district || enriched.district,
+        state: identity.state || enriched.state,
+        tehsil: identity.tehsil || enriched.tehsil,
+        post_village: identity.post_village || enriched.post_village,
+        pincode: identity.pincode || enriched.pincode,
+        address: identity.address || enriched.address,
+        curr_pin: identity.curr_pin || enriched.curr_pin,
+        max_pin: identity.max_pin || enriched.max_pin,
+        highest_pin: identity.highest_pin || enriched.max_pin,
+        kyc_status: identity.kyc_status || enriched.kyc_status,
+        photo_url: pickPhoto(identity) || enriched.photo_url,
+        join_date: identity.join_date || enriched.join_date
+      };
+    }
+
+    let raw = null;
+    if (!targetNode) {
+      const nodeRows = await select('SELECT * FROM rcm_downline_nodes WHERE buyer_id = :memberId LIMIT 1', { memberId });
+      raw = nodeRows[0] || null;
+    }
+    const node = targetNode || (raw ? normalizeNode(raw, 0) : null);
+
+    if (!identity.buyer_id && !identity.name && !node) {
       return sendSafe(res, 404, { success: false, message: 'Member profile not found.' });
     }
 
-    const name = identity?.name || node?.name || `Associate #${memberId}`;
+    const sponsorId = firstDefined(identity.sponsor_id, node?.sponsor_id, node?.parent_id) || null;
+    const proposerId = firstDefined(identity.proposer_id, node?.proposer_id) || null;
+
+    const extraLookupIds = [];
+    if (sponsorId && !identityMap.has(Number(sponsorId)) && !tree.nodeMap.has(String(sponsorId))) {
+      extraLookupIds.push(Number(sponsorId));
+    }
+    if (proposerId && !identityMap.has(Number(proposerId)) && !tree.nodeMap.has(String(proposerId))) {
+      extraLookupIds.push(Number(proposerId));
+    }
+    if (extraLookupIds.length > 0) {
+      const extraMap = await loadIdentities(extraLookupIds);
+      extraMap.forEach((v, k) => identityMap.set(k, v));
+    }
+
+    const resolvePersonName = (id, explicitName) => {
+      if (explicitName) return explicitName;
+      if (!id) return null;
+      const numId = Number(id);
+      return identityMap.get(numId)?.name || tree.nodeMap.get(String(id))?.name || null;
+    };
+
+    const sponsorName = resolvePersonName(sponsorId, firstDefined(identity.sponsor_name, node?.sponsor_name));
+    const proposerName = resolvePersonName(proposerId, firstDefined(identity.proposer_name, node?.proposer_name));
+
+    for (const [descId, ownerChildId] of childOwnership.entries()) {
+      const descIdNum = Number(descId);
+      const descIdentity = identityMap.get(descIdNum) || {};
+      const descNode = tree.nodeMap.get(descId);
+
+      const joinInfo = resolveEffectiveJoinDate(descIdentity, descNode);
+      if (!joinInfo) continue;
+
+      const joined = joinInfo.date;
+      if (joined < monthStart || joined >= nextMonthStart) continue;
+
+      const bucket = legBuckets.get(ownerChildId);
+      if (!bucket) continue;
+
+      const descSponsorId = firstDefined(descIdentity.sponsor_id, descNode?.sponsor_id, descNode?.parent_id) || null;
+      const descProposerId = firstDefined(descIdentity.proposer_id, descNode?.proposer_id) || null;
+
+      bucket.count += 1;
+      bucket.joinings.push({
+        buyer_id: descIdNum,
+        name: descIdentity.name || descNode?.name || `Associate #${descIdNum}`,
+        mobile_no: pickMobile(descIdentity) || null,
+        join_date: formatDateOnly(joined),
+        join_date_source: joinInfo.source,
+        leg_code: bucket.legCode,
+        leg_type: bucket.legLabel,
+        sponsor_id: descSponsorId ? String(descSponsorId) : null,
+        sponsor_name: resolvePersonName(descSponsorId, firstDefined(descIdentity.sponsor_name, descNode?.sponsor_name)),
+        proposer_id: descProposerId ? String(descProposerId) : null,
+        proposer_name: resolvePersonName(descProposerId, firstDefined(descIdentity.proposer_name, descNode?.proposer_name)),
+        self_pv: descNode ? descNode.self_pv : 0,
+        repurchase_amt: descNode ? descNode.repurchase_amt : 0
+      });
+    }
+
+    const legsSummary = {};
+    const legJoiningsList = [];
+    for (const bucket of legBuckets.values()) {
+      bucket.joinings.sort((a, b) => String(b.join_date).localeCompare(String(a.join_date)) || b.buyer_id - a.buyer_id);
+      legsSummary[bucket.legCode] = {
+        leg_code: bucket.legCode,
+        leg_type: bucket.legLabel,
+        head_id: bucket.headId,
+        head_name: bucket.headName,
+        new_joinings_count: bucket.count,
+        joinings: bucket.joinings
+      };
+      legJoiningsList.push(...bucket.joinings);
+    }
+
+    const legAJoinings = legsSummary.A?.joinings || [];
+    const legBJoinings = legsSummary.B?.joinings || [];
+    const legACount = legsSummary.A?.new_joinings_count || 0;
+    const legBCount = legsSummary.B?.new_joinings_count || 0;
+
+    const name = identity.name || node?.name || `Associate #${memberId}`;
     const terminated = node && node.status === 0;
+    const legLetter = memberMeta?.leg_letter || (isRootMember ? 'ROOT' : null);
+    const actualDirectCount = Math.max(directKidsOfTarget.length, node ? node.children_count : 0);
 
     return sendSafe(res, 200, {
       success: true,
@@ -1365,32 +1762,42 @@ exports.getMemberFullProfile = async (req, res) => {
         buyer_id: memberId,
         name,
         applicant_name: name,
-        join_date: identity?.join_date || null,
-        kyc_status: node?.kyc_status || identity?.kyc_status || (terminated ? 'Terminated' : null),
-        curr_pin: identity?.curr_pin || null,
-        max_pin: identity?.max_pin || null,
-        highest_pin: identity?.highest_pin || 'ASSOCIATE BUYER',
-        pin: identity?.highest_pin || 'ASSOCIATE BUYER',
-        sponsor_id: identity?.sponsor_id || node?.parent_id || null,
-        sponsor_name: identity?.sponsor_name || null,
-        proposer_id: identity?.proposer_id || null,
-        proposer_name: identity?.proposer_name || null,
-        address_line: identity?.address || null,
-        post_village: identity?.post_village || null,
-        tehsil: identity?.tehsil || null,
-        city: identity?.city || null,
-        district: identity?.district || null,
-        state: identity?.state || null,
-        pincode: identity?.pincode || null,
-        mobile: pickMobile(identity || {}),
-        mobile_no: pickMobile(identity || {}),
+        join_date: identity.join_date || node?.join_date || null,
+        kyc_status: node?.kyc_status || identity.kyc_status || (terminated ? 'Terminated' : null),
+        curr_pin: identity.curr_pin || null,
+        max_pin: identity.max_pin || null,
+        highest_pin: identity.highest_pin || identity.max_pin || 'ASSOCIATE BUYER',
+        pin: identity.highest_pin || identity.max_pin || 'ASSOCIATE BUYER',
+        leg_letter: legLetter,
+        leg_type: legLetter && legLetter !== 'ROOT' ? `Leg ${legLetter}` : null,
+        sponsor_id: sponsorId ? String(sponsorId) : null,
+        sponsor_name: sponsorName,
+        proposer_id: proposerId ? String(proposerId) : null,
+        proposer_name: proposerName,
+        address_line: identity.address || null,
+        post_village: identity.post_village || null,
+        tehsil: identity.tehsil || null,
+        city: identity.city || null,
+        district: identity.district || null,
+        state: identity.state || null,
+        pincode: identity.pincode || null,
+        mobile: pickMobile(identity),
+        mobile_no: pickMobile(identity),
         self_pv: node ? node.self_pv : 0,
         current_pv: node ? node.self_pv : 0,
         repurchase_amt: node ? node.repurchase_amt : 0,
         total_group_pv: node ? node.total_group_pv : 0,
-        children_count: node ? node.children_count : 0,
+        children_count: actualDirectCount,
         status: node ? node.status : 1,
-        photo_url: pickPhoto(identity || {})
+        photo_url: pickPhoto(identity),
+        this_month_key: currentMonthKey,
+        this_month_joinings: {
+          total: legJoiningsList.length,
+          legA: { count: legACount, joinings: legAJoinings },
+          legB: { count: legBCount, joinings: legBJoinings },
+          byLeg: legsSummary,
+          allJoinings: legJoiningsList
+        }
       }
     });
   } catch (error) {
@@ -1403,13 +1810,12 @@ exports.getMemberFullProfile = async (req, res) => {
 // GET /search
 // ---------------------------------------------------------------------------
 exports.searchLifelines = async (req, res) => {
+  setNoStore(res);
   const rootId = resolveRoot(req, res, req.query.rootBuyerId || req.query.rootBuyerID || req.query.buyerId);
   if (!rootId) return undefined;
 
   const rawQ = String(req.query.q || req.query.search || req.query.query || '').trim();
-  if (!rawQ) {
-    return sendSafe(res, 400, { success: false, message: 'Search query is required.' });
-  }
+  if (!rawQ) return sendSafe(res, 400, { success: false, message: 'Search query is required.' });
 
   const limit = Math.min(Math.max(safeNumber(req.query.limit, 20), 1), 50);
   const isNumericId = /^\d+$/.test(rawQ);
@@ -1419,6 +1825,9 @@ exports.searchLifelines = async (req, res) => {
   try {
     const tree = await loadTree(rootId);
     if (res.headersSent || res.writableEnded) return undefined;
+
+    const { members } = analyzeTree(tree, rootId);
+    const legMap = new Map(members.map((m) => [m.buyer_id, m.leg_type]));
 
     const scored = [];
     for (const node of tree.nodeMap.values()) {
@@ -1449,7 +1858,7 @@ exports.searchLifelines = async (req, res) => {
     const filtered = matchedNodes.map((node) => {
       const idRow = identities.get(node.buyer_id) || {};
       const pin = pickPin(idRow) || 'ASSOCIATE BUYER';
-      const hasKids = (tree.childrenMap.get(String(node.buyer_id)) || []).length > 0 || node.children_count > 0;
+      const actualKids = Math.max((tree.childrenMap.get(String(node.buyer_id)) || []).length, node.children_count || 0);
       return {
         id: node.buyer_id,
         buyer_id: node.buyer_id,
@@ -1462,7 +1871,7 @@ exports.searchLifelines = async (req, res) => {
         mobile_no: pickMobile(idRow) || null,
         district: idRow.district || null,
         state: idRow.state || null,
-        leg_type: node.leg_type || null,
+        leg_type: legMap.get(node.buyer_id) || node.leg_type || null,
         level: node.level ?? node.depth,
         status: node.status,
         statusLabel: node.status === 1 ? 'ACTIVE' : 'TERMINATED',
@@ -1470,8 +1879,8 @@ exports.searchLifelines = async (req, res) => {
         current_pv: node.self_pv,
         repurchase_amt: node.repurchase_amt,
         total_group_pv: node.total_group_pv,
-        children_count: node.children_count,
-        has_children: hasKids,
+        children_count: actualKids,
+        has_children: actualKids > 0,
         photo_url: pickPhoto(idRow)
       };
     });
@@ -1487,25 +1896,13 @@ exports.searchLifelines = async (req, res) => {
       }
     }
 
-    return sendSafe(res, 200, {
-      success: true,
-      data: filtered,
-      selectedPath
-    });
+    return sendSafe(res, 200, { success: true, data: filtered, selectedPath });
   } catch (error) {
     if (res.headersSent || res.writableEnded) return undefined;
     console.warn('Search fallback triggered:', error.message);
     try {
-      const helperRes = await searchLifelineMembers({
-        rootBuyerId: rootId,
-        searchQuery: rawQ,
-        limit
-      });
-      return sendSafe(res, 200, {
-        success: true,
-        data: Array.isArray(helperRes) ? helperRes : [],
-        selectedPath: null
-      });
+      const helperRes = await searchLifelineMembers({ rootBuyerId: rootId, searchQuery: rawQ, limit });
+      return sendSafe(res, 200, { success: true, data: Array.isArray(helperRes) ? helperRes : [], selectedPath: null });
     } catch {
       return sendSafe(res, 200, { success: true, data: [], selectedPath: null });
     }
@@ -1514,17 +1911,14 @@ exports.searchLifelines = async (req, res) => {
 
 exports.getMemberPath = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.query.rootBuyerId || req.query.buyerId);
     if (!rootId) return undefined;
     const memberId = safeNumber(req.params.memberId || req.query.memberId, 0);
-    if (!memberId) {
-      return sendSafe(res, 400, { success: false, message: 'memberId is required.' });
-    }
-
+    if (!memberId) return sendSafe(res, 400, { success: false, message: 'memberId is required.' });
     if (!(await isInSubtree(rootId, memberId))) {
       return sendSafe(res, 404, { success: false, message: 'Member not found in your tree.' });
     }
-
     const path = await buildAncestorPath(rootId, memberId);
     return sendSafe(res, 200, { success: true, data: path });
   } catch {
@@ -1537,6 +1931,7 @@ exports.getMemberPath = async (req, res) => {
 // ---------------------------------------------------------------------------
 exports.getTerritorySummary = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
@@ -1606,6 +2001,7 @@ exports.getTerritorySummary = async (req, res) => {
 // ---------------------------------------------------------------------------
 exports.getFollowupList = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
 
@@ -1651,6 +2047,7 @@ exports.getFollowupList = async (req, res) => {
 // ---------------------------------------------------------------------------
 exports.getTurnoverHistory = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, req.params.buyerId || req.query.buyerId);
     if (!rootId) return undefined;
     const rows = await fetchTurnoverRows(rootId, 12);
@@ -1665,6 +2062,7 @@ exports.getTurnoverHistory = async (req, res) => {
 // ---------------------------------------------------------------------------
 exports.updateCustomPhoto = async (req, res) => {
   try {
+    setNoStore(res);
     const rootId = resolveRoot(req, res, null);
     if (!rootId) return undefined;
 

@@ -13,8 +13,8 @@ const lifelinesAuthModule = require('../services/lifelinesAuth');
 // ---------------------------------------------------------------------------
 // 1. RESILIENT AUTH MIDDLEWARE RESOLVER (Zero-Crash Fallback)
 // ---------------------------------------------------------------------------
-let authMiddleware = lifelinesAuthModule?.requireLifelinesAuth 
-  || lifelinesAuthModule?.verifyToken 
+let authMiddleware = lifelinesAuthModule?.requireLifelinesAuth
+  || lifelinesAuthModule?.verifyToken
   || lifelinesAuthModule?.lifelinesAuth;
 
 if (typeof authMiddleware !== 'function') {
@@ -39,21 +39,22 @@ function safe(handlerName, fallbackAliases = []) {
   if (!targetFn) {
     console.error(`[TITAN ROUTE CRITICAL]: Handler '${handlerName}' (aliases: ${candidates.join(', ')}) is undefined in lifelinesController!`);
     return (req, res) => {
-      res.status(501).json({
-        success: false,
-        code: 'HANDLER_NOT_IMPLEMENTED',
-        message: `Endpoint handler '${handlerName}' is not loaded in backend controller.`
-      });
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(501).json({
+          success: false,
+          code: 'HANDLER_NOT_IMPLEMENTED',
+          message: `Endpoint handler '${handlerName}' is not loaded in backend controller.`
+        });
+      }
     };
   }
 
-  // Wrap async execution to prevent unhandled promise rejections from crashing the process
   return async (req, res, next) => {
     try {
       await targetFn(req, res, next);
     } catch (err) {
       console.error(`[ROUTER UNHANDLED EXCEPTION] [${req.method} ${req.originalUrl}]:`, err.message);
-      if (!res.headersSent) {
+      if (!res.headersSent && !res.writableEnded) {
         res.status(500).json({
           success: false,
           code: 'INTERNAL_ROUTER_FAULT',
@@ -69,7 +70,7 @@ function safe(handlerName, fallbackAliases = []) {
 // ---------------------------------------------------------------------------
 const routeTimeout = (ms = 18000) => (req, res, next) => {
   res.setTimeout(ms, () => {
-    if (!res.headersSent) {
+    if (!res.headersSent && !res.writableEnded) {
       res.status(504).json({
         success: false,
         code: 'GATEWAY_TIMEOUT',
@@ -88,10 +89,8 @@ const secureHeaders = (req, res, next) => {
   next();
 };
 
-// Global router middleware
 router.use(secureHeaders);
 
-// Strict Param Validation: Prevents malicious or garbage IDs from ever hitting the DB
 router.param('buyerId', (req, res, next, idVal) => {
   const cleaned = String(idVal || '').trim();
   if (!/^\d{4,12}$/.test(cleaned)) {
@@ -115,8 +114,10 @@ router.post('/sync', routeTimeout(25000), safe('syncLifelines'));
 // ---------------------------------------------------------------------------
 router.use(authMiddleware);
 
-// --- Session & Real-Time Sync Status ---
+// --- Session, Live Check & Real-Time Sync Status ---
 router.post('/logout', safe('logoutLifelines'));
+router.get('/live-check/:buyerId', routeTimeout(8000), safe('liveCheckLifelines'));
+router.get('/live-check', routeTimeout(8000), safe('liveCheckLifelines'));
 router.get('/status/:buyerId', safe('getSyncStatus'));
 router.get('/status', safe('getSyncStatus'));
 
